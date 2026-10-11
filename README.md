@@ -57,3 +57,13 @@ cd management && mvn spring-boot:run   # http://localhost:9000
 - 管理面全接口认证 + RBAC + BCrypt
 - 检测引擎故障 fail-open（网关层保证可用性）
 - 规则热加载不重启、操作可审计
+
+## 开源协议
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）**，详见 [LICENSE](./LICENSE)。
+
+这是强 copyleft 协议，核心要求：
+- **修改后必须开源**：任何人修改本项目代码，都必须以 AGPL-3.0 继续开源其修改版本及对应源代码。
+- **网络服务同样适用**：即使仅将修改版作为网络服务对外提供（不分发二进制），也必须向该服务的用户提供修改后的源代码。商用部署同样受此约束。
+- 衍生作品整体须保持 AGPL-3.0，不可转授权为闭源或其他更宽松协议。
+
+Copyright © 2026 NovaWAF Contributors.
