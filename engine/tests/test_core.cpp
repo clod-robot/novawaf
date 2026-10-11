@@ -1,10 +1,12 @@
 // NovaWAF - 核心逻辑单元测试（平台无关，Windows/Linux 均可编译运行）
 // 自带极简测试框架，无第三方依赖。
 #include "novawaf/core/buffer.h"
+#include "novawaf/core/json.h"
 #include "novawaf/core/mpmc_queue.h"
 #include "novawaf/detect/ac_automaton.h"
 #include "novawaf/detect/decoder.h"
 #include "novawaf/detect/detectors.h"
+#include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/http_model.h"
 #include "novawaf/detect/threat_intel.h"
@@ -718,11 +720,76 @@ static void test_geo_filter() {
     CHECK(!geo.assess("1.1.1.1").has_value(), "old AU range gone after reload");
 }
 
+static void test_json() {
+    TEST("Json");
+    using namespace novawaf;
+    // 控制台写出的真实规则 JSON 格式
+    std::string j = R"([{"id":1,"name":"block-sqli","pattern":"union select","action":"block","category":"sqli","enabled":true},{"id":2,"name":"noop","pattern":"","action":"log","category":"x","enabled":false}])";
+    auto root = parseJson(j);
+    CHECK(root.isArray(), "root is array");
+    CHECK(root.arr.size() == 2, "two rules");
+    CHECK(root.arr[0].at("name").str == "block-sqli", "name field");
+    CHECK(root.arr[0].at("id").num == 1, "id field");
+    CHECK(root.arr[0].at("enabled").b == true, "enabled bool");
+    CHECK(root.arr[1].at("enabled").b == false, "disabled bool");
+    // 转义
+    auto s = parseJson(R"({"a":"he said \"hi\"\nline2"})");
+    CHECK(s.at("a").str == "he said \"hi\"\nline2", "string escapes");
+    // 空值
+    auto e = parseJson("[]");
+    CHECK(e.isArray() && e.arr.empty(), "empty array");
+}
+
+static void test_custom_rules() {
+    TEST("CustomRule");
+    using namespace novawaf;
+    CustomRuleDetector det;
+    // 空集不命中
+    HttpRequest clean; clean.path = "/index"; clean.query = ""; clean.body = "";
+    CHECK(det.detect(clean).action == Action::PASS, "empty set passes");
+
+    // 加载控制台格式 JSON
+    std::string j = R"([{"id":1,"name":"block-sqli","pattern":"union select","action":"block","category":"sqli","enabled":true},{"id":2,"name":"log-only","pattern":"foobar","action":"log","category":"probe","enabled":true},{"id":3,"name":"off","pattern":"zzz","action":"block","category":"x","enabled":false}])";
+    size_t n = det.reload(j);
+    CHECK(n == 2, "two enabled rules loaded (disabled skipped)");
+    CHECK(det.enabledCount() == 2, "enabled count");
+
+    // 命中 block
+    HttpRequest evil; evil.path = "/"; evil.query = "id=1 union select password"; evil.body = "";
+    auto r = det.detect(evil);
+    CHECK(r.action == Action::BLOCK, "union select blocked");
+    CHECK(r.category == "sqli", "category sqli");
+    CHECK(r.ruleId == "CUSTOM-1", "rule id CUSTOM-1");
+
+    // 命中 log
+    HttpRequest logreq; logreq.path = "/"; logreq.query = "x=foobar"; logreq.body = "";
+    auto r2 = det.detect(logreq);
+    CHECK(r2.action == Action::LOG, "foobar logs");
+
+    // 禁用规则不命中
+    HttpRequest off; off.path = "/"; off.query = "x=zzz"; off.body = "";
+    CHECK(det.detect(off).action == Action::PASS, "disabled rule ignored");
+
+    // 热更新：移除规则后 clone 副本应同步看到（共享原子）
+    auto clone = det.clone();
+    det.reload("[]");
+    CHECK(det.enabledCount() == 0, "reload clears");
+    HttpRequest evil2; evil2.path = "/"; evil2.query = "union select"; evil2.body = "";
+    CHECK(clone->detect(evil2).action == Action::PASS, "clone sees live reload");
+
+    // 损坏 JSON 不崩溃，保留空集
+    det.reload("not json at all");
+    CHECK(det.enabledCount() == 0, "bad json -> empty, no crash");
+    CHECK(det.detect(evil2).action == Action::PASS, "bad json keeps passing");
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
     test_ac_automaton();
     test_decoder();
+    test_json();
+    test_custom_rules();
     test_detectors();
     test_pipeline();
     test_rate_limiter();

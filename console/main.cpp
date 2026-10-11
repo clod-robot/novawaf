@@ -188,6 +188,7 @@ int main(int argc, char* argv[]) {
                 if (!rule.isMember("enabled")) rule["enabled"] = true;
                 arr.append(rule);
                 r->set(kRulesKey, dumpJson(arr));
+                r->incr("novawaf:rules:version");  // 触发引擎热加载脏检查
                 cb(jsonResp(std::move(rule), k201Created));
                 return;
             }
@@ -195,18 +196,39 @@ int main(int argc, char* argv[]) {
             cb(jsonResp(std::move(m), k503ServiceUnavailable));
         }, {Post});
 
-    // 更新规则
-    app().registerHandler("/api/rules/([0-9]+)",
+    // 更新 / 删除规则（同一路径模式合并注册，避免 Drogon 重复路径冲突；按方法分发）
+    app().registerHandler("/api/rules/{1}",
         [](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb,
            const std::string& idStr) {
             std::string role = authenticate(req);
             if (role.empty()) { cb(needAuth()); return; }
-            if (!roleAllowed(role, {"ADMIN","OPERATOR"})) { cb(forbidden()); return; }
+            bool isDelete = (req->method() == Delete);
+            // DELETE 仅 ADMIN；PUT 允许 ADMIN/OPERATOR
+            if (isDelete) {
+                if (!roleAllowed(role, {"ADMIN"})) { cb(forbidden()); return; }
+            } else {
+                if (!roleAllowed(role, {"ADMIN","OPERATOR"})) { cb(forbidden()); return; }
+            }
             long long id = std::atoll(idStr.c_str());
-            auto json = req->getJsonObject();
-            if (!json) { Json::Value m; m["error"]="invalid json"; cb(jsonResp(std::move(m),k400BadRequest)); return; }
             if (auto* r = g_store.get()) {
                 Json::Value arr = parseJson(r->get(kRulesKey).value_or("[]"));
+                if (isDelete) {
+                    Json::Value out(Json::arrayValue);
+                    bool found = false;
+                    for (auto& it : arr) {
+                        if (it.get("id",0).asInt64() == id) found = true;
+                        else out.append(it);
+                    }
+                    if (!found) { Json::Value m; m["error"]="not found"; cb(jsonResp(std::move(m),k404NotFound)); return; }
+                    r->set(kRulesKey, dumpJson(out));
+                    r->incr("novawaf:rules:version");
+                    Json::Value ok; ok["ok"]=true; ok["deleted"]=(Json::Int64)id;
+                    cb(jsonResp(std::move(ok)));
+                    return;
+                }
+                // PUT
+                auto json = req->getJsonObject();
+                if (!json) { Json::Value m; m["error"]="invalid json"; cb(jsonResp(std::move(m),k400BadRequest)); return; }
                 bool found = false;
                 for (auto& it : arr) {
                     if (it.get("id", 0).asInt64() == id) {
@@ -217,34 +239,14 @@ int main(int argc, char* argv[]) {
                 }
                 if (!found) { Json::Value m; m["error"]="not found"; cb(jsonResp(std::move(m),k404NotFound)); return; }
                 r->set(kRulesKey, dumpJson(arr));
+                r->incr("novawaf:rules:version");
                 Json::Value ok; ok["ok"]=true;
                 cb(jsonResp(std::move(ok)));
                 return;
             }
             Json::Value m; m["error"]="redis unavailable";
             cb(jsonResp(std::move(m), k503ServiceUnavailable));
-        }, {Put});
-
-    // 删除规则（仅 ADMIN）
-    app().registerHandler("/api/rules/([0-9]+)",
-        [](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb,
-           const std::string& idStr) {
-            std::string role = authenticate(req);
-            if (role.empty()) { cb(needAuth()); return; }
-            if (!roleAllowed(role, {"ADMIN"})) { cb(forbidden()); return; }
-            long long id = std::atoll(idStr.c_str());
-            if (auto* r = g_store.get()) {
-                Json::Value arr = parseJson(r->get(kRulesKey).value_or("[]"));
-                Json::Value out(Json::arrayValue);
-                for (auto& it : arr) if (it.get("id",0).asInt64() != id) out.append(it);
-                r->set(kRulesKey, dumpJson(out));
-                Json::Value ok; ok["ok"]=true;
-                cb(jsonResp(std::move(ok)));
-                return;
-            }
-            Json::Value m; m["error"]="redis unavailable";
-            cb(jsonResp(std::move(m), k503ServiceUnavailable));
-        }, {Delete});
+        }, {Put, Delete});
 
     // 热加载：规则写 Redis 后，引擎后台线程按 cksum 自动拾取（此处 bump 版本号触发）
     app().registerHandler("/api/rules/reload",

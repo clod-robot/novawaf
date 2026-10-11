@@ -6,6 +6,7 @@
 #include "novawaf/core/redis_client.h"
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/detect/pipeline.h"
+#include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/protect/cc_guard.h"
 #include "novawaf/protect/bot_guard.h"
@@ -357,6 +358,49 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(60));
             if (!g_running) break;
             loadIoc(false);  // copy-on-write 原子替换，不阻塞检测
+        }
+    }).detach();
+
+    // ---- 控制台自定义规则：从 Redis 键 novawaf:rules 热加载（JSON），闭环管理控制台 -> 引擎 ----
+    auto customRules = std::make_shared<CustomRuleDetector>();
+    // 读 Redis 原始 STRING 值（含读取版本号做脏检查，未变则跳过重解析）
+    auto readRulesBlob = [](std::string& inoutVersion, bool& outChanged) -> std::optional<std::string> {
+        outChanged = false;
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return std::nullopt;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return std::nullopt;
+        auto ver = r.get("novawaf:rules:version");
+        std::string cur = ver.value_or("");
+        if (cur == inoutVersion) return std::nullopt;  // 版本未变
+        auto blob = r.get("novawaf:rules");
+        if (!blob) return std::nullopt;
+        inoutVersion = cur;
+        outChanged = true;
+        return blob;
+    };
+    auto rulesVersion = std::make_shared<std::string>("-");
+    auto loadRules = [customRules, readRulesBlob, rulesVersion](bool initial) -> size_t {
+        bool changed = false;
+        auto blob = readRulesBlob(*rulesVersion, changed);
+        if (!blob) return initial ? customRules->reload("") : (size_t)-1;  // -1 = 无变化
+        size_t n = customRules->reload(*blob);
+        std::printf("  CustomRules: %s %zu rules from redis\n",
+                    initial ? "loaded" : "hot-reloaded", n);
+        return n;
+    };
+    loadRules(true);
+    pipeline.addDetector(std::unique_ptr<CustomRuleDetector>(
+        static_cast<CustomRuleDetector*>(customRules->clone().release())));
+    int rulesInterval = getenv("NOVA_RULES_INTERVAL") ? atoi(getenv("NOVA_RULES_INTERVAL")) : 60;
+    std::thread([loadRules, rulesInterval]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(rulesInterval));
+            if (!g_running) break;
+            loadRules(false);
         }
     }).detach();
 
