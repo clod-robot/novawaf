@@ -7,6 +7,11 @@
 #include "novawaf/detect/detectors.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/http_model.h"
+#include "novawaf/detect/threat_intel.h"
+#include "novawaf/protect/cc_guard.h"
+#include "novawaf/protect/bot_guard.h"
+#include "novawaf/protect/dynamic_shield.h"
+#include "novawaf/protect/fingerprint.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -497,6 +502,166 @@ static void test_threat_intel() {
       auto m = ti2.match(r); CHECK(m && m->action == Action::CHALLENGE, "medium -> challenge"); }
 }
 
+static void test_fingerprint() {
+    TEST("Fingerprint");
+    using namespace novawaf;
+
+    // HTTP 指纹稳定性：相同头部集合 → 相同指纹
+    std::unordered_map<std::string,std::string> h1{{"User-Agent","x"},{"Accept","*/*"}};
+    std::unordered_map<std::string,std::string> h2{{"accept","*/*"},{"user-agent","x"}};
+    std::string f1 = httpFingerprint("GET", h1);
+    std::string f2 = httpFingerprint("GET", h2);
+    CHECK(f1 == f2, "http fingerprint stable regardless of header order/case");
+    CHECK(!f1.empty() && f1[0] == 'h', "http fingerprint format");
+
+    // JA4：构造一个最小 ClientHello（TLS 1.2，含 SNI + ALPN 扩展）
+    std::vector<uint8_t> ch;
+    auto u16 = [&](uint16_t v){ ch.push_back(v>>8); ch.push_back(v&0xFF); };
+    // handshake header (type 0x01, len filled later)
+    size_t hsStart = ch.size();
+    ch.push_back(0x01); ch.push_back(0); ch.push_back(0); ch.push_back(0);
+    u16(0x0303);                       // legacy version TLS1.2
+    for (int i=0;i<32;i++) ch.push_back((uint8_t)i);  // random
+    ch.push_back(0);                    // session id len 0
+    u16(4); u16(0x1301); u16(0x1302);   // 2 cipher suites
+    ch.push_back(1); ch.push_back(0);   // compression
+    // extensions block
+    size_t extStart = ch.size();
+    u16(0); // placeholder ext total len
+    u16(0);   u16(0);  // SNI ext (type0, len0)
+    u16(16);  u16(0);  // ALPN ext (type16, len0)
+    size_t extEnd = ch.size();
+    // fill ext total len
+    ch[extStart]   = (uint8_t)((extEnd-extStart-2)>>8);
+    ch[extStart+1] = (uint8_t)((extEnd-extStart-2)&0xFF);
+    // fill handshake len
+    uint32_t hsLen = extEnd - hsStart - 4;
+    ch[hsStart+1] = (uint8_t)(hsLen>>16);
+    ch[hsStart+2] = (uint8_t)(hsLen>>8);
+    ch[hsStart+3] = (uint8_t)(hsLen&0xFF);
+
+    std::string ja4 = ja4FromClientHello(ch.data(), ch.size());
+    CHECK(!ja4.empty(), "ja4 parsed from clienthello");
+    CHECK(ja4.rfind("t12", 0) == 0, "ja4 version token t12");  // TLS1.2 → d? actually map
+    // 同一字节流重复计算 → 稳定
+    CHECK(ja4 == ja4FromClientHello(ch.data(), ch.size()), "ja4 deterministic");
+    // 解析失败（空/垃圾）返回空
+    std::vector<uint8_t> junk{0x16,0x03};
+    CHECK(ja4FromClientHello(junk.data(), junk.size()).empty(), "ja4 garbage -> empty");
+}
+
+static void test_cc_guard() {
+    TEST("CcGuard");
+    using namespace novawaf;
+
+    CcGuard::Config cfg;
+    cfg.windowMs = 1000; cfg.maxReqPerWindow = 10; cfg.burstPerUrl = 6;
+    cfg.hotUrlGlobal = 1000; cfg.scoreToChallenge = 40; cfg.scoreToBlock = 100;
+    CcGuard cc(cfg);
+
+    // 正常低频 → PASS
+    for (int i = 0; i < 5; ++i)
+        CHECK(cc.assess("1.1.1.1", "/a").action == Action::PASS, "low rate pass");
+
+    // 单 IP 速率超限 → 至少 CHALLENGE
+    Action worst = Action::PASS;
+    for (int i = 0; i < 25; ++i) {
+        auto r = cc.assess("9.9.9.9", "/b");
+        if ((int)r.action > (int)worst) worst = r.action;
+    }
+    CHECK((int)worst >= (int)Action::CHALLENGE, "high rate triggers challenge/block");
+
+    // 单 IP 狂刷同一 URL → 触发
+    CcGuard cc2(cfg);
+    Action w2 = Action::PASS;
+    for (int i = 0; i < 20; ++i) {
+        auto r = cc2.assess("8.8.8.8", "/hot");
+        if ((int)r.action > (int)w2) w2 = r.action;
+    }
+    CHECK((int)w2 >= (int)Action::CHALLENGE, "url burst triggers action");
+
+    // 动态收紧：applyThreatLevel 后阈值下降，更容易触发
+    CcGuard cc3(cfg);
+    cc3.applyThreatLevel((int)ThreatLevel::SEVERE);  // factor≈0.216
+    Action w3 = Action::PASS;
+    for (int i = 0; i < 6; ++i) {
+        auto r = cc3.assess("7.7.7.7", "/x");
+        if ((int)r.action > (int)w3) w3 = r.action;
+    }
+    CHECK((int)w3 >= (int)Action::CHALLENGE, "tightened threshold triggers earlier");
+}
+
+static void test_bot_guard() {
+    TEST("BotGuard");
+    using namespace novawaf;
+
+    BotGuard bot(BotGuard::Config{});
+
+    // 裸请求（无 UA/无 Accept）→ 应被判定
+    HttpRequest r1; r1.method="GET"; r1.path="/";
+    auto a1 = bot.assess(r1);
+    CHECK((int)a1.action >= (int)Action::CHALLENGE, "bare request flagged as bot");
+
+    // 完整浏览器请求（含 UA/Accept/sec-ch-ua）→ PASS
+    HttpRequest r2; r2.method="GET"; r2.path="/";
+    r2.headers["User-Agent"] = "Mozilla/5.0 Chrome/120";
+    r2.headers["Accept"] = "text/html";
+    r2.headers["Accept-Language"] = "en-US";
+    r2.headers["Accept-Encoding"] = "gzip";
+    r2.headers["sec-ch-ua"] = "\"Chromium\"";
+    auto a2 = bot.assess(r2);
+    CHECK(a2.action == Action::PASS, "browser-like request passes");
+
+    // 声明现代 UA 但无客户端提示头 → 触发
+    HttpRequest r3; r3.method="GET"; r3.path="/";
+    r3.headers["User-Agent"] = "Mozilla/5.0 Chrome/120";
+    r3.headers["Accept"] = "text/html";
+    auto a3 = bot.assess(r3);
+    CHECK((int)a3.action >= (int)Action::CHALLENGE, "modern ua without hints flagged");
+}
+
+static void test_dynamic_shield() {
+    TEST("DynamicShield");
+    using namespace novawaf;
+
+    DynamicShield::Config cfg;
+    cfg.sampleMs = 100; cfg.elevatedQps = 50; cfg.highQps = 200; cfg.severeQps = 1000;
+    DynamicShield shield(cfg);
+    std::atomic<int> calls{0};
+    ThreatLevel seen = ThreatLevel::NORMAL;
+    shield.observe([&](ThreatLevel l){ if ((int)l > (int)seen) seen = l; calls++; });
+    shield.start();
+    // 持续注入请求 + 拦截（覆盖整个采样窗口），应触发升级
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (int i = 0; i < 2000; ++i) { shield.recordRequest(); shield.recordBlock(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    shield.stop();
+    CHECK((int)seen >= (int)ThreatLevel::ELEVATED, "shield escalates under load");
+    CHECK(calls.load() >= 1, "observer callback fired");
+}
+
+static void test_ti_fingerprint() {
+    TEST("TiFingerprint");
+    using namespace novawaf;
+
+    ThreatIntel ti(TiSeverity::HIGH);
+    ti.loadFromLines({
+        "ja4,t12di_8daaf6152771_e5627efa2ab1,critical,bot,known bot JA4",
+        "fingerprint,h0123456789ab,high,bot,bad http fp",
+    });
+    HttpRequest req; req.clientIp = "8.8.8.8"; req.path = "/";
+    // JA4 命中
+    auto m = ti.match(req, "t12di_8daaf6152771_e5627efa2ab1", "");
+    CHECK(m && m->action == Action::BLOCK, "ja4 blacklist blocks");
+    // HTTP 指纹命中
+    auto m2 = ti.match(req, "", "h0123456789ab");
+    CHECK(m2 && m2->action == Action::BLOCK, "http fp blacklist blocks");
+    // 干净指纹不命中
+    CHECK(!ti.match(req, "t13d_aaaaaaaaaaaa_bbbbbbbbbbbb", "hfedcba").has_value(), "clean fp passes");
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -515,6 +680,11 @@ int main() {
     test_ai_async();
     test_new_detectors();
     test_threat_intel();
+    test_fingerprint();
+    test_cc_guard();
+    test_bot_guard();
+    test_dynamic_shield();
+    test_ti_fingerprint();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);

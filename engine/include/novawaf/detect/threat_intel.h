@@ -69,6 +69,8 @@ struct TiDataset {
     AcAutomaton domains;
     AcAutomaton uas;
     AcAutomaton signatures;   // 攻击签名（命中任意 payload）
+    std::unordered_set<std::string> ja4;        // JA4 指纹黑名单（精确匹配）
+    std::unordered_set<std::string> fingerprints; // HTTP 层指纹黑名单（精确匹配）
     std::unordered_map<std::string, IoC> meta;  // key(type:value) -> 原始 IOC
     size_t count = 0;
 };
@@ -107,8 +109,21 @@ public:
 
     // 匹配请求，命中返回处置结果；否则空
     std::optional<DetectionResult> match(const HttpRequest& req) {
+        return match(req, "", "");
+    }
+
+    // 带指纹匹配：ja4（TLS 指纹，可由前置层透传 X-JA4 头）与 httpFp（HTTP 层指纹）
+    std::optional<DetectionResult> match(const HttpRequest& req,
+                                         const std::string& ja4,
+                                         const std::string& httpFp) {
         auto ds = data_.load(std::memory_order_acquire);
         if (!ds || ds->count == 0) return std::nullopt;
+
+        // 0) 指纹黑名单（最快、最稳定的客户端归并特征）
+        if (!ja4.empty() && ds->ja4.count(ja4))
+            return makeResult(*ds, "ja4:" + ja4, ja4);
+        if (!httpFp.empty() && ds->fingerprints.count(httpFp))
+            return makeResult(*ds, "fingerprint:" + httpFp, httpFp);
 
         // 1) 源 IP（精确 + CIDR）
         if (!req.clientIp.empty()) {
@@ -178,6 +193,10 @@ private:
             ds.domains.addPattern(ioc.value);
         } else if (ioc.type == "ua") {
             ds.uas.addPattern(ioc.value);
+        } else if (ioc.type == "ja4") {
+            ds.ja4.insert(ioc.value);
+        } else if (ioc.type == "fingerprint" || ioc.type == "fp") {
+            ds.fingerprints.insert(ioc.value);
         } else if (ioc.type == "signature") {
             ds.signatures.addPattern(ioc.value);
         }

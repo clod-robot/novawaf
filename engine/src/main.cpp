@@ -6,6 +6,10 @@
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/threat_intel.h"
+#include "novawaf/protect/cc_guard.h"
+#include "novawaf/protect/bot_guard.h"
+#include "novawaf/protect/dynamic_shield.h"
+#include "novawaf/protect/fingerprint.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -60,7 +64,10 @@ static void setNonblock(int fd) {
 // 单 Reactor 线程：监听 + 读请求 + 检测 + 简单回包（演示版）
 static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         RateLimiter& limiter, DdosGuard& ddos,
-                        const std::shared_ptr<AiDetector>& ai, int idx) {
+                        const std::shared_ptr<AiDetector>& ai,
+                        CcGuard& cc, BotGuard& bot,
+                        const std::shared_ptr<ThreatIntel>& ti,
+                        DynamicShield& shield, int idx) {
     int epfd = epoll_create1(0);
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -118,18 +125,85 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     if (!ddos.onRequest(req.clientIp)) {
                         // 请求速率超限 → 触发封禁链路，返回 429
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+                        shield.recordBlock();
                     } else if (!limiter.allow(req.clientIp)) {
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+                        shield.recordBlock();
                     } else {
-                        DetectionResult dr = detectWithAiReview(pipeline, ai, req);
-                        if (dr.isBlocked()) {
-                            std::printf("[reactor %d] BLOCK %s from %s: %s\n",
-                                        idx, dr.category.c_str(), ipstr, dr.matched.c_str());
-                            resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                   "Content-Length: 52\r\n\r\n"
-                                   "<html><body>Blocked by NovaWAF</body></html>";
-                        } else {
-                            resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                        // 动态防护统计
+                        shield.recordRequest();
+                        shield.recordIp(req.clientIp);
+
+                        // 指纹（JA4 由前置层通过 X-JA4 透传；HTTP 指纹本地计算）
+                        std::string ja4, httpFp;
+                        for (auto& [k, v] : req.headers) {
+                            std::string lk = k;
+                            for (auto& c : lk) c = (char)tolower((unsigned char)c);
+                            if (lk == "x-ja4") { ja4 = v; }
+                        }
+                        httpFp = httpFingerprint(req.method, req.headers);
+
+                        // 威胁情报：指纹/IP/路径/UA/签名 黑名单
+                        bool blocked = false;
+                        if (ti) {
+                            auto tr = ti->match(req, ja4, httpFp);
+                            if (tr && tr->isBlocked()) {
+                                std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
+                                            idx, tr->category.c_str(), ipstr, tr->matched.c_str());
+                                resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                       "Content-Length: 52\r\n\r\n"
+                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                shield.recordBlock();
+                                blocked = true;
+                            }
+                        }
+                        // CC 攻击防护
+                        if (!blocked) {
+                            DetectionResult cr = cc.assess(req.clientIp, req.path);
+                            if (cr.action != Action::PASS) {
+                                std::printf("[reactor %d] %s CC from %s: %s\n",
+                                            idx, cr.action == Action::BLOCK ? "BLOCK" : "CHAL",
+                                            ipstr, cr.matched.c_str());
+                                resp = (cr.action == Action::BLOCK)
+                                       ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                         "Content-Length: 52\r\n\r\n"
+                                         "<html><body>Blocked by NovaWAF</body></html>"
+                                       : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
+                                         "Content-Length: 0\r\n\r\n";
+                                if (cr.action == Action::BLOCK) shield.recordBlock();
+                                blocked = true;
+                            }
+                        }
+                        // Bot 行为防护
+                        if (!blocked) {
+                            DetectionResult br = bot.assess(req, ja4);
+                            if (br.action != Action::PASS) {
+                                std::printf("[reactor %d] %s Bot from %s: %s\n",
+                                            idx, br.action == Action::BLOCK ? "BLOCK" : "CHAL",
+                                            ipstr, br.matched.c_str());
+                                resp = (br.action == Action::BLOCK)
+                                       ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                         "Content-Length: 52\r\n\r\n"
+                                         "<html><body>Blocked by NovaWAF</body></html>"
+                                       : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
+                                         "Content-Length: 0\r\n\r\n";
+                                if (br.action == Action::BLOCK) shield.recordBlock();
+                                blocked = true;
+                            }
+                        }
+                        // 规则 + AI 二阶复核
+                        if (!blocked) {
+                            DetectionResult dr = detectWithAiReview(pipeline, ai, req);
+                            if (dr.isBlocked()) {
+                                std::printf("[reactor %d] BLOCK %s from %s: %s\n",
+                                            idx, dr.category.c_str(), ipstr, dr.matched.c_str());
+                                resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                       "Content-Length: 52\r\n\r\n"
+                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                shield.recordBlock();
+                            } else {
+                                resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                            }
                         }
                     }
                     ssize_t w = write(fd, resp, strlen(resp));
@@ -195,6 +269,21 @@ int main(int argc, char** argv) {
     ddosCfg.banSeconds          = 300;  // 封禁 5 分钟，到期自动解封
     DdosGuard ddos(ddosCfg);
 
+    // ---- 应用层防护：CC / Bot / 动态自适应 / 指纹威胁情报 ----
+    CcGuard::Config ccCfg;
+    ccCfg.maxReqPerWindow  = 300;   // 单 IP 10s 内 300 次（正常浏览远低于此）
+    ccCfg.burstPerUrl      = 80;    // 单 IP 刷同 URL 上限
+    ccCfg.hotUrlGlobal     = 800;   // 全局热点 URL 阈值
+    CcGuard cc(ccCfg);
+    BotGuard bot(BotGuard::Config{});
+    DynamicShield shield(DynamicShield::Config{});
+    // 观察者：态势升级 → 收紧 CC 阈值
+    shield.observe([&](ThreatLevel lvl) {
+        cc.applyThreatLevel((int)lvl);
+        std::printf("[shield] threat level -> %s\n", levelName(lvl));
+    });
+    shield.start();
+
     // ---- AI 大模型二阶复核（可指向本地模型或外部 API，不可用则自动降级）----
     // 配置来源：环境变量。未配置 NOVAAI_ENABLE=1 时 AI 完全不启用，引擎=纯规则。
     LlmConfig llmCfg;
@@ -231,8 +320,11 @@ int main(int argc, char** argv) {
         int lfd = createListenFd(port, 4096);
         if (lfd < 0) { std::perror("listen"); return 1; }
         reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
-                              std::ref(limiter), std::ref(ddos), ai, i);
+                              std::ref(limiter), std::ref(ddos), ai,
+                              std::ref(cc), std::ref(bot), threatIntel,
+                              std::ref(shield), i);
     }
     for (auto& t : reactors) t.join();
+    shield.stop();
     return 0;
 }
