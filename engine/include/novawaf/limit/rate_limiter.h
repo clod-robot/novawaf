@@ -62,27 +62,34 @@ private:
     std::atomic<int64_t> lastRefill_;
 };
 
-// 按 key（IP/UID）分桶的限流器
+// 按 key（IP/UID）分桶的限流器（分片锁，降低并发竞争）
 class RateLimiter {
 public:
+    static constexpr size_t kShards = 64;
+
     RateLimiter(int64_t capacity, int64_t refillPerSec)
-        : capacity_(capacity), refillPerSec_(refillPerSec) {}
+        : capacity_(capacity), refillPerSec_(refillPerSec), shards_(kShards) {}
 
     bool allow(const std::string& key) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = buckets_.find(key);
-        if (it == buckets_.end()) {
-            it = buckets_.emplace(key,
+        size_t h = std::hash<std::string>{}(key) & (kShards - 1);
+        auto& shard = shards_[h];
+        std::lock_guard<std::mutex> lk(shard.mtx);
+        auto it = shard.buckets.find(key);
+        if (it == shard.buckets.end()) {
+            it = shard.buckets.emplace(key,
                 std::make_unique<TokenBucket>(capacity_, refillPerSec_)).first;
         }
         return it->second->tryConsume();
     }
 
 private:
-    std::mutex mtx_;
-    std::unordered_map<std::string, std::unique_ptr<TokenBucket>> buckets_;
+    struct Shard {
+        std::mutex mtx;
+        std::unordered_map<std::string, std::unique_ptr<TokenBucket>> buckets;
+    };
     int64_t capacity_;
     int64_t refillPerSec_;
+    std::vector<Shard> shards_;
 };
 
 }  // namespace novawaf

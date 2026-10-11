@@ -17,6 +17,8 @@ public:
     virtual ~IDetector() = default;
     virtual const char* name() const = 0;
     virtual DetectionResult detect(const HttpRequest& req) = 0;
+    // 用于 copy-on-write 热更新：克隆一个独立检测器（含独立 AC 自动机）
+    virtual std::unique_ptr<IDetector> clone() const = 0;
 };
 
 // ---- SQL 注入检测器 ----
@@ -33,6 +35,7 @@ public:
     }
 
     const char* name() const override { return "SQLi"; }
+    std::unique_ptr<IDetector> clone() const override { return std::make_unique<SqlInjectionDetector>(); }
 
     DetectionResult detect(const HttpRequest& req) override {
         for (auto& payload : req.collectPayloads()) {
@@ -86,6 +89,7 @@ public:
     }
 
     const char* name() const override { return "XSS"; }
+    std::unique_ptr<IDetector> clone() const override { return std::make_unique<XssDetector>(); }
 
     DetectionResult detect(const HttpRequest& req) override {
         for (auto& payload : req.collectPayloads()) {
@@ -114,6 +118,7 @@ public:
     }
 
     const char* name() const override { return "RCE"; }
+    std::unique_ptr<IDetector> clone() const override { return std::make_unique<CommandInjectionDetector>(); }
 
     DetectionResult detect(const HttpRequest& req) override {
         for (auto& payload : req.collectPayloads()) {
@@ -140,6 +145,7 @@ public:
     }
 
     const char* name() const override { return "Traversal"; }
+    std::unique_ptr<IDetector> clone() const override { return std::make_unique<PathTraversalDetector>(); }
 
     DetectionResult detect(const HttpRequest& req) override {
         for (auto& payload : req.collectPayloads()) {

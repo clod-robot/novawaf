@@ -1,5 +1,6 @@
 // NovaWAF - 检测流水线（责任链模式）
-// 按顺序执行各检测器，任一命中即短路返回。支持运行时增删检测器、规则热加载。
+// 按顺序执行各检测器，任一命中即短路返回。
+// 性能关键：detect() 热路径无锁 —— 检测器只读，用 shared_ptr 原子交换实现 copy-on-write 热更新。
 #pragma once
 
 #include "novawaf/detect/detectors.h"
@@ -7,41 +8,53 @@
 
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 namespace novawaf {
 
 class DetectionPipeline {
 public:
+    using DetectorList = std::vector<std::unique_ptr<IDetector>>;
+
     DetectionPipeline() {
-        // 默认加载全套检测器
-        detectors_.push_back(std::make_unique<SqlInjectionDetector>());
-        detectors_.push_back(std::make_unique<XssDetector>());
-        detectors_.push_back(std::make_unique<CommandInjectionDetector>());
-        detectors_.push_back(std::make_unique<PathTraversalDetector>());
+        auto list = std::make_shared<DetectorList>();
+        list->push_back(std::make_unique<SqlInjectionDetector>());
+        list->push_back(std::make_unique<XssDetector>());
+        list->push_back(std::make_unique<CommandInjectionDetector>());
+        list->push_back(std::make_unique<PathTraversalDetector>());
+        detectors_.store(list, std::memory_order_release);
+    }
+
+    // 热更新：整体替换检测器列表（copy-on-write，与 detect 无锁竞争）
+    void setDetectors(std::shared_ptr<DetectorList> list) {
+        detectors_.store(list, std::memory_order_release);
     }
 
     void addDetector(std::unique_ptr<IDetector> d) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        detectors_.push_back(std::move(d));
+        auto cur = detectors_.load(std::memory_order_acquire);
+        auto next = std::make_shared<DetectorList>();
+        next->reserve(cur->size() + 1);
+        for (auto& up : *cur) next->push_back(up->clone());
+        next->push_back(std::move(d));
+        detectors_.store(next, std::memory_order_release);
     }
 
-    // 线程安全的检测入口（共享只读，热更新时整体替换）
+    // 无锁检测入口：原子 load 一次 shared_ptr，期间检测器只读
     DetectionResult detect(const HttpRequest& req) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (auto& d : detectors_) {
+        auto list = detectors_.load(std::memory_order_acquire);
+        for (auto& d : *list) {
             DetectionResult r = d->detect(req);
             if (r.action != Action::PASS) return r;
         }
         return {};
     }
 
-    size_t detectorCount() const { return detectors_.size(); }
+    size_t detectorCount() const {
+        return detectors_.load(std::memory_order_acquire)->size();
+    }
 
 private:
-    mutable std::mutex mtx_;
-    std::vector<std::unique_ptr<IDetector>> detectors_;
+    std::atomic<std::shared_ptr<DetectorList>> detectors_;
 };
 
 }  // namespace novawaf
