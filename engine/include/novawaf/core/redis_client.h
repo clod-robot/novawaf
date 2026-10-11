@@ -117,13 +117,42 @@ public:
         if (!r || r->kind != Reply::INTEGER) return std::nullopt;
         return r->integer;
     }
+    // RPUSH key value -> 推送后列表长度（失败 nullopt）
+    std::optional<int64_t> rpush(const std::string& key, const std::string& value) {
+        auto r = command({"RPUSH", key, value});
+        if (!r || r->kind != Reply::INTEGER) return std::nullopt;
+        return r->integer;
+    }
+    // RPUSH key v1 v2 ... 批量推送（失败 nullopt）
+    std::optional<int64_t> rpushMulti(const std::string& key, const std::vector<std::string>& values) {
+        std::vector<std::string> args;
+        args.reserve(values.size() + 2);
+        args.push_back("RPUSH");
+        args.push_back(key);
+        for (auto& v : values) args.push_back(v);
+        auto r = command(args);
+        if (!r || r->kind != Reply::INTEGER) return std::nullopt;
+        return r->integer;
+    }
+    // LTRIM key start stop（成功返回 true）
+    bool ltrim(const std::string& key, int64_t start, int64_t stop) {
+        auto r = command({"LTRIM", key, std::to_string(start), std::to_string(stop)});
+        return r && r->kind == Reply::STATUS && r->status == "OK";
+    }
+    // LRANGE key start stop -> 元素列表（失败 nullopt）
+    std::optional<std::vector<std::string>> lrange(const std::string& key, int64_t start, int64_t stop) {
+        auto r = command({"LRANGE", key, std::to_string(start), std::to_string(stop)});
+        if (!r || r->kind != Reply::ARRAY) return std::nullopt;
+        return r->arr;
+    }
 
 private:
     struct Reply {
-        enum Kind { STATUS, ERROR, INTEGER, BULK } kind = STATUS;
+        enum Kind { STATUS, ERROR, INTEGER, BULK, ARRAY } kind = STATUS;
         std::string status;   // STATUS / ERROR 文本
         int64_t integer = 0;
         std::optional<std::string> bulk;
+        std::vector<std::string> arr;  // ARRAY（批量字符串）
         std::string asString() const { return kind == BULK ? (bulk.value_or("")) : status; }
     };
 
@@ -203,7 +232,20 @@ private:
             rep.bulk = std::move(s);
             return rep;
         }
-        return std::nullopt;  // 数组等本客户端暂不需要
+        if (t == '*') {
+            long count = std::atol(body.c_str());
+            rep.kind = Reply::ARRAY;
+            if (count < 0) return rep;  // nil array
+            for (long i = 0; i < count; ++i) {
+                auto elem = readReply();
+                if (!elem) return std::nullopt;
+                if (elem->kind == Reply::BULK) rep.arr.push_back(elem->bulk.value_or(""));
+                else if (elem->kind == Reply::STATUS) rep.arr.push_back(elem->status);
+                else rep.arr.push_back(std::to_string(elem->integer));
+            }
+            return rep;
+        }
+        return std::nullopt;
     }
 
     std::optional<Reply> command(const std::vector<std::string>& args) {

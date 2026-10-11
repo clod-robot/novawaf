@@ -2,6 +2,7 @@
 // 多 Reactor (SO_REUSEPORT) + epoll + 检测流水线 + 限流器
 // 编译: 见 CMakeLists.txt (Linux, g++/clang++ C++20)
 #include "novawaf/core/buffer.h"
+#include "novawaf/core/event_sink.h"
 #include "novawaf/core/mpmc_queue.h"
 #include "novawaf/core/redis_client.h"
 #include "novawaf/core/thread_pool.h"
@@ -43,6 +44,16 @@
 using namespace novawaf;
 
 static std::atomic<bool> g_running{true};
+
+// 态势统计：拦截事件异步入队（热路径不阻塞）
+static void emitEvt(const std::string& ip, const std::string& cat,
+                    const std::string& action, const std::string& ruleId,
+                    const std::string& matched) {
+    AttackEvent e;
+    e.ts = (int64_t)std::time(nullptr);
+    e.ip = ip; e.category = cat; e.action = action; e.ruleId = ruleId; e.matched = matched;
+    EventSink::instance().emit(std::move(e));
+}
 
 // 拆分逗号分隔字符串（用于 NOVA_GEO_BLOCK=CN,RU 等环境变量）
 static std::vector<std::string> splitCsvStr(const char* s) {
@@ -210,9 +221,11 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         // 请求速率超限 → 触发封禁链路，返回 429
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                         shield.recordBlock();
+                        emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit");
                     } else if (!limiter.allow(req.clientIp)) {
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                         shield.recordBlock();
+                        emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit");
                     } else {
                         // 动态防护统计
                         shield.recordRequest();
@@ -238,6 +251,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 52\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
+                                emitEvt(req.clientIp, tr->category, "block", tr->ruleId, tr->matched);
                                 blocked = true;
                             }
                         }
@@ -252,6 +266,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 52\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
+                                emitEvt(req.clientIp, "Geo", "block", gr->ruleId, gr->matched);
                                 blocked = true;
                             }
                         }
@@ -268,6 +283,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
                                 if (cr.action == Action::BLOCK) shield.recordBlock();
+                                emitEvt(req.clientIp, "CC", cr.action == Action::BLOCK ? "block" : "challenge", cr.ruleId, cr.matched);
                                 blocked = true;
                             }
                         }
@@ -285,6 +301,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
                                 if (br.action == Action::BLOCK) shield.recordBlock();
+                                emitEvt(req.clientIp, "Bot", br.action == Action::BLOCK ? "block" : "challenge", br.ruleId, br.matched);
                                 blocked = true;
                             }
                         }
@@ -298,6 +315,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 52\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
+                                emitEvt(req.clientIp, dr.category, "block", dr.ruleId, dr.matched);
                             } else {
                                 resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
                             }
@@ -329,6 +347,9 @@ int main(int argc, char** argv) {
     int port = (argc > 1) ? atoi(argv[1]) : 8080;
     int threads = (argc > 2) ? atoi(argv[2]) : (int)std::thread::hardware_concurrency();
     signal(SIGPIPE, SIG_IGN);
+
+    // 态势统计事件汇聚（异步写 Redis，可视化大屏数据源）
+    EventSink::instance().start();
 
     DetectionPipeline pipeline;
     RateLimiter limiter(100, 1000);  // 每 IP 突发 100，每秒补 1000
@@ -497,5 +518,6 @@ int main(int argc, char** argv) {
     }
     for (auto& t : reactors) t.join();
     shield.stop();
+    EventSink::instance().stop();
     return 0;
 }
