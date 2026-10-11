@@ -41,6 +41,7 @@ public:
             if (!changed || next == current) break;
             current = next;
         }
+        toLowerInPlace(current);  // 终态统一小写，防止大小写绕过
         return current;
     }
 

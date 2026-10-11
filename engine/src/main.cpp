@@ -5,12 +5,15 @@
 #include "novawaf/core/mpmc_queue.h"
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/detect/pipeline.h"
+#include "novawaf/detect/threat_intel.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
 #include "novawaf/ai/http_transport.h"
+
+#include <fstream>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -22,6 +25,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,6 +161,29 @@ int main(int argc, char** argv) {
 
     DetectionPipeline pipeline;
     RateLimiter limiter(100, 1000);  // 每 IP 突发 100，每秒补 1000
+
+    // ---- 威胁情报 IOC：从文件加载并注入流水线，支持热更新 ----
+    auto threatIntel = std::make_shared<ThreatIntel>(TiSeverity::HIGH);
+    const char* iocFile = getenv("NOVA_IOC_FILE");
+    std::string iocPath = iocFile ? iocFile : "rules/ioc.txt";
+    auto loadIoc = [&](const std::string& path) -> size_t {
+        std::ifstream in(path);
+        if (!in) return 0;
+        std::vector<std::string> lines;
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+        return threatIntel->loadFromLines(lines);
+    };
+    size_t iocN = loadIoc(iocPath);
+    pipeline.addDetector(std::make_unique<TiDetector>(threatIntel));
+    // 后台定时刷新线程（每 60s 重读文件；可扩展为远程拉取）
+    std::thread([threatIntel, iocPath, loadIoc]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            if (!g_running) break;
+            loadIoc(iocPath);  // copy-on-write 原子替换，不阻塞检测
+        }
+    }).detach();
 
     // DDoS / 网络攻击防护配置
     DdosGuard::Config ddosCfg;

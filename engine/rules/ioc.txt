@@ -1,0 +1,29 @@
+# NovaWAF 威胁情报 IOC 种子库
+# 格式: type,value,severity,category,desc
+#   type: ip / cidr / path / domain / ua / signature
+#   severity: low|medium|high|critical  (>=blockThreshold 拦截, medium 挑战, low 记录)
+#   以 # 开头为注释，空行忽略。可由远程情报源定期覆盖更新。
+
+# ---- 恶意源 IP / 网段（示例，生产应替换为实时情报）----
+ip,203.0.113.66,critical,botnet,C2 僵尸网络节点
+cidr,198.51.100.0/24,high,scanner,已知扫描段
+ip,192.0.2.99,high,bruteforce,SSH 爆破源
+
+# ---- 已知 Webshell / 恶意路径 ----
+path,/wp-content/uploads/shell.php,critical,webshell,常见 webshell 路径
+path,/vendor/phpunit,high,exploit,PHPUnit RCE 利用路径
+path,/cgi-bin/.%2e,high,exploit,经典绕过路径
+path,/actuator/env,high,info,Spring 敏感端点
+
+# ---- 恶意域名 / Host ----
+domain,evil.example.com,high,c2,恶意 C2 域名
+
+# ---- 恶意 User-Agent ----
+ua,sqlmap,critical,scanner,sqlmap 扫描器
+ua,morfeus,high,scanner,Morfeus 漏洞扫描
+ua,zgrab,medium,scanner,互联网扫描
+
+# ---- 攻击签名（命中任意 payload）----
+signature,exec xp_cmdshell,critical,sqli,MSSQL 命令执行
+signature,<script>alert(1)</script>,medium,xss,XSS 探针
+signature,;cat /etc/passwd,high,rce,命令执行读文件

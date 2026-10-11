@@ -18,10 +18,17 @@ public:
 
     DetectionPipeline() {
         auto list = std::make_shared<DetectorList>();
+        // 威胁情报优先（IOC 命中即处置，最快）
         list->push_back(std::make_unique<SqlInjectionDetector>());
         list->push_back(std::make_unique<XssDetector>());
         list->push_back(std::make_unique<CommandInjectionDetector>());
         list->push_back(std::make_unique<PathTraversalDetector>());
+        list->push_back(std::make_unique<SstiDetector>());
+        list->push_back(std::make_unique<XxeDetector>());
+        list->push_back(std::make_unique<SsrfDetector>());
+        list->push_back(std::make_unique<CrlfDetector>());
+        list->push_back(std::make_unique<InfoLeakDetector>());
+        list->push_back(std::make_unique<ScannerDetector>());
         detectors_.store(list, std::memory_order_release);
     }
 

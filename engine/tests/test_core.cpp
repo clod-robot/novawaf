@@ -99,7 +99,7 @@ static void test_detectors() {
 static void test_pipeline() {
     TEST("Pipeline");
     novawaf::DetectionPipeline pipe;
-    CHECK(pipe.detectorCount() == 4, "four detectors loaded");
+    CHECK(pipe.detectorCount() == 10, "ten detectors loaded");
     novawaf::HttpRequest req;
     req.query = "id=1' or '1'='1";
     auto r = pipe.detect(req);
@@ -398,6 +398,105 @@ static void test_ai_async() {
     pool->stop();
 }
 
+static void test_new_detectors() {
+    TEST("NewDetectors");
+    using namespace novawaf;
+
+    auto mkReq = [](const std::string& q) {
+        HttpRequest r; r.method = "GET"; r.path = "/x"; r.query = q;
+        r.headers["User-Agent"] = "curl/7.0";
+        return r;
+    };
+
+    { SstiDetector d; auto r = d.detect(mkReq("name={{7*7}}"));
+      CHECK(r.action == Action::BLOCK && r.category == "SSTI", "SSTI {{7*7}}"); }
+    { SstiDetector d; auto r = d.detect(mkReq("name=hello"));
+      CHECK(r.action == Action::PASS, "SSTI benign pass"); }
+
+    { XxeDetector d; HttpRequest r; r.method="POST"; r.path="/x"; r.body="<!ENTITY xxe SYSTEM>";
+      CHECK(d.detect(r).action == Action::BLOCK, "XXE entity"); }
+
+    { SsrfDetector d; auto r = d.detect(mkReq("url=http://169.254.169.254/"));
+      CHECK(r.action == Action::BLOCK && r.category == "SSRF", "SSRF metadata"); }
+    { SsrfDetector d; auto r = d.detect(mkReq("url=gopher://x"));
+      CHECK(r.action == Action::BLOCK, "SSRF gopher scheme"); }
+
+    { CrlfDetector d; auto r = d.detect(mkReq("next=http://a/%0d%0aSet-Cookie:x=1"));
+      CHECK(r.action == Action::BLOCK, "CRLF header injection"); }
+
+    { InfoLeakDetector d; HttpRequest r; r.method="GET"; r.path="/.env"; r.headers["User-Agent"]="x";
+      CHECK(d.detect(r).action == Action::BLOCK, "InfoLeak .env"); }
+
+    { ScannerDetector d; HttpRequest r; r.method="GET"; r.path="/"; r.headers["User-Agent"]="sqlmap/1.5";
+      CHECK(d.detect(r).action == Action::BLOCK, "Scanner sqlmap UA"); }
+    { ScannerDetector d; HttpRequest r; r.method="GET"; r.path="/"; r.headers["User-Agent"]="Mozilla/5.0";
+      CHECK(d.detect(r).action == Action::PASS, "Scanner benign UA pass"); }
+}
+
+static void test_threat_intel() {
+    TEST("ThreatIntel");
+    using namespace novawaf;
+
+    ThreatIntel ti(TiSeverity::HIGH);  // >=HIGH 拦截，MEDIUM 挑战，LOW 记录
+    size_t n = ti.loadFromLines({
+        "# comment",
+        "ip,203.0.113.66,critical,botnet,c2",
+        "cidr,198.51.100.0/24,high,scanner,scan range",
+        "path,/wp-admin,critical,webshell,wp admin",
+        "domain,evil.com,high,c2,bad domain",
+        "ua,nikto,high,scanner,nikto",
+        "signature,exec xp_cmdshell,critical,sqli,mssql exec",
+        "garbage line",
+    });
+    CHECK(n == 6, "parsed 6 valid IOCs");
+    CHECK(ti.count() == 6, "count matches");
+
+    // 1) 恶意 IP 精确命中 → critical → BLOCK
+    { HttpRequest r; r.clientIp = "203.0.113.66";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "malicious ip blocked"); }
+
+    // 2) CIDR 命中（段内任意 IP）→ high → BLOCK
+    { HttpRequest r; r.clientIp = "198.51.100.42";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "cidr match blocked"); }
+    // 段外不应命中
+    { HttpRequest r; r.clientIp = "198.51.101.5";
+      CHECK(!ti.match(r).has_value(), "cidr out-of-range not matched"); }
+
+    // 3) 路径命中
+    { HttpRequest r; r.path = "/wp-admin/login.php";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "path ioc blocked"); }
+
+    // 4) 域名命中（Host 头）
+    { HttpRequest r; r.path="/"; r.headers["Host"]="evil.com";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "domain ioc blocked"); }
+
+    // 5) UA 命中
+    { HttpRequest r; r.path="/"; r.headers["User-Agent"]="Nikto/2.1.6";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "ua ioc blocked"); }
+
+    // 6) 攻击签名命中（出现在 query）
+    { HttpRequest r; r.path="/x"; r.query="q=exec xp_cmdshell";
+      auto m = ti.match(r); CHECK(m && m->action == Action::BLOCK, "signature ioc blocked"); }
+
+    // 7) 正常流量不命中
+    { HttpRequest r; r.clientIp="8.8.8.8"; r.path="/index.html";
+      CHECK(!ti.match(r).has_value(), "clean traffic no match"); }
+
+    // 8) 热更新：reload 后旧数据被替换
+    ti.loadFromLines({"ip,1.2.3.4,high,x,x"});
+    CHECK(ti.count() == 1, "reload replaces dataset");
+    { HttpRequest r; r.clientIp="203.0.113.66";
+      CHECK(!ti.match(r).has_value(), "old ioc gone after reload"); }
+    { HttpRequest r; r.clientIp="1.2.3.4";
+      CHECK(ti.match(r)->action == Action::BLOCK, "new ioc active after reload"); }
+
+    // 9) 分级：MEDIUM → CHALLENGE
+    ThreatIntel ti2(TiSeverity::HIGH);
+    ti2.loadFromLines({"ua,slowika,medium,bot,slow bot"});
+    { HttpRequest r; r.path="/"; r.headers["User-Agent"]="slowika";
+      auto m = ti2.match(r); CHECK(m && m->action == Action::CHALLENGE, "medium -> challenge"); }
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -414,6 +513,8 @@ int main() {
     test_ai_detector();
     test_ai_cache();
     test_ai_async();
+    test_new_detectors();
+    test_threat_intel();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);
