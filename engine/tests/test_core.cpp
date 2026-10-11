@@ -12,6 +12,7 @@
 #include "novawaf/protect/bot_guard.h"
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
+#include "novawaf/protect/geo_filter.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -662,6 +663,61 @@ static void test_ti_fingerprint() {
     CHECK(!ti.match(req, "t13d_aaaaaaaaaaaa_bbbbbbbbbbbb", "hfedcba").has_value(), "clean fp passes");
 }
 
+static void test_geo_filter() {
+    TEST("GeoFilter");
+    using namespace novawaf;
+
+    GeoFilter geo;
+    size_t n = geo.loadFromLines({
+        "# comment",
+        "8.8.8.0/24,US,Google",
+        "114.114.114.0/24,CN,dns",
+        "1.1.1.0/24,AU,cf",
+        "203.0.113.0/24,us,TEST",  // 小写 cc 应被归一为大写
+        "garbage",
+    });
+    CHECK(n == 4, "parsed 4 valid cidr ranges");
+    CHECK(geo.rangeCount() == 4, "range count matches");
+
+    // 未启用 → 一律放行
+    CHECK(!geo.assess("8.8.8.8").has_value(), "disabled -> pass");
+
+    // 黑名单模式
+    geo.setEnabled(true);
+    geo.setBlockedCountries({"CN", "RU"});
+    auto m = geo.assess("114.114.114.114");
+    CHECK(m && m->action == Action::BLOCK && m->matched.find("CN") != std::string::npos,
+          "blacklist blocks CN");
+    CHECK(m && m->category == "GeoBlock", "category GeoBlock");
+    // 小写 cc 归一：203.0.113.5 → US，不在黑名单 → 放行
+    CHECK(!geo.assess("203.0.113.5").has_value(), "US not in blacklist -> pass");
+    // 未知国家 → 默认放行
+    CHECK(!geo.assess("9.9.9.9").has_value(), "unknown country -> pass");
+
+    // 私有/保留地址永远放行（即使在配置了封锁的模式下）
+    CHECK(!geo.assess("192.168.1.1").has_value(), "private 192.168 pass");
+    CHECK(!geo.assess("10.0.0.5").has_value(), "private 10/8 pass");
+    CHECK(!geo.assess("127.0.0.1").has_value(), "loopback pass");
+    CHECK(!geo.assess("172.16.0.1").has_value(), "private 172.16 pass");
+    CHECK(!geo.assess("169.254.1.1").has_value(), "link-local pass");
+
+    // 白名单模式：仅放行 CN
+    geo.setMode(GeoMode::WHITELIST);
+    geo.setAllowedCountries({"CN"});
+    CHECK(!geo.assess("114.114.114.114").has_value(), "whitelist CN -> pass");
+    auto w = geo.assess("8.8.8.8");
+    CHECK(w && w->action == Action::BLOCK, "whitelist blocks non-CN US");
+    // 白名单对未知国家放行（保守）
+    CHECK(!geo.assess("9.9.9.9").has_value(), "whitelist unknown -> pass");
+
+    // 热更新：reload 替换数据集
+    geo.setMode(GeoMode::BLACKLIST);
+    geo.setBlockedCountries({"AU"});
+    geo.loadFromLines({"8.8.8.0/24,US,x"});  // 只剩 US 段
+    CHECK(geo.rangeCount() == 1, "reload replaces dataset");
+    CHECK(!geo.assess("1.1.1.1").has_value(), "old AU range gone after reload");
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -685,6 +741,7 @@ int main() {
     test_bot_guard();
     test_dynamic_shield();
     test_ti_fingerprint();
+    test_geo_filter();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);

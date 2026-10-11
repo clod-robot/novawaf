@@ -10,6 +10,7 @@
 #include "novawaf/protect/bot_guard.h"
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
+#include "novawaf/protect/geo_filter.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -41,6 +42,18 @@ using namespace novawaf;
 
 static std::atomic<bool> g_running{true};
 
+// 拆分逗号分隔字符串（用于 NOVA_GEO_BLOCK=CN,RU 等环境变量）
+static std::vector<std::string> splitCsvStr(const char* s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char* p = s; *p; ++p) {
+        if (*p == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+        else cur += *p;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 static int createListenFd(int port, int backlog) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -67,7 +80,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         const std::shared_ptr<AiDetector>& ai,
                         CcGuard& cc, BotGuard& bot,
                         const std::shared_ptr<ThreatIntel>& ti,
-                        DynamicShield& shield, int idx) {
+                        DynamicShield& shield, GeoFilter& geo, int idx) {
     int epfd = epoll_create1(0);
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -120,6 +133,21 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     getpeername(fd, (sockaddr*)&peer, &plen);
                     inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
                     req.clientIp = ipstr;
+                    // 若位于反向代理/CDN 之后，真实客户端 IP 在 X-Forwarded-For / X-Real-IP
+                    // 取最左侧（原始）IP，用于地理围栏等基于真实来源的判定
+                    for (auto& [k, v] : req.headers) {
+                        std::string lk = k;
+                        for (auto& c : lk) c = (char)tolower((unsigned char)c);
+                        if (lk == "x-forwarded-for" || lk == "x-real-ip") {
+                            std::string ff = v;
+                            auto comma = ff.find(',');
+                            if (comma != std::string::npos) ff = ff.substr(0, comma);
+                            // trim
+                            size_t a = 0; while (a < ff.size() && isspace((unsigned char)ff[a])) a++;
+                            ff = ff.substr(a);
+                            if (!ff.empty()) { req.clientIp = ff; break; }
+                        }
+                    }
 
                     const char* resp;
                     if (!ddos.onRequest(req.clientIp)) {
@@ -158,6 +186,19 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                         // CC 攻击防护
+                        if (!blocked) {
+                            // 地理位置拦截（GeoIP 地理围栏）
+                            auto gr = geo.assess(req.clientIp);
+                            if (gr && gr->isBlocked()) {
+                                std::printf("[reactor %d] BLOCK Geo from %s: %s\n",
+                                            idx, ipstr, gr->matched.c_str());
+                                resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                       "Content-Length: 52\r\n\r\n"
+                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                shield.recordBlock();
+                                blocked = true;
+                            }
+                        }
                         if (!blocked) {
                             DetectionResult cr = cc.assess(req.clientIp, req.path);
                             if (cr.action != Action::PASS) {
@@ -277,6 +318,31 @@ int main(int argc, char** argv) {
     CcGuard cc(ccCfg);
     BotGuard bot(BotGuard::Config{});
     DynamicShield shield(DynamicShield::Config{});
+
+    // ---- 地理位置拦截（GeoIP 地理围栏）：离线 CIDR→国家 映射 ----
+    GeoFilter geo;
+    const char* geoFile = getenv("NOVA_GEO_FILE");
+    std::string geoPath = geoFile ? geoFile : "rules/geoip.txt";
+    {
+        std::ifstream gin(geoPath);
+        if (gin) {
+            std::vector<std::string> glines; std::string gl;
+            while (std::getline(gin, gl)) glines.push_back(gl);
+            size_t gn = geo.loadFromLines(glines);
+            std::printf("  GeoIP: loaded %zu CIDR ranges from %s\n", gn, geoPath.c_str());
+        }
+    }
+    // 配置：NOVA_GEO_BLOCK=CN,RU  黑名单；NOVA_GEO_ALLOW=CN  白名单（仅放行）
+    if (const char* e = getenv("NOVA_GEO_BLOCK")) {
+        geo.setBlockedCountries(splitCsvStr(e));
+        geo.setEnabled(true);
+        std::printf("  GeoIP: BLACKLIST mode, blocked countries = %s\n", e);
+    } else if (const char* e = getenv("NOVA_GEO_ALLOW")) {
+        geo.setAllowedCountries(splitCsvStr(e));
+        geo.setMode(GeoMode::WHITELIST);
+        geo.setEnabled(true);
+        std::printf("  GeoIP: WHITELIST mode, allowed countries = %s\n", e);
+    }
     // 观察者：态势升级 → 收紧 CC 阈值
     shield.observe([&](ThreatLevel lvl) {
         cc.applyThreatLevel((int)lvl);
@@ -322,7 +388,7 @@ int main(int argc, char** argv) {
         reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
                               std::ref(limiter), std::ref(ddos), ai,
                               std::ref(cc), std::ref(bot), threatIntel,
-                              std::ref(shield), i);
+                              std::ref(shield), std::ref(geo), i);
     }
     for (auto& t : reactors) t.join();
     shield.stop();

@@ -1,0 +1,13 @@
+# NovaWAF - 离线 GeoIP 地理围栏数据（CIDR → 国家代码）
+# 格式: cidr,CC[,country_name]   CC 为 ISO 3166-1 alpha-2 两位代码（大写）
+# # 开头为注释，空行忽略。可被后台定期覆盖更新（copy-on-write 热加载）。
+#
+# 合规说明：本文件为离线映射，运行时不访问任何外部 API，不上传访问者 IP。
+# 生产环境建议用 MaxMind GeoLite2 等库转换为该 CSV 格式后覆盖本文件以获得完整精度。
+# 下方为少量公开已知网段示例（仅作功能演示，非完整库）：
+8.8.8.0/24,US,Google DNS
+8.8.4.0/24,US,Google DNS
+1.1.1.0/24,AU,Cloudflare
+114.114.114.0/24,CN,Public DNS
+203.0.113.0/24,US,TEST-NET-3
+198.51.100.0/24,GB,TEST-NET-2
