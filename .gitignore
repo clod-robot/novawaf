@@ -1,0 +1,25 @@
+# 构建产物
+build/
+target/
+*.o
+*.obj
+*.exe
+*.o.d
+cmake-build-*/
+
+# XDP
+xdp/*.o
+xdp/*.ll
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 临时
+_run.bat
+*.log

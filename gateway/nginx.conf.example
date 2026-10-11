@@ -1,0 +1,53 @@
+# NovaWAF - Nginx 网关接入配置示例
+# 网关层复用成熟 Nginx，通过 auth_request 子请求把请求送到检测引擎。
+# 检测引擎判定拦截则返回 403，否则放行回源。
+
+# 1. 检测引擎 upstream（多实例负载均衡）
+upstream novawaf_detector {
+    least_conn;
+    server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+    # server 127.0.0.1:8081 backup;
+    keepalive 64;
+}
+
+# 2. 受保护站点
+server {
+    listen 80;
+    server_name example.com;
+
+    # 把原始请求方法/URL/IP 通过 header 传给检测子请求
+    location = /novawaf_check {
+        internal;
+        proxy_pass http://novawaf_detector/detect;
+        proxy_pass_request_body on;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 2s;
+        # 检测超时则放行（fail-open，保证可用性）
+        proxy_intercept_errors on;
+        error_page 403 = @blocked;
+        error_page 500 502 503 504 = @pass;
+    }
+
+    location @blocked {
+        return 403 "<html><body>Blocked by NovaWAF</body></html>";
+    }
+
+    location @pass {
+        # 检测异常时放行到后端
+        proxy_pass http://backend;
+    }
+
+    location / {
+        auth_request /novawaf_check;
+        proxy_pass http://backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+upstream backend {
+    server 127.0.0.1:8000;
+}

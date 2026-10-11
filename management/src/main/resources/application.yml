@@ -1,0 +1,26 @@
+server:
+  port: 9000
+
+spring:
+  application:
+    name: novawaf-management
+  datasource:
+    url: jdbc:h2:mem:novawaf;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+  h2:
+    console:
+      enabled: false   # 生产关闭
+
+novawaf:
+  engine:
+    url: http://127.0.0.1:8080
+
+logging:
+  level:
+    com.novawaf: INFO

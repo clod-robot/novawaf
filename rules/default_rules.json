@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "rules": [
+    {"id": "SQLI-001", "category": "SQLi", "enabled": true, "severity": 9, "pattern": "union select", "desc": "SQL 联合查询注入"},
+    {"id": "SQLI-002", "category": "SQLi", "enabled": true, "severity": 9, "pattern": "' or '1'='1", "desc": "SQL 永真注入"},
+    {"id": "SQLI-003", "category": "SQLi", "enabled": true, "severity": 8, "pattern": "sleep(", "desc": "SQL 时间盲注"},
+    {"id": "XSS-001", "category": "XSS", "enabled": true, "severity": 8, "pattern": "<script", "desc": "脚本标签注入"},
+    {"id": "XSS-002", "category": "XSS", "enabled": true, "severity": 7, "pattern": "javascript:", "desc": "JS 协议 XSS"},
+    {"id": "RCE-001", "category": "RCE", "enabled": true, "severity": 10, "pattern": "/etc/passwd", "desc": "敏感文件读取"},
+    {"id": "RCE-002", "category": "RCE", "enabled": true, "severity": 9, "pattern": "bash -i", "desc": "反弹 shell"},
+    {"id": "TRAV-001", "category": "Traversal", "enabled": true, "severity": 7, "pattern": "../", "desc": "路径遍历"}
+  ],
+  "rateLimit": {"capacity": 100, "refillPerSec": 1000}
+}
