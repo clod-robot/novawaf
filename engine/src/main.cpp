@@ -3,6 +3,7 @@
 // 编译: 见 CMakeLists.txt (Linux, g++/clang++ C++20)
 #include "novawaf/core/buffer.h"
 #include "novawaf/core/mpmc_queue.h"
+#include "novawaf/core/redis_client.h"
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/threat_intel.h"
@@ -52,6 +53,60 @@ static std::vector<std::string> splitCsvStr(const char* s) {
     }
     if (!cur.empty()) out.push_back(cur);
     return out;
+}
+
+// 把一段文本按行切分（用于 Redis 返回的整文件内容）
+static std::vector<std::string> splitLines(const std::string& blob) {
+    std::vector<std::string> lines;
+    std::string cur;
+    for (char c : blob) {
+        if (c == '\n') { lines.push_back(cur); cur.clear(); }
+        else if (c != '\r') cur += c;
+    }
+    if (!cur.empty()) lines.push_back(cur);
+    return lines;
+}
+
+// 加载数据行：优先 Redis（NOVA_REDIS_HOST 配置时），失败/未配置回退本地文件。
+// redisKey     : Redis 中存整文件内容的 STRING 键，如 "novawaf:geoip"
+// cksumField   : novawaf:meta 哈希中记录 cksum 的字段，如 "geoip_cksum"
+// filePath     : 回退用的本地文件路径
+// inoutCksum   : 上次加载的 cksum，未变则返回空（调用方据此跳过重解析）
+// outFromRedis : 输出本次是否来自 Redis
+static std::vector<std::string> loadDataLines(const char* redisKey,
+                                              const char* cksumField,
+                                              const std::string& filePath,
+                                              std::string& inoutCksum,
+                                              bool& outFromRedis) {
+    outFromRedis = false;
+    const char* rh = getenv("NOVA_REDIS_HOST");
+    if (rh && *rh) {
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (r.connect(rh, port, pass ? pass : "", db)) {
+            auto cs = r.hget("novawaf:meta", cksumField);
+            if (cs && !cs->empty() && *cs == inoutCksum) {
+                outFromRedis = true;
+                return {};  // 内容未变，无需重解析
+            }
+            auto blob = r.get(redisKey);
+            if (blob) {
+                inoutCksum = cs.value_or("");
+                outFromRedis = true;
+                return splitLines(*blob);
+            }
+            // Redis 连通但无该键：回退文件
+        }
+        // 连接失败：回退文件，保证可用性
+    }
+    std::ifstream in(filePath);
+    if (!in) return {};
+    std::vector<std::string> lines;
+    std::string ln;
+    while (std::getline(in, ln)) lines.push_back(ln);
+    return lines;
 }
 
 static int createListenFd(int port, int backlog) {
@@ -277,26 +332,31 @@ int main(int argc, char** argv) {
     DetectionPipeline pipeline;
     RateLimiter limiter(100, 1000);  // 每 IP 突发 100，每秒补 1000
 
-    // ---- 威胁情报 IOC：从文件加载并注入流水线，支持热更新 ----
+    // ---- 威胁情报 IOC：优先从 Redis 加载（免磁盘 IO），失败回退文件，支持热更新 ----
     auto threatIntel = std::make_shared<ThreatIntel>(TiSeverity::HIGH);
     const char* iocFile = getenv("NOVA_IOC_FILE");
     std::string iocPath = iocFile ? iocFile : "rules/ioc.txt";
-    auto loadIoc = [&](const std::string& path) -> size_t {
-        std::ifstream in(path);
-        if (!in) return 0;
-        std::vector<std::string> lines;
-        std::string ln;
-        while (std::getline(in, ln)) lines.push_back(ln);
-        return threatIntel->loadFromLines(lines);
+    auto iocCksum = std::make_shared<std::string>();  // 跨线程共享的 cksum 状态
+    auto loadIoc = [threatIntel, iocPath, iocCksum](bool initial) -> size_t {
+        bool fromRedis = false;
+        auto lines = loadDataLines("novawaf:ioc", "ioc_cksum", iocPath, *iocCksum, fromRedis);
+        if (lines.empty() && !fromRedis) return 0;          // 文件不存在
+        if (lines.empty() && fromRedis) return (size_t)-1;   // Redis 内容未变，跳过重解析
+        size_t n = threatIntel->loadFromLines(lines);
+        if (initial)
+            std::printf("  IOC: loaded %zu entries from %s\n", n, fromRedis ? "redis" : iocPath.c_str());
+        else
+            std::printf("  IOC: hot-reloaded %zu entries from %s\n", n, fromRedis ? "redis" : iocPath.c_str());
+        return n;
     };
-    size_t iocN = loadIoc(iocPath);
+    size_t iocN = loadIoc(true);
     pipeline.addDetector(std::make_unique<TiDetector>(threatIntel));
-    // 后台定时刷新线程（每 60s 重读文件；可扩展为远程拉取）
+    // 后台定时刷新线程（每 60s 从 Redis/文件重读；cksum 未变则跳过重解析）
     std::thread([threatIntel, iocPath, loadIoc]() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(60));
             if (!g_running) break;
-            loadIoc(iocPath);  // copy-on-write 原子替换，不阻塞检测
+            loadIoc(false);  // copy-on-write 原子替换，不阻塞检测
         }
     }).detach();
 
@@ -319,17 +379,18 @@ int main(int argc, char** argv) {
     BotGuard bot(BotGuard::Config{});
     DynamicShield shield(DynamicShield::Config{});
 
-    // ---- 地理位置拦截（GeoIP 地理围栏）：离线 CIDR→国家 映射 ----
+    // ---- 地理位置拦截（GeoIP 地理围栏）：优先 Redis，回退文件，copy-on-write 热更新 ----
     GeoFilter geo;
     const char* geoFile = getenv("NOVA_GEO_FILE");
     std::string geoPath = geoFile ? geoFile : "rules/geoip.txt";
     {
-        std::ifstream gin(geoPath);
-        if (gin) {
-            std::vector<std::string> glines; std::string gl;
-            while (std::getline(gin, gl)) glines.push_back(gl);
+        std::string geoCksum;
+        bool fromRedis = false;
+        auto glines = loadDataLines("novawaf:geoip", "geoip_cksum", geoPath, geoCksum, fromRedis);
+        if (!glines.empty() || fromRedis) {
             size_t gn = geo.loadFromLines(glines);
-            std::printf("  GeoIP: loaded %zu CIDR ranges from %s\n", gn, geoPath.c_str());
+            std::printf("  GeoIP: loaded %zu CIDR ranges from %s\n", gn,
+                        fromRedis ? "redis" : geoPath.c_str());
         }
     }
     // 配置：NOVA_GEO_BLOCK=CN,RU  黑名单；NOVA_GEO_ALLOW=CN  白名单（仅放行）

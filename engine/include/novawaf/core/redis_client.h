@@ -1,0 +1,199 @@
+// NovaWAF - 极简 header-only Redis 客户端（RESP over TCP，零第三方依赖）
+// 仅实现引擎加载数据所需的命令：AUTH / SELECT / GET / HGET / PING。
+// 用途：从 Redis 内存加载 geoip / ioc 数据，免除磁盘 IO 与重复解析。
+// 设计（安全/稳定）：
+//   * 同步阻塞调用，带连接/读写超时，避免网络异常拖垮检测线程。
+//   * 仅用于后台加载线程，不在请求热路径调用。
+//   * 与 Redis 通信应为内网；生产须配密码 + 绑定受信地址。
+#pragma once
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace novawaf {
+
+class RedisClient {
+public:
+    RedisClient() = default;
+    ~RedisClient() { disconnect(); }
+    RedisClient(const RedisClient&) = delete;
+    RedisClient& operator=(const RedisClient&) = delete;
+
+    // 连接（带超时毫秒）。失败返回 false。
+    bool connect(const std::string& host, int port, const std::string& pass = "",
+                 int db = 0, int timeoutMs = 2000) {
+        disconnect();
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) return false;
+        // 非阻塞 connect 以实现超时
+        int flags = ::fcntl(fd_, F_GETFL, 0);
+        ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+            // 主机名解析
+            addrinfo hints{}, *res = nullptr;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
+                addr.sin_addr = ((sockaddr_in*)res->ai_addr)->sin_addr;
+                ::freeaddrinfo(res);
+            } else {
+                disconnect();
+                return false;
+            }
+        }
+        int rc = ::connect(fd_, (sockaddr*)&addr, sizeof(addr));
+        if (rc < 0 && errno != EINPROGRESS) { disconnect(); return false; }
+        if (rc < 0) {
+            fd_set wfds; FD_ZERO(&wfds); FD_SET(fd_, &wfds);
+            timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+            if (::select(fd_ + 1, nullptr, &wfds, nullptr, &tv) <= 0) { disconnect(); return false; }
+            int err = 0; socklen_t el = sizeof(err);
+            ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &el);
+            if (err != 0) { disconnect(); return false; }
+        }
+        ::fcntl(fd_, F_SETFL, flags);  // 恢复阻塞
+        if (!pass.empty()) {
+            auto r = command({"AUTH", pass});
+            if (!r || r->asString() != "OK") { disconnect(); return false; }
+        }
+        if (db != 0) {
+            auto r = command({"SELECT", std::to_string(db)});
+            if (!r || r->asString() != "OK") { disconnect(); return false; }
+        }
+        timeoutMs_ = timeoutMs;
+        return true;
+    }
+
+    void disconnect() {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+    bool connected() const { return fd_ >= 0; }
+
+    // GET key -> 字符串值（不存在返回 nullopt）
+    std::optional<std::string> get(const std::string& key) {
+        auto r = command({"GET", key});
+        if (!r) return std::nullopt;
+        if (r->kind == Reply::BULK && r->bulk.has_value()) return r->bulk;
+        return std::nullopt;
+    }
+    // HGET key field -> 值（不存在返回 nullopt）
+    std::optional<std::string> hget(const std::string& key, const std::string& field) {
+        auto r = command({"HGET", key, field});
+        if (!r) return std::nullopt;
+        if (r->kind == Reply::BULK && r->bulk.has_value()) return r->bulk;
+        return std::nullopt;
+    }
+
+private:
+    struct Reply {
+        enum Kind { STATUS, ERROR, INTEGER, BULK } kind = STATUS;
+        std::string status;   // STATUS / ERROR 文本
+        int64_t integer = 0;
+        std::optional<std::string> bulk;
+        std::string asString() const { return kind == BULK ? (bulk.value_or("")) : status; }
+    };
+
+    int fd_ = -1;
+    int timeoutMs_ = 2000;
+
+    bool sendAll(const char* data, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = ::send(fd_, data + off, n - off, MSG_NOSIGNAL);
+            if (w <= 0) { if (errno == EINTR) continue; return false; }
+            off += (size_t)w;
+        }
+        return true;
+    }
+
+    // 发送 RESP 命令：*N\r\n$len\r\narg\r\n ...
+    bool sendCmd(const std::vector<std::string>& args) {
+        std::string buf;
+        buf += "*" + std::to_string(args.size()) + "\r\n";
+        for (auto& a : args) {
+            buf += "$" + std::to_string(a.size()) + "\r\n";
+            buf += a;
+            buf += "\r\n";
+        }
+        return sendAll(buf.data(), buf.size());
+    }
+
+    bool readExact(char* dst, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            if (!waitReadable()) return false;
+            ssize_t r = ::recv(fd_, dst + off, n - off, 0);
+            if (r <= 0) { if (errno == EINTR) continue; return false; }
+            off += (size_t)r;
+        }
+        return true;
+    }
+
+    // 读到一行（不含 \r\n）
+    bool readLine(std::string& out) {
+        out.clear();
+        char c;
+        while (true) {
+            if (!readExact(&c, 1)) return false;
+            if (c == '\r') {
+                if (!readExact(&c, 1)) return false;  // consume \n
+                return true;
+            }
+            out.push_back(c);
+        }
+    }
+
+    bool waitReadable() {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(fd_, &rfds);
+        timeval tv{ timeoutMs_ / 1000, (timeoutMs_ % 1000) * 1000 };
+        return ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv) > 0;
+    }
+
+    std::optional<Reply> readReply() {
+        std::string line;
+        if (!readLine(line) || line.empty()) return std::nullopt;
+        Reply rep;
+        char t = line[0];
+        std::string body = line.substr(1);
+        if (t == '+') { rep.kind = Reply::STATUS; rep.status = body; return rep; }
+        if (t == '-') { rep.kind = Reply::ERROR; rep.status = body; return rep; }
+        if (t == ':') { rep.kind = Reply::INTEGER; rep.integer = std::atoll(body.c_str()); return rep; }
+        if (t == '$') {
+            long len = std::atol(body.c_str());
+            if (len < 0) { rep.kind = Reply::BULK; rep.bulk = std::nullopt; return rep; }  // nil
+            std::string s((size_t)len, '\0');
+            if (len > 0 && !readExact(&s[0], (size_t)len)) return std::nullopt;
+            char crlf[2];
+            if (!readExact(crlf, 2)) return std::nullopt;  // 尾部 \r\n
+            rep.kind = Reply::BULK;
+            rep.bulk = std::move(s);
+            return rep;
+        }
+        return std::nullopt;  // 数组等本客户端暂不需要
+    }
+
+    std::optional<Reply> command(const std::vector<std::string>& args) {
+        if (fd_ < 0) return std::nullopt;
+        if (!sendCmd(args)) return std::nullopt;
+        return readReply();
+    }
+};
+
+}  // namespace novawaf
