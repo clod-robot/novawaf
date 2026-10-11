@@ -7,6 +7,7 @@
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
+#include "novawaf/ddos/ddos_guard.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -50,7 +51,7 @@ static void setNonblock(int fd) {
 
 // 单 Reactor 线程：监听 + 读请求 + 检测 + 简单回包（演示版）
 static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
-                        RateLimiter& limiter, int idx) {
+                        RateLimiter& limiter, DdosGuard& ddos, int idx) {
     int epfd = epoll_create1(0);
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -70,6 +71,13 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     socklen_t clen = sizeof(caddr);
                     int cfd = accept(listenFd, (sockaddr*)&caddr, &clen);
                     if (cfd < 0) break;
+                    // DDoS 防护：取源 IP，检查并发上限/连接速率/黑名单
+                    char ipstr[32] = {0};
+                    inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
+                    if (!ddos.onConnect(ipstr)) {
+                        close(cfd);  // 直接丢弃，不消耗应用层资源
+                        continue;
+                    }
                     setNonblock(cfd);
                     epoll_event ce{};
                     ce.events = EPOLLIN | EPOLLET;
@@ -98,7 +106,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     req.clientIp = ipstr;
 
                     const char* resp;
-                    if (!limiter.allow(req.clientIp)) {
+                    if (!ddos.onRequest(req.clientIp)) {
+                        // 请求速率超限 → 触发封禁链路，返回 429
+                        resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+                    } else if (!limiter.allow(req.clientIp)) {
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                     } else {
                         DetectionResult dr = pipeline.detect(req);
@@ -112,9 +123,20 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
                         }
                     }
-                    write(fd, resp, strlen(resp));
+                    ssize_t w = write(fd, resp, strlen(resp));
+                    (void)w;
                 }
             closefd:
+                {
+                    // 释放 DDoS 并发连接计数
+                    char ipstr[32] = {0};
+                    sockaddr_in peer{};
+                    socklen_t plen = sizeof(peer);
+                    if (getpeername(fd, (sockaddr*)&peer, &plen) == 0) {
+                        inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
+                        ddos.onDisconnect(ipstr);
+                    }
+                }
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
             }
@@ -131,13 +153,26 @@ int main(int argc, char** argv) {
     DetectionPipeline pipeline;
     RateLimiter limiter(100, 1000);  // 每 IP 突发 100，每秒补 1000
 
+    // DDoS / 网络攻击防护配置
+    DdosGuard::Config ddosCfg;
+    ddosCfg.maxConcurrentPerIp = 200;   // 单 IP 并发连接上限
+    ddosCfg.newConnPerSec       = 200;  // 单 IP 新建连接速率
+    ddosCfg.reqPerSec           = 1000; // 单 IP 请求速率
+    ddosCfg.slowTimeoutMs       = 5000; // 慢速攻击判定超时
+    ddosCfg.banThreshold        = 5;    // 违规 5 次触发封禁
+    ddosCfg.banSeconds          = 300;  // 封禁 5 分钟，到期自动解封
+    DdosGuard ddos(ddosCfg);
+
     std::printf("NovaWAF engine starting on port %d with %d reactors\n", port, threads);
+    std::printf("  DDoS guard: maxConn=%d newConn/s=%d req/s=%d ban=%ds\n",
+                ddosCfg.maxConcurrentPerIp, ddosCfg.newConnPerSec,
+                ddosCfg.reqPerSec, ddosCfg.banSeconds);
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
         int lfd = createListenFd(port, 4096);
         if (lfd < 0) { std::perror("listen"); return 1; }
         reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
-                              std::ref(limiter), i);
+                              std::ref(limiter), std::ref(ddos), i);
     }
     for (auto& t : reactors) t.join();
     return 0;

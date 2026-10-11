@@ -9,6 +9,7 @@
 #include "novawaf/detect/http_model.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
+#include "novawaf/ddos/ddos_guard.h"
 
 #include <atomic>
 #include <cstdio>
@@ -159,6 +160,61 @@ static void test_buffer() {
     CHECK(buf.readableBytes() == 0, "empty after retrieve");
 }
 
+static void test_ddos_guard() {
+    TEST("DdosGuard");
+    using novawaf::DdosGuard;
+    DdosGuard::Config cfg;
+    cfg.maxConcurrentPerIp = 3;
+    cfg.newConnPerSec = 5;
+    cfg.reqPerSec = 10;
+    cfg.banThreshold = 2;
+    cfg.banSeconds = 60;
+    cfg.slowTimeoutMs = 5000;
+    DdosGuard g(cfg);
+
+    // 1) 并发连接上限
+    CHECK(g.onConnect("10.0.0.1"), "conn1 ok");
+    CHECK(g.onConnect("10.0.0.1"), "conn2 ok");
+    CHECK(g.onConnect("10.0.0.1"), "conn3 ok");
+    CHECK(!g.onConnect("10.0.0.1"), "conn4 blocked (max concurrent)");
+    g.onDisconnect("10.0.0.1");
+    CHECK(g.onConnect("10.0.0.1"), "after disconnect, conn ok again");
+
+    // 2) 新建连接速率（并发上限调高，单独测速率）
+    DdosGuard::Config cfgRate = cfg;
+    cfgRate.maxConcurrentPerIp = 100000;
+    DdosGuard g2(cfgRate);
+    int ok = 0;
+    for (int i = 0; i < 10; ++i) if (g2.onConnect("10.0.0.2")) ok++;
+    CHECK(ok == 5, "only 5 new conns/sec allowed");
+
+    // 3) 请求速率
+    DdosGuard g3(cfgRate);
+    int rok = 0;
+    for (int i = 0; i < 20; ++i) if (g3.onRequest("10.0.0.3")) rok++;
+    CHECK(rok == 10, "only 10 req/sec allowed");
+
+    // 4) 违规累计触发自动封禁，封禁后全部拒绝
+    DdosGuard g4(cfg);
+    for (int i = 0; i < 5; ++i) g4.onConnect("10.0.0.4");  // 触发多次违规
+    CHECK(g4.bannedCount() >= 1, "auto-banned after threshold");
+    CHECK(!g4.onRequest("10.0.0.4"), "banned ip rejected");
+    CHECK(!g4.onConnect("10.0.0.4"), "banned ip connect rejected");
+
+    // 5) 手动封禁/解封
+    DdosGuard g5(cfg);
+    CHECK(g5.onConnect("10.0.0.5"), "connect ok before ban");
+    g5.ban("10.0.0.5", 60);
+    CHECK(!g5.onConnect("10.0.0.5"), "rejected after manual ban");
+    g5.unban("10.0.0.5");
+    CHECK(g5.onConnect("10.0.0.5"), "allowed after unban");
+
+    // 6) 不同 IP 互不影响
+    DdosGuard g6(cfg);
+    CHECK(g6.onConnect("10.0.0.6") && g6.onConnect("10.0.0.7"),
+          "different ips independent");
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -170,6 +226,7 @@ int main() {
     test_http_parser();
     test_mpmc_queue();
     test_buffer();
+    test_ddos_guard();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);
