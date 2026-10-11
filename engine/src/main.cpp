@@ -85,33 +85,35 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     else if (r == 0 || (r < 0 && errno != EAGAIN)) { goto closefd; }
                     else break;
                 }
-                // 解析 + 检测
-                HttpParser parser;
-                parser.feed(data);
-                HttpRequest req = parser.request();
-                char ipstr[32] = {0};
-                sockaddr_in peer{};
-                socklen_t plen = sizeof(peer);
-                getpeername(fd, (sockaddr*)&peer, &plen);
-                inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
-                req.clientIp = ipstr;
+                {
+                    // 解析 + 检测（独立块作用域，变量不越过 goto 标签）
+                    HttpParser parser;
+                    parser.feed(data);
+                    HttpRequest req = parser.request();
+                    char ipstr[32] = {0};
+                    sockaddr_in peer{};
+                    socklen_t plen = sizeof(peer);
+                    getpeername(fd, (sockaddr*)&peer, &plen);
+                    inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
+                    req.clientIp = ipstr;
 
-                const char* resp;
-                if (!limiter.allow(req.clientIp)) {
-                    resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
-                } else {
-                    DetectionResult r = pipeline.detect(req);
-                    if (r.isBlocked()) {
-                        std::printf("[reactor %d] BLOCK %s from %s: %s\n",
-                                    idx, r.category.c_str(), ipstr, r.matched.c_str());
-                        resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                               "Content-Length: 52\r\n\r\n"
-                               "<html><body>Blocked by NovaWAF</body></html>";
+                    const char* resp;
+                    if (!limiter.allow(req.clientIp)) {
+                        resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                     } else {
-                        resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                        DetectionResult dr = pipeline.detect(req);
+                        if (dr.isBlocked()) {
+                            std::printf("[reactor %d] BLOCK %s from %s: %s\n",
+                                        idx, dr.category.c_str(), ipstr, dr.matched.c_str());
+                            resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                   "Content-Length: 52\r\n\r\n"
+                                   "<html><body>Blocked by NovaWAF</body></html>";
+                        } else {
+                            resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                        }
                     }
+                    write(fd, resp, strlen(resp));
                 }
-                write(fd, resp, strlen(resp));
             closefd:
                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
