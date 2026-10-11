@@ -100,6 +100,23 @@ public:
         if (r->kind == Reply::BULK && r->bulk.has_value()) return r->bulk;
         return std::nullopt;
     }
+    // SET key value（成功返回 true）
+    bool set(const std::string& key, const std::string& value) {
+        auto r = command({"SET", key, value});
+        return r && r->asString() == "OK";
+    }
+    // DEL key（返回被删数量，失败 -1）
+    int64_t del(const std::string& key) {
+        auto r = command({"DEL", key});
+        if (!r || r->kind != Reply::INTEGER) return -1;
+        return r->integer;
+    }
+    // INCR key -> 自增后的值（失败 nullopt）
+    std::optional<int64_t> incr(const std::string& key) {
+        auto r = command({"INCR", key});
+        if (!r || r->kind != Reply::INTEGER) return std::nullopt;
+        return r->integer;
+    }
 
 private:
     struct Reply {
