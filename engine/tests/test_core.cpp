@@ -10,6 +10,8 @@
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
+#include "novawaf/ai/llm_client.h"
+#include "novawaf/ai/ai_detector.h"
 
 #include <atomic>
 #include <cstdio>
@@ -215,6 +217,111 @@ static void test_ddos_guard() {
           "different ips independent");
 }
 
+static void test_llm_client() {
+    TEST("LlmClient");
+    using namespace novawaf;
+
+    // 1) 未启用 → 直接降级返回空，不调用传输层
+    {
+        LlmConfig c; c.enabled = false;
+        int calls = 0;
+        LlmTransport t = [&](const std::string&){ calls++; return std::optional<std::string>("x"); };
+        LlmClient cli(c, t);
+        auto r = cli.chat("sys", "user");
+        CHECK(!r.has_value(), "disabled client returns nullopt");
+        CHECK(calls == 0, "disabled client never calls transport");
+    }
+
+    // 2) 正常调用 → 从响应 JSON 提取 content
+    {
+        LlmConfig c; c.enabled = true;
+        std::string sentBody;
+        LlmTransport t = [&](const std::string& body){
+            sentBody = body;
+            return std::optional<std::string>(
+                "{\"choices\":[{\"message\":{\"content\":\"{\\\"block\\\":true}\"}}]}");
+        };
+        LlmClient cli(c, t);
+        auto r = cli.chat("SYS", "hello \"world\"");
+        CHECK(r.has_value(), "got response");
+        CHECK(*r == "{\"block\":true}", "content extracted");
+        // 确认请求体里用户输入被 JSON 转义
+        CHECK(sentBody.find("hello \\\"world\\\"") != std::string::npos, "user input escaped in body");
+    }
+
+    // 3) 传输层失败 → 重试后返回空（降级）
+    {
+        LlmConfig c; c.enabled = true; c.maxRetries = 2;
+        int calls = 0;
+        LlmTransport t = [&](const std::string&){ calls++; return std::nullopt; };
+        LlmClient cli(c, t);
+        auto r = cli.chat("s", "u");
+        CHECK(!r.has_value(), "transport failure degrades to nullopt");
+        CHECK(calls == 3, "retried maxRetries+1 times");
+    }
+
+    // 4) jsonEscape 防注入
+    CHECK(jsonEscape("a\"b\\c\n") == "a\\\"b\\\\c\\n", "json escape");
+}
+
+static void test_ai_detector() {
+    TEST("AiDetector");
+    using namespace novawaf;
+
+    HttpRequest req;
+    req.method = "GET";
+    req.path = "/search";
+    req.query = "q=' OR 1=1--";
+
+    // AI 判定攻击 → 拦截
+    {
+        LlmConfig c; c.enabled = true;
+        LlmTransport t = [&](const std::string&){
+            return std::optional<std::string>(
+                "{\"choices\":[{\"message\":{\"content\":"
+                "\"{\\\"block\\\":true,\\\"category\\\":\\\"SQLi\\\",\\\"reason\\\":\\\"tautology\\\"}\"}}]}");
+        };
+        auto llm = std::make_shared<LlmClient>(c, t);
+        AiDetector ai(llm);
+        auto r = ai.detect(req);
+        CHECK(r.action == Action::BLOCK, "ai blocks attack");
+        CHECK(r.category == "SQLi", "ai category");
+        CHECK(std::string(ai.name()) == "AI", "detector name");
+    }
+
+    // AI 判定非攻击 + 规则误报 → 二阶复核应放行
+    {
+        DetectionPipeline pipe;
+        HttpRequest blocked;
+        blocked.method = "GET"; blocked.path = "/x"; blocked.query = "id=1' or '1'='1";
+        auto base = pipe.detect(blocked);
+        CHECK(base.action == Action::BLOCK, "rule blocks it first");
+
+        LlmConfig c; c.enabled = true;
+        LlmTransport t = [&](const std::string&){
+            return std::optional<std::string>(
+                "{\"choices\":[{\"message\":{\"content\":"
+                "\"{\\\"block\\\":false,\\\"category\\\":\\\"Benign\\\",\\\"reason\\\":\\\"fp\\\"}\"}}]}");
+        };
+        auto llm = std::make_shared<LlmClient>(c, t);
+        auto ai = std::make_shared<AiDetector>(llm);
+        auto reviewed = detectWithAiReview(pipe, ai, blocked);
+        CHECK(reviewed.action == Action::PASS, "ai review overrules false positive");
+    }
+
+    // AI 不可用 → 复核维持规则结果（fail-closed）
+    {
+        DetectionPipeline pipe;
+        HttpRequest blocked;
+        blocked.method = "GET"; blocked.path = "/x"; blocked.query = "id=1' or '1'='1";
+        LlmConfig c; c.enabled = false;  // AI 关闭
+        auto llm = std::make_shared<LlmClient>(c, LlmTransport{});
+        auto ai = std::make_shared<AiDetector>(llm);
+        auto reviewed = detectWithAiReview(pipe, ai, blocked);
+        CHECK(reviewed.action == Action::BLOCK, "degraded keeps rule block (fail-closed)");
+    }
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -227,6 +334,8 @@ int main() {
     test_mpmc_queue();
     test_buffer();
     test_ddos_guard();
+    test_llm_client();
+    test_ai_detector();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);

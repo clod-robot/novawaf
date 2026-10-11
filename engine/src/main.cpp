@@ -8,6 +8,9 @@
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
+#include "novawaf/ai/llm_client.h"
+#include "novawaf/ai/ai_detector.h"
+#include "novawaf/ai/http_transport.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -20,6 +23,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -51,7 +55,8 @@ static void setNonblock(int fd) {
 
 // 单 Reactor 线程：监听 + 读请求 + 检测 + 简单回包（演示版）
 static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
-                        RateLimiter& limiter, DdosGuard& ddos, int idx) {
+                        RateLimiter& limiter, DdosGuard& ddos,
+                        const std::shared_ptr<AiDetector>& ai, int idx) {
     int epfd = epoll_create1(0);
     epoll_event ev{};
     ev.events = EPOLLIN;
@@ -112,7 +117,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     } else if (!limiter.allow(req.clientIp)) {
                         resp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                     } else {
-                        DetectionResult dr = pipeline.detect(req);
+                        DetectionResult dr = detectWithAiReview(pipeline, ai, req);
                         if (dr.isBlocked()) {
                             std::printf("[reactor %d] BLOCK %s from %s: %s\n",
                                         idx, dr.category.c_str(), ipstr, dr.matched.c_str());
@@ -163,16 +168,30 @@ int main(int argc, char** argv) {
     ddosCfg.banSeconds          = 300;  // 封禁 5 分钟，到期自动解封
     DdosGuard ddos(ddosCfg);
 
+    // ---- AI 大模型二阶复核（可指向本地模型或外部 API，不可用则自动降级）----
+    // 配置来源：环境变量。未配置 NOVAAI_ENABLE=1 时 AI 完全不启用，引擎=纯规则。
+    LlmConfig llmCfg;
+    llmCfg.enabled = (getenv("NOVAAI_ENABLE") && std::string(getenv("NOVAAI_ENABLE")) == "1");
+    if (const char* e = getenv("NOVAAI_ENDPOINT")) llmCfg.endpoint = e;
+    if (const char* e = getenv("NOVAAI_APIKEY"))   llmCfg.apiKey = e;
+    if (const char* e = getenv("NOVAAI_MODEL"))    llmCfg.model = e;
+    if (const char* e = getenv("NOVAAI_TIMEOUT_MS")) llmCfg.timeoutMs = std::atoi(e);
+    auto llm = std::make_shared<LlmClient>(llmCfg, makeHttpTransport(llmCfg));
+    auto ai = std::make_shared<AiDetector>(llm);
+
     std::printf("NovaWAF engine starting on port %d with %d reactors\n", port, threads);
     std::printf("  DDoS guard: maxConn=%d newConn/s=%d req/s=%d ban=%ds\n",
                 ddosCfg.maxConcurrentPerIp, ddosCfg.newConnPerSec,
                 ddosCfg.reqPerSec, ddosCfg.banSeconds);
+    std::printf("  AI review: %s model=%s endpoint=%s timeout=%dms\n",
+                llmCfg.enabled ? "ENABLED" : "disabled(pure-rules)",
+                llmCfg.model.c_str(), llmCfg.endpoint.c_str(), llmCfg.timeoutMs);
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
         int lfd = createListenFd(port, 4096);
         if (lfd < 0) { std::perror("listen"); return 1; }
         reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
-                              std::ref(limiter), std::ref(ddos), i);
+                              std::ref(limiter), std::ref(ddos), ai, i);
     }
     for (auto& t : reactors) t.join();
     return 0;
