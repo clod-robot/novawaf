@@ -48,7 +48,7 @@ public:
 
 private:
     void runInThread() {
-        while (running_ || !queueEmpty()) {
+        while (running_.load(std::memory_order_acquire)) {
             Task task;
             if (queue_.dequeue(task)) {
                 task();
@@ -56,12 +56,9 @@ private:
                 std::this_thread::yield();
             }
         }
-    }
-
-    bool queueEmpty() {
-        // 近似判断，避免误判导致提前退出
-        Task t;
-        return false;  // 保守：不主动认为空，由 running_ 控制退出
+        // 退出前兜底排空队列中剩余任务（避免 stop 时丢弃已入队任务）
+        Task task;
+        while (queue_.dequeue(task)) task();
     }
 
     MpmcQueue<Task> queue_;

@@ -12,8 +12,11 @@
 #include "novawaf/ddos/ddos_guard.h"
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
+#include "novawaf/ai/ai_cache.h"
+#include "novawaf/core/thread_pool.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -322,6 +325,79 @@ static void test_ai_detector() {
     }
 }
 
+static void test_ai_cache() {
+    TEST("AiCache");
+    using namespace novawaf;
+    AiCache cache(300, 2);  // ttl 300s, 容量2
+
+    HttpRequest a; a.method = "GET"; a.path = "/p"; a.query = "q=1";
+    HttpRequest b; b.method = "GET"; b.path = "/p"; b.query = "q=2";
+    HttpRequest c; c.method = "GET"; c.path = "/p"; c.query = "q=3";
+
+    std::string ka = AiCache::makeKey(a);
+    std::string kb = AiCache::makeKey(b);
+    CHECK(ka != kb, "different payload -> different key");
+    CHECK(AiCache::makeKey(a) == ka, "same payload -> stable key");
+
+    CHECK(!cache.get(ka).has_value(), "miss before put");
+    DetectionResult block{Action::BLOCK, "AI-001", "SQLi", "x", "y"};
+    cache.put(ka, block);
+    auto hit = cache.get(ka);
+    CHECK(hit.has_value() && hit->action == Action::BLOCK, "hit returns cached block");
+
+    // 容量上限 2：放入 b、c 后应淘汰
+    cache.put(kb, block);
+    cache.put(AiCache::makeKey(c), block);
+    CHECK(cache.size() <= 2, "cache respects max entries");
+}
+
+static void test_ai_async() {
+    TEST("AiDetector async (non-blocking)");
+    using namespace novawaf;
+
+    // 传输层：第一次调用会阻塞 200ms 模拟慢 AI，计数调用次数
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    LlmConfig cfg; cfg.enabled = true; cfg.maxRetries = 0;
+    LlmTransport t = [calls](const std::string&) -> std::optional<std::string> {
+        (*calls)++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return std::string(
+            "{\"choices\":[{\"message\":{\"content\":"
+            "\"{\\\"block\\\":true,\\\"category\\\":\\\"SQLi\\\",\\\"reason\\\":\\\"r\\\"}\"}}]}");
+    };
+    auto llm = std::make_shared<LlmClient>(cfg, t);
+    auto ai = std::make_shared<AiDetector>(llm);
+    auto cache = std::make_shared<AiCache>(300, 1000);
+    auto pool = std::make_shared<ThreadPool>(2, 1024);
+    pool->start();
+    ai->setCache(cache);
+    ai->setExecutor(pool);
+    CHECK(ai->asyncReady(), "async ready when cache+executor set");
+
+    HttpRequest req; req.method = "GET"; req.path = "/x"; req.query = "q=' OR 1=1";
+
+    // 第 1 次：未命中 → 立即返回 nullopt（不阻塞 200ms），并异步提交任务
+    auto t0 = std::chrono::steady_clock::now();
+    auto r1 = ai->analyzeNonBlocking(req);
+    auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    CHECK(!r1.has_value(), "first call is non-blocking miss");
+    CHECK(dt < 100, "non-blocking returns fast (<100ms)");
+
+    // 等待后台 AI 完成并填充缓存
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(calls->load() >= 1, "async task called the LLM");
+
+    // 第 2 次相同 payload：缓存命中 → 秒回拦截，且不再调用 LLM
+    int before = calls->load();
+    auto r2 = ai->analyzeNonBlocking(req);
+    CHECK(r2.has_value() && r2->action == Action::BLOCK, "second call hits cache -> block");
+    CHECK(calls->load() == before, "cache hit does NOT call LLM again");
+    CHECK(ai->cacheHits() >= 1, "cache hit counter incremented");
+
+    pool->stop();
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -336,6 +412,8 @@ int main() {
     test_ddos_guard();
     test_llm_client();
     test_ai_detector();
+    test_ai_cache();
+    test_ai_async();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);

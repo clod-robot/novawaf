@@ -179,6 +179,16 @@ int main(int argc, char** argv) {
     auto llm = std::make_shared<LlmClient>(llmCfg, makeHttpTransport(llmCfg));
     auto ai = std::make_shared<AiDetector>(llm);
 
+    // AI 缓存 + 异步执行器（命中秒回、未命中不阻塞响应）
+    int cacheTtl = (getenv("NOVAAI_CACHE_TTL")) ? std::atoi(getenv("NOVAAI_CACHE_TTL")) : 300;
+    int cacheMax = (getenv("NOVAAI_CACHE_MAX")) ? std::atoi(getenv("NOVAAI_CACHE_MAX")) : 10000;
+    int aiThreads = (getenv("NOVAAI_THREADS")) ? std::atoi(getenv("NOVAAI_THREADS")) : 4;
+    auto aiCache = std::make_shared<AiCache>(cacheTtl, (size_t)cacheMax);
+    auto aiPool = std::make_shared<ThreadPool>(aiThreads, 1 << 16);
+    aiPool->start();
+    ai->setCache(aiCache);
+    ai->setExecutor(aiPool);
+
     std::printf("NovaWAF engine starting on port %d with %d reactors\n", port, threads);
     std::printf("  DDoS guard: maxConn=%d newConn/s=%d req/s=%d ban=%ds\n",
                 ddosCfg.maxConcurrentPerIp, ddosCfg.newConnPerSec,
@@ -186,6 +196,9 @@ int main(int argc, char** argv) {
     std::printf("  AI review: %s model=%s endpoint=%s timeout=%dms\n",
                 llmCfg.enabled ? "ENABLED" : "disabled(pure-rules)",
                 llmCfg.model.c_str(), llmCfg.endpoint.c_str(), llmCfg.timeoutMs);
+    if (llmCfg.enabled)
+        std::printf("  AI cache: ttl=%ds max=%d async threads=%d (non-blocking)\n",
+                    cacheTtl, cacheMax, aiThreads);
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
         int lfd = createListenFd(port, 4096);

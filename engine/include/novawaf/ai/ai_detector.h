@@ -8,6 +8,8 @@
 #pragma once
 
 #include "novawaf/ai/llm_client.h"
+#include "novawaf/ai/ai_cache.h"
+#include "novawaf/core/thread_pool.h"
 #include "novawaf/detect/detectors.h"
 
 #include <memory>
@@ -24,9 +26,17 @@ public:
     // AI 是否真正可用（启用且有 client）。不可用时复核应维持规则结果（fail-closed）。
     bool isActive() const { return llm_ && llm_->config().enabled; }
 
+    // 注入缓存与异步执行器（异步化所需）。两者皆有时走非阻塞路径。
+    void setCache(std::shared_ptr<AiCache> c) { cache_ = std::move(c); }
+    void setExecutor(std::shared_ptr<ThreadPool> e) { exec_ = std::move(e); }
+    bool asyncReady() const { return cache_ && exec_ && isActive(); }
+
     std::unique_ptr<IDetector> clone() const override {
-        // 共享同一个 LLM client（线程安全：只读配置 + 无状态调用）
-        return std::make_unique<AiDetector>(llm_);
+        // 共享同一个 LLM client / 缓存 / 执行器（线程安全）
+        auto d = std::make_unique<AiDetector>(llm_);
+        d->setCache(cache_);
+        d->setExecutor(exec_);
+        return d;
     }
 
     DetectionResult detect(const HttpRequest& req) override {
@@ -34,7 +44,7 @@ public:
         return r ? *r : DetectionResult{};  // IDetector 接口：无结论=放行
     }
 
-    // 二阶复核专用：返回 nullopt 表示 AI 不可用/调用失败，调用方应维持规则结果（fail-closed）。
+    // 同步分析：真实调用大模型（阻塞）。返回 nullopt = AI 不可用/失败。
     std::optional<DetectionResult> analyze(const HttpRequest& req) {
         if (!llm_ || !llm_->config().enabled) return std::nullopt;
 
@@ -42,15 +52,41 @@ public:
         auto ans = llm_->chat(kSystemPrompt, user);
         if (!ans) return std::nullopt;  // 调用失败 → 交由规则引擎兜底
 
-        Verdict v = parseVerdict(*ans);
-        if (v.block) {
-            return DetectionResult{Action::BLOCK, "AI-001", v.category,
-                    "AI semantic detection: " + v.reason, v.raw};
-        }
-        // AI 明确判定非攻击 → 返回放行结论（可用于覆盖规则误报）
-        return DetectionResult{Action::PASS, "AI-REVIEW", v.category,
-                "AI verified benign: " + v.reason, v.raw};
+        return verdictToResult(parseVerdict(*ans));
     }
+
+    // 非阻塞分析（缓存 + 异步）：
+    //   - 缓存命中 → 立即返回缓存结论（无 AI 调用）；
+    //   - 未命中 → 立即返回 nullopt，并异步提交 AI 任务填充缓存（本次响应不等待）；
+    //   - 调用方据此：未命中时维持规则结果，后续相同 payload 即可秒级命中缓存。
+    std::optional<DetectionResult> analyzeNonBlocking(const HttpRequest& req) {
+        if (!isActive()) return std::nullopt;
+        std::string key = AiCache::makeKey(req);
+        if (cache_) {
+            auto hit = cache_->get(key);
+            if (hit) { cacheHits_++; return hit; }   // 命中秒回
+        }
+        cacheMisses_++;
+        if (exec_ && cache_) {
+            // 后台异步：调用 AI → 写缓存。捕获 req 副本，闭包安全。
+            HttpRequest copy = req;
+            std::weak_ptr<LlmClient> wllm = llm_;
+            auto wcache = cache_;
+            std::string k = key;
+            exec_->submit([wllm, wcache, k, copy, sys = std::string(kSystemPrompt)]() {
+                auto llm = wllm.lock();
+                if (!llm) return;
+                std::string user = AiDetector::buildUserPrompt(copy);
+                auto ans = llm->chat(sys, user);
+                if (!ans) return;
+                wcache->put(k, AiDetector::verdictToResult(AiDetector::parseVerdict(*ans)));
+            });
+        }
+        return std::nullopt;  // 未命中 → 本次按规则结果响应（不阻塞）
+    }
+
+    size_t cacheHits() const { return cacheHits_.load(); }
+    size_t cacheMisses() const { return cacheMisses_.load(); }
 
 private:
     struct Verdict {
@@ -60,7 +96,6 @@ private:
         std::string raw;
     };
 
-    // 解析模型返回的 JSON：{"block":true,"category":"SQLi","confidence":0.97,"reason":"..."}
     static Verdict parseVerdict(const std::string& s) {
         Verdict v;
         v.raw = s;
@@ -108,6 +143,15 @@ private:
         return u;
     }
 
+    static DetectionResult verdictToResult(const Verdict& v) {
+        if (v.block) {
+            return {Action::BLOCK, "AI-001", v.category,
+                    "AI semantic detection: " + v.reason, v.raw};
+        }
+        return {Action::PASS, "AI-REVIEW", v.category,
+                "AI verified benign: " + v.reason, v.raw};
+    }
+
     static constexpr const char* kSystemPrompt =
         "You are a Web Application Firewall security analyzer. Analyze the HTTP request "
         "for injection, XSS, RCE, path traversal, SSRF, deserialization, and other web "
@@ -116,6 +160,10 @@ private:
         "\"confidence\":0.0,\"reason\":\"short\"}. block=true only for actual attacks.";
 
     std::shared_ptr<LlmClient> llm_;
+    std::shared_ptr<AiCache> cache_;
+    std::shared_ptr<ThreadPool> exec_;
+    std::atomic<size_t> cacheHits_{0};
+    std::atomic<size_t> cacheMisses_{0};
 };
 
 // 二阶复核编排：规则引擎判定 + AI 语义复核（降误报 + 抓变种/0day）。
@@ -148,21 +196,31 @@ inline DetectionResult detectWithAiReview(DetectionPipeline& pipeline,
                                           const std::shared_ptr<AiDetector>& ai,
                                           const HttpRequest& req, bool augment = true) {
     DetectionResult r = pipeline.detect(req);
-
     if (!ai || !ai->isActive()) return r;  // AI 不可用 → 纯规则结果
 
+    // 异步路径（缓存 + 后台线程池）：响应绝不阻塞。
+    // 命中缓存 → 秒回 AI 结论；未命中 → 立即按规则响应，后台异步填缓存。
+    if (ai->asyncReady()) {
+        auto ar = ai->analyzeNonBlocking(req);
+        if (ar) {
+            // 有缓存结论：AI 判攻击则拦截；AI 判良性且规则已拦则视为误报放行
+            if (ar->action == Action::BLOCK) return *ar;
+            if (r.action == Action::BLOCK) return *ar;
+        }
+        // 未命中(或 AI 判良性且规则放行) → 维持规则结果，本次不等待 AI
+        return r;
+    }
+
+    // 同步降级路径（未配置缓存/线程池时）：阻塞调用 AI，仅用于小流量或测试。
     if (r.action == Action::BLOCK) {
-        // 规则已拦 → AI 复核降误报
         auto ar = ai->analyze(req);
         if (!ar) return r;                  // AI 失败 → 维持拦截（fail-closed）
         if (ar->action == Action::PASS) return *ar;  // AI 判定误报 → 放行
         return r;                            // AI 也认为攻击 → 维持拦截
     }
-
-    // 规则放行 → 增强模式下，对可疑流量追加 AI 检测（抓变种/0day）
     if (augment && isSuspicious(req)) {
         auto ar = ai->analyze(req);
-        if (ar && ar->action == Action::BLOCK) return *ar;  // AI 抓到规则漏判的攻击
+        if (ar && ar->action == Action::BLOCK) return *ar;
     }
     return r;
 }
