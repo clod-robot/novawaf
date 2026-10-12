@@ -1,0 +1,75 @@
+name: Release
+
+# 推送 v* tag 时自动构建并发布 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install libyara
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libyara-dev
+
+      - name: Build engine (C++20)
+        run: |
+          mkdir -p out/bin
+          g++ -std=c++20 -O2 -pthread -I engine/include engine/src/main.cpp \
+            -o out/bin/novawaf-engine -lpthread -lyara
+          ls -lh out/bin/novawaf-engine
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build admin jar
+        working-directory: admin-server
+        run: |
+          mvn -B -DskipTests package
+          cp target/novawaf-admin.jar ../out/bin/
+          ls -lh ../out/bin/novawaf-admin.jar
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: admin-web/package-lock.json
+
+      - name: Build frontend
+        working-directory: admin-web
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          cp -r dist ../out/web
+
+      - name: Assemble release package
+        run: bash release/assemble.sh
+
+      - name: Compute checksum
+        run: |
+          cd out
+          sha256sum novawaf-release.tar.gz > novawaf-release.tar.gz.sha256
+          cat novawaf-release.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NovaWAF ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            out/novawaf-release.tar.gz
+            out/novawaf-release.tar.gz.sha256
