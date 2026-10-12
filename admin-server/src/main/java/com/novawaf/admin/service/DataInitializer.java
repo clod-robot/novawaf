@@ -15,6 +15,7 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class DataInitializer implements CommandLineRunner {
     private final SysUserMapper userMapper;
+    private final WafRedisService waf;
     private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
     @Value("${nova.admin.init-password}") private String initPassword;
 
@@ -22,6 +23,7 @@ public class DataInitializer implements CommandLineRunner {
     public void run(String... args) {
         ensureUser("admin", "超级管理员", initPassword);
         ensureUser("auditor", "审计员", initPassword);
+        waf.ensureRulesSeed();   // 灌入默认自定义规则集(已存在则跳过)
         log.info("DataInitializer done.");
     }
 

@@ -49,7 +49,32 @@ public class WafRedisService {
         return m;
     }
 
-    public Object rules() { return getJson("novawaf:rules"); }
+    public Object rules() {
+        ensureRulesSeed();
+        return getJson("novawaf:rules");
+    }
+
+    /** 引擎只消费 novawaf:rules, 管理端需负责灌入初始自定义规则集; 仅当键缺失/为空时写入, 不覆盖用户已编辑内容 */
+    private static final String DEFAULT_RULES = "["
+            + "{\"id\":1,\"name\":\"SQL注入-联合查询\",\"pattern\":\"union select\",\"category\":\"SQLi\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":2,\"name\":\"SQL注入-恒真绕过\",\"pattern\":\"' or '1'='1\",\"category\":\"SQLi\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":3,\"name\":\"XSS-脚本标签\",\"pattern\":\"<script\",\"category\":\"XSS\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":4,\"name\":\"XSS-事件处理器\",\"pattern\":\"onerror=\",\"category\":\"XSS\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":5,\"name\":\"命令执行-敏感文件\",\"pattern\":\"/etc/passwd\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":6,\"name\":\"路径穿越\",\"pattern\":\"../\",\"category\":\"Traversal\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":7,\"name\":\"XXE-外部实体\",\"pattern\":\"<!ENTITY\",\"category\":\"XXE\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":8,\"name\":\"扫描器-Nikto\",\"pattern\":\"nikto\",\"category\":\"Scanner\",\"action\":\"log\",\"enabled\":true},"
+            + "{\"id\":9,\"name\":\"扫描器-Sqlmap\",\"pattern\":\"sqlmap\",\"category\":\"Scanner\",\"action\":\"block\",\"enabled\":true},"
+            + "{\"id\":10,\"name\":\"信息探测-备份文件\",\"pattern\":\".bak\",\"category\":\"InfoLeak\",\"action\":\"log\",\"enabled\":true}"
+            + "]";
+
+    public void ensureRulesSeed() {
+        String cur = redis.opsForValue().get("novawaf:rules");
+        if (cur == null || cur.isBlank() || "[]".equals(cur.trim())) {
+            redis.opsForValue().set("novawaf:rules", DEFAULT_RULES);
+            bumpRulesVersion();
+        }
+    }
 
     /** 防护应用列表(novawaf:apps)，叠加每应用今日统计与引擎能力标签 */
     @SuppressWarnings("unchecked")
