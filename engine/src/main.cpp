@@ -24,6 +24,7 @@
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
 #include "novawaf/protect/geo_filter.h"
+#include "novawaf/protect/iplist_filter.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -446,7 +447,22 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
 
                         // 威胁情报：指纹/IP/路径/UA/签名 黑名单
                         bool blocked = false;
-                        if (ti) {
+                        bool whitelisted = false;
+                        // IP 黑白名单（最高优先级，联动管理控制台 novawaf:blacklist / whitelist）
+                        switch (IpListFilter::instance().match(req.clientIp)) {
+                            case IpListFilter::Verdict::WHITE: whitelisted = true; break;
+                            case IpListFilter::Verdict::BLACK:
+                                outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
+                                       "Content-Length: 52\r\n\r\n"
+                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                shield.recordBlock();
+                                emitEvt(req.clientIp, "IpList", "block", "IP-BLACK",
+                                        std::string("blacklisted ip ") + req.clientIp);
+                                blocked = true; tBlocked = true; tAttack = true;
+                                break;
+                            default: break;
+                        }
+                        if (!whitelisted && ti) {
                             auto tr = ti->match(req, ja4, httpFp);
                             if (tr && tr->isBlocked()) {
                                 std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
@@ -460,7 +476,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                         // CC 攻击防护
-                        if (!blocked) {
+                        if (!whitelisted && !blocked) {
                             // 地理位置拦截（GeoIP 地理围栏）
                             auto gr = geo.assess(req.clientIp);
                             if (gr && gr->isBlocked()) {
@@ -474,7 +490,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
-                        if (!blocked) {
+                        if (!whitelisted && !blocked) {
                             DetectionResult cr = cc.assess(req.clientIp, req.path);
                             if (cr.action != Action::PASS) {
                                 std::printf("[reactor %d] %s CC from %s: %s\n",
@@ -492,7 +508,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                         // Bot 行为防护
-                        if (!blocked) {
+                        if (!whitelisted && !blocked) {
                             DetectionResult br = bot.assess(req, ja4);
                             if (br.action != Action::PASS) {
                                 std::printf("[reactor %d] %s Bot from %s: %s\n",
@@ -510,7 +526,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                         // 规则 + AI 二阶复核
-                        if (!blocked) {
+                        if (!whitelisted && !blocked) {
                             DetectionResult dr = detectWithAiReview(pipeline, ai, req);
                             if (dr.isBlocked()) {
                                 std::printf("[reactor %d] BLOCK %s from %s: %s\n",
@@ -525,6 +541,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 asyncHandled = forwardToApp();
                             }
                         }
+                        // 白名单：跳过全部检测，直接放行转发上游
+                        if (whitelisted) asyncHandled = forwardToApp();
                     }
                     // 观察模式：命中攻击仅记录事件(tAttack 已置位)，不拦截、不封禁，仍转发上游
                     if (appMode == 1 && tAttack && app) {
@@ -701,6 +719,35 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             if (!g_running) break;
             loadApps(false);
+        }
+    }).detach();
+
+    // ---- IP 黑白名单：从 Redis novawaf:blacklist / novawaf:whitelist 热加载（联动管理控制台）----
+    auto loadIpList = [](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        static std::string s_ver = "-";
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        auto ver = r.get("novawaf:iplist:version");
+        std::string cur = ver.value_or("");
+        if (cur == s_ver && !initial) return;
+        auto bl = r.get("novawaf:blacklist");
+        auto wh = r.get("novawaf:whitelist");
+        s_ver = cur;
+        auto cnt = IpListFilter::instance().reload(bl.value_or(""), wh.value_or(""));
+        std::printf("  IpList: %s black=%zu white=%zu (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", cnt.first, cnt.second, cur.c_str());
+    };
+    loadIpList(true);
+    std::thread([loadIpList]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!g_running) break;
+            loadIpList(false);
         }
     }).detach();
 
