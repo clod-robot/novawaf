@@ -38,7 +38,7 @@ function has(p) { return isAdmin || perms.value.includes(p) }
 const all = [
   { path: '/dashboard', title: '作战仪表盘', perm: 'dashboard', icon: 'Odometer' },
   { path: '/waf/app', title: '防护应用', perm: 'waf:app:list', icon: 'Grid' },
-  { path: '/waf/log', title: '攻击日志', perm: 'waf:log:list', icon: 'Document' },
+  { path: '/waf/log', title: '日志管理', perm: 'waf:log:list', icon: 'Document' },
   { path: '/waf/rule', title: '规则管理', perm: 'waf:rule:list', icon: 'Setting' },
   { path: '/waf/ioc', title: '威胁情报', perm: 'waf:ioc:list', icon: 'Warning' },
   { path: '/system/user', title: '用户管理', perm: 'sys:user:list', icon: 'User' },

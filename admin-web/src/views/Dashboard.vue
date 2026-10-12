@@ -219,8 +219,11 @@ async function load() {
   try { d.value = await api.dashboard() } catch (e) { d.value = { traffic: {}, byCategory: {}, topIps: [], trend: [], events: [], byAction: {}, byRule: {}, byStatus: [], byCountry: [], byBrowser: [], byOs: [], byHost: [], byReferer: [], topPages: [] } }
   await next()
   charts.forEach(c => c.dispose()); charts = []
+  redraw()
+}
+function redraw() {
   drawTrend()
-  drawDonut(catEl, objToList(d.value.byCategory), ['#00e5ff','#ff4d6d','#ffb020','#00ff9d','#b37feb','#ff7a45','#36cfc9','#40a9ff'])
+  drawDonut(catEl, objToList(d.value.byCategory), ['#00e5ff','#ff4d6d','#ffb020','#00ff9d','b37feb','#ff7a45','#36cfc9','#40a9ff'])
   drawDonut(actEl, objToList(d.value.byAction), ['#ff4d6d','#00ff9d','#ffb020','#00e5ff'])
   drawDonut(statusEl, arr2(d.value.byStatus), ['#00e5ff','#ffb020','#ff4d6d','#00ff9d','#b37feb','#ff7a45'])
   drawDonut(browserEl, arr2(d.value.byBrowser), ['#40a9ff','#00e5ff','#b37feb','#00ff9d','#ffb020','#ff4d6d','#36cfc9'])
@@ -228,9 +231,30 @@ async function load() {
   drawQps()
 }
 function next() { return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))) }
-const timer = ref(null)
-onMounted(() => { load(); timer.value = setInterval(load, 15000) })
-onBeforeUnmount(() => { clearInterval(timer.value); charts.forEach(c => c.dispose()) })
+
+// ===== SSE 实时推送：替代轮询，事件秒级到达，快照每 3s 全量刷新 =====
+let es = null, reconn = null
+function applySnapshot(snap) {
+  if (snap && typeof snap === 'object') { d.value = snap; next().then(redraw) }
+}
+function applyEvent(ev) {
+  if (!ev || typeof ev !== 'object') return
+  const evs = Array.isArray(d.value.events) ? d.value.events.slice() : []
+  evs.unshift(ev)
+  d.value.events = evs.slice(0, 60)
+  if (ev.action === 'block' && d.value.traffic) d.value.traffic.blk = (d.value.traffic.blk || 0) + 1
+}
+function openStream() {
+  try { es = new EventSource(api.streamUrl()) } catch (e) { return }
+  es.addEventListener('snapshot', (e) => { try { applySnapshot(JSON.parse(e.data)) } catch {} })
+  es.addEventListener('event', (e) => { try { applyEvent(JSON.parse(e.data)) } catch {} })
+  es.onerror = () => {
+    es && es.close()
+    reconn = setTimeout(openStream, 3000)   // 断线自动重连
+  }
+}
+onMounted(() => { load(); openStream() })
+onBeforeUnmount(() => { if (reconn) clearTimeout(reconn); if (es) es.close(); charts.forEach(c => c.dispose()) })
 window.addEventListener('resize', () => charts.forEach(c => c.resize()))
 </script>
 

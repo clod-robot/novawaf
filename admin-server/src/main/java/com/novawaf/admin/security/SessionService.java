@@ -36,11 +36,18 @@ public class SessionService {
 
     /** 解析并构建 LoginUser(同时校验 Redis 白名单 + 滑动续期) */
     public LoginUser resolve(HttpServletRequest request) {
+        String token = null;
         String auth = request.getHeader("Authorization");
-        if (auth == null || !auth.startsWith("Bearer ")) {
+        if (auth != null && auth.startsWith("Bearer ")) {
+            token = auth.substring(7);
+        } else {
+            // 兼容 EventSource 无法设置请求头: 允许 ?token=xxx（仅用于 SSE 流）
+            String q = request.getParameter("token");
+            if (q != null && !q.isBlank()) token = q;
+        }
+        if (token == null) {
             throw new BusinessException(401, "未登录");
         }
-        String token = auth.substring(7);
         Claims c;
         try {
             c = jwtUtil.parse(token);

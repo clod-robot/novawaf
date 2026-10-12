@@ -57,6 +57,16 @@ export const api = {
   saveRules: (json) => http.post('/waf/rules', { json }),
   reloadRules: () => http.post('/waf/rules/reload'),
   wafIoc: () => http.get('/waf/ioc'),
+  syslogStatus: () => http.get('/waf/syslog'),
+  saveSyslog: (cfg) => http.put('/waf/syslog', cfg),
+  testSyslog: (cfg) => http.post('/waf/syslog/test', cfg || {}),
+  wafEvents2: (p) => http.get('/waf/events', { params: p }),
+  // SSE 实时流地址（EventSource 不支持自定义头，token 走 query）
+  streamUrl: () => {
+    const base = (import.meta.env && import.meta.env.VITE_API_BASE) || '/api'
+    const token = localStorage.getItem('nova_token') || ''
+    return `${base}/waf/stream?token=${encodeURIComponent(token)}`
+  },
   users: (p) => http.get('/system/users', { params: p }),
   addUser: (d) => http.post('/system/users', d),
   updUser: (id, d) => http.put('/system/users/' + id, d),

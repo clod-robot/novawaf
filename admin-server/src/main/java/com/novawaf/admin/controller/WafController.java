@@ -4,10 +4,13 @@ import com.novawaf.admin.common.Result;
 import com.novawaf.admin.security.RequirePerms;
 import com.novawaf.admin.security.UserContext;
 import com.novawaf.admin.service.AuditService;
+import com.novawaf.admin.service.SseStreamService;
+import com.novawaf.admin.service.SyslogService;
 import com.novawaf.admin.service.WafRedisService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 import java.util.Map;
@@ -19,6 +22,8 @@ import java.util.Map;
 public class WafController {
     private final WafRedisService waf;
     private final AuditService audit;
+    private final SseStreamService sse;
+    private final SyslogService syslog;
 
     // ---------- 日志 ----------
     @RequirePerms("waf:log:list")
@@ -118,5 +123,40 @@ public class WafController {
     public Result<Object> ioc() {
         return Result.ok(Map.of("ioc", waf.ioc() == null ? List.of() : waf.ioc(),
                 "meta", waf.iocMeta() == null ? Map.of() : waf.iocMeta()));
+    }
+
+    // ---------- 实时推送 SSE ----------
+    // 浏览器 EventSource 无法带 Authorization 头，鉴权走 ?token=（SessionService 已兼容）
+    @GetMapping("/stream")
+    public SseEmitter stream() {
+        return sse.subscribe();
+    }
+
+    @RequirePerms("dashboard")
+    @GetMapping("/stream/status")
+    public Result<Map<String, Object>> streamStatus() {
+        return Result.ok(sse.status());
+    }
+
+    // ---------- Syslog 外发 ----------
+    @RequirePerms("waf:log:list")
+    @GetMapping("/syslog")
+    public Result<Map<String, Object>> syslogStatus() {
+        return Result.ok(syslog.status());
+    }
+
+    @RequirePerms("waf:log:list")
+    @PutMapping("/syslog")
+    public Result<Void> saveSyslog(@RequestBody SyslogService.Cfg cfg) {
+        syslog.saveCfg(cfg);
+        audit.record(UserContext.get().getUsername(), "waf", "更新 Syslog 外发配置", "PUT", null, 1,
+                "host=" + cfg.getHost() + ":" + cfg.getPort() + " enabled=" + cfg.isEnabled(), 0);
+        return Result.ok();
+    }
+
+    @RequirePerms("waf:log:list")
+    @PostMapping("/syslog/test")
+    public Result<Map<String, Object>> testSyslog(@RequestBody(required = false) SyslogService.Cfg cfg) {
+        return Result.ok(syslog.test(cfg));
     }
 }
