@@ -57,6 +57,12 @@ export const api = {
   saveRules: (json) => http.post('/waf/rules', { json }),
   reloadRules: () => http.post('/waf/rules/reload'),
   wafIoc: () => http.get('/waf/ioc'),
+  // 黑白名单(联动 GeoIP)
+  ipList: (type, q) => http.get('/waf/iplist', { params: { type, q } }),
+  addIp: (d) => http.post('/waf/iplist', d),
+  delIp: (type, ip) => http.delete('/waf/iplist', { params: { type, ip } }),
+  toggleIp: (type, ip) => http.post('/waf/iplist/toggle', { type, ip }),
+  clearIp: (type) => http.delete('/waf/iplist/all', { params: { type } }),
   syslogStatus: () => http.get('/waf/syslog'),
   saveSyslog: (cfg) => http.put('/waf/syslog', cfg),
   testSyslog: (cfg) => http.post('/waf/syslog/test', cfg || {}),

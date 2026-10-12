@@ -26,12 +26,15 @@ import java.util.concurrent.TimeUnit;
 public class SseStreamService {
     private final StringRedisTemplate redis;
     private final WafRedisService waf;
+    private final IpListService iplist;
+    private final GeoService geo;
     private final ObjectMapper om = new ObjectMapper();
 
     private final CopyOnWriteArrayList<SseEmitter> emitters = new CopyOnWriteArrayList<>();
     private ScheduledExecutorService pool;
     private long lastEventIdx = -1;   // 已推送的 novawaf:events 最大下标(0-based 总长度游标)
     private long lastSnapshot = 0;
+    private long lastIpVersion = -1;  // 名单版本游标，变化则推送 iplist 事件
 
     private static final long TIMEOUT = 0L; // 不超时，靠连接断开清理
 
@@ -81,7 +84,16 @@ public class SseStreamService {
                 if (newOnes != null) {
                     for (String s : newOnes) {
                         Object ev;
-                        try { ev = om.readValue(s, Object.class); } catch (Exception ex) { ev = s; }
+                        try {
+                            ev = om.readValue(s, Object.class);
+                            // 富集 geo（联动地理），并累加名单命中计数
+                            if (ev instanceof Map<?, ?> m && m.get("ip") != null) {
+                                @SuppressWarnings("unchecked") Map<String, Object> mm = (Map<String, Object>) m;
+                                String ip = String.valueOf(mm.get("ip"));
+                                mm.put("country", geo.label(ip));
+                                iplist.recordHit(ip);
+                            }
+                        } catch (Exception ex) { ev = s; }
                         sendAll("event", ev);
                     }
                 }
@@ -89,7 +101,11 @@ public class SseStreamService {
             } else if (cur < lastEventIdx) {
                 lastEventIdx = cur; // 列表被裁剪/清空，重置游标
             }
-            // 2) 仪表盘快照（每 3 秒）
+            // 2) 黑白名单版本变化 → 推送 iplist（前端实时刷新）
+            long ipv = iplist.version();
+            if (lastIpVersion < 0) lastIpVersion = ipv;
+            else if (ipv != lastIpVersion) { lastIpVersion = ipv; sendAll("iplist", Map.of("version", ipv)); }
+            // 3) 仪表盘快照（每 3 秒）
             long now = System.currentTimeMillis();
             if (now - lastSnapshot >= 3000) {
                 lastSnapshot = now;

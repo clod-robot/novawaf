@@ -4,6 +4,8 @@ import com.novawaf.admin.common.Result;
 import com.novawaf.admin.security.RequirePerms;
 import com.novawaf.admin.security.UserContext;
 import com.novawaf.admin.service.AuditService;
+import com.novawaf.admin.service.GeoService;
+import com.novawaf.admin.service.IpListService;
 import com.novawaf.admin.service.SseStreamService;
 import com.novawaf.admin.service.SyslogService;
 import com.novawaf.admin.service.WafRedisService;
@@ -24,6 +26,8 @@ public class WafController {
     private final AuditService audit;
     private final SseStreamService sse;
     private final SyslogService syslog;
+    private final IpListService iplist;
+    private final GeoService geo;
 
     // ---------- 日志 ----------
     @RequirePerms("waf:log:list")
@@ -123,6 +127,54 @@ public class WafController {
     public Result<Object> ioc() {
         return Result.ok(Map.of("ioc", waf.ioc() == null ? List.of() : waf.ioc(),
                 "meta", waf.iocMeta() == null ? Map.of() : waf.iocMeta()));
+    }
+
+    // ---------- 黑白名单(联动 GeoIP) ----------
+    @RequirePerms("waf:iplist:list")
+    @GetMapping("/iplist")
+    public Result<List<Map<String, Object>>> ipList(@RequestParam(defaultValue = "black") String type,
+                                                    @RequestParam(required = false) String q) {
+        return Result.ok(iplist.list(type, q));
+    }
+
+    @Data
+    public static class IpReq { private String ip; private String type; private String note; private String source; }
+
+    @RequirePerms("waf:iplist:edit")
+    @PostMapping("/iplist")
+    public Result<Map<String, Object>> addIp(@RequestBody IpReq req) {
+        String by = UserContext.get() == null ? "system" : UserContext.get().getUsername();
+        Map<String, Object> e = iplist.add(req.getType(), req.getIp(), req.getNote(), req.getSource(), by);
+        audit.record(by, "waf", "新增" + ("white".equals(req.getType()) ? "白" : "黑") + "名单", "POST", null, 1,
+                "ip=" + req.getIp(), 0);
+        return Result.ok(e);
+    }
+
+    @RequirePerms("waf:iplist:edit")
+    @DeleteMapping("/iplist")
+    public Result<Void> delIp(@RequestParam String type, @RequestParam String ip) {
+        iplist.remove(type, ip);
+        audit.record(UserContext.get().getUsername(), "waf", "删除名单IP", "DELETE", null, 1, "ip=" + ip, 0);
+        return Result.ok();
+    }
+
+    @RequirePerms("waf:iplist:edit")
+    @PostMapping("/iplist/toggle")
+    public Result<Void> toggleIp(@RequestBody IpReq req) {
+        iplist.toggle(req.getType(), req.getIp());
+        return Result.ok();
+    }
+
+    @RequirePerms("waf:iplist:edit")
+    @DeleteMapping("/iplist/all")
+    public Result<Void> clearIp(@RequestParam String type) {
+        iplist.clear(type);
+        return Result.ok();
+    }
+
+    @GetMapping("/iplist/geo/{ip}")
+    public Result<Map<String, String>> geoOf(@PathVariable String ip) {
+        return Result.ok(geo.resolve(ip));
     }
 
     // ---------- 实时推送 SSE ----------
