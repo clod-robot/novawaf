@@ -1,0 +1,52 @@
+:root {
+  --bg: #070b12;
+  --bg2: #0c1320;
+  --panel: rgba(13, 22, 38, 0.85);
+  --line: rgba(0, 229, 255, 0.25);
+  --cyan: #00e5ff;
+  --green: #00ff9d;
+  --amber: #ffb020;
+  --red: #ff4d6d;
+  --text: #cfe9ff;
+  --muted: #6f8bb0;
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(0,229,255,0.08), transparent),
+    radial-gradient(900px 500px at -10% 110%, rgba(0,255,157,0.06), transparent),
+    var(--bg);
+  color: var(--text);
+  font-family: "Rajdhani", "PingFang SC", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+}
+/* 机甲切角面板 */
+.mecha-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  clip-path: polygon(14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 14px);
+  position: relative;
+  backdrop-filter: blur(6px);
+}
+.mecha-panel::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(0,229,255,0.05), transparent);
+  animation: scan 6s linear infinite;
+}
+@keyframes scan { from { transform: translateX(-100%);} to { transform: translateX(100%);} }
+.glow-cyan { color: var(--cyan); text-shadow: 0 0 8px rgba(0,229,255,0.6); }
+.hud-title { font-size: 13px; letter-spacing: 2px; color: var(--muted); text-transform: uppercase; }
+
+/* Element Plus 暗色适配 */
+.el-table, .el-table tr, .el-table th.el-table__cell { background: transparent !important; color: var(--text); }
+.el-table--border .el-table__cell { border-color: var(--line) !important; }
+.el-table__body tr:hover > td { background: rgba(0,229,255,0.08) !important; }
+.el-pagination, .el-pagination button, .el-pager li { color: var(--muted) !important; background: transparent !important; }
+.el-input__wrapper, .el-textarea__inner, .el-select__wrapper {
+  background: rgba(8,14,24,0.9) !important; box-shadow: 0 0 0 1px var(--line) inset !important;
+}
+.el-card { background: var(--panel); border: 1px solid var(--line); }
+.el-menu { border-right: none !important; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.3); border-radius: 4px; }

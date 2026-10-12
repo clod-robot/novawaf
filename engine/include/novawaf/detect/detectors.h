@@ -192,8 +192,10 @@ private:
 class XxeDetector : public IDetector {
 public:
     XxeDetector() {
-        for (auto& p : {"<!entity", "<!entity", "system", "public", "<!doctype",
-                         "externalentity", "%remote;", "file:///etc", "expect://"})
+        // 仅匹配 XML 上下文特征，避免裸词 system/public 误伤正常路径/字段(如 /api/auth/system/info)
+        // 真实 XXE 必带 <!ENTITY>/<!DOCTYPE，由下方精确特征兜底
+        for (auto& p : {"<!entity", "<!doctype", "externalentity",
+                         "%remote;", "file:///etc", "expect://"})
             ac_.addPattern(p);
         ac_.build();
     }
@@ -252,7 +254,17 @@ public:
     const char* name() const override { return "CRLF"; }
     std::unique_ptr<IDetector> clone() const override { return std::make_unique<CrlfDetector>(); }
     DetectionResult detect(const HttpRequest& req) override {
-        for (auto& payload : req.collectPayloads()) {
+        // CRLF 注入/响应拆分的注入面是 URL 与请求头，请求体含 CRLF 属正常
+        // （如 multipart 边界），故不扫描 body，避免上传误报。
+        std::vector<std::string> payloads;
+        payloads.push_back(req.path);
+        payloads.push_back(req.query);
+        for (auto& [k, v] : req.headers) payloads.push_back(v);
+        for (auto& [k, v] : req.queryParams) {
+            payloads.push_back(k);
+            payloads.push_back(v);
+        }
+        for (auto& payload : payloads) {
             std::string norm = Decoder::normalize(payload);
             if (ac_.containsAny(norm)) {
                 return {Action::BLOCK, "CRLF-001", "CRLF", "CRLF injection / response splitting", norm};

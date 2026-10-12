@@ -79,6 +79,16 @@ public:
     bool enabled() const { return enabled_.load(std::memory_order_acquire); }
     size_t rangeCount() const { return data_.load(std::memory_order_acquire)->count; }
 
+    // 返回 IP 归属国家代码（大写）。内网/保留地址返回 "内网"，未知返回空串。
+    // 锁无关 copy-on-write 查找，可在 reactor 热路径安全调用。
+    std::string country(const std::string& ip) {
+        if (ip.empty()) return {};
+        if (isPrivateOrReserved(ip)) return "内网";
+        uint32_t u = ipToUint(ip);
+        if (u == 0) return {};
+        return lookup(u);
+    }
+
     // 评估：命中地理策略返回 BLOCK，否则空（放行）
     std::optional<DetectionResult> assess(const std::string& ip) {
         if (!enabled_.load(std::memory_order_acquire)) return std::nullopt;

@@ -100,6 +100,11 @@ public:
         if (r->kind == Reply::BULK && r->bulk.has_value()) return r->bulk;
         return std::nullopt;
     }
+    // HSET key field value -> 成功返回 true
+    bool hset(const std::string& key, const std::string& field, const std::string& value) {
+        auto r = command({"HSET", key, field, value});
+        return r && (r->kind == Reply::INTEGER || r->asString() == "OK");
+    }
     // SET key value（成功返回 true）
     bool set(const std::string& key, const std::string& value) {
         auto r = command({"SET", key, value});

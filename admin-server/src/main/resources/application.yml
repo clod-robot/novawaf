@@ -1,0 +1,52 @@
+server:
+  port: 8081
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: novawaf-admin
+  datasource:
+    url: jdbc:mysql://${NOVA_MYSQL_HOST:127.0.0.1}:${NOVA_MYSQL_PORT:3306}/${NOVA_MYSQL_DB:novawaf_admin}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: ${NOVA_MYSQL_USER:novawaf}
+    password: ${NOVA_MYSQL_PASSWORD:CHANGE-ME}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 2
+  data:
+    redis:
+      host: ${NOVA_REDIS_HOST:127.0.0.1}
+      port: ${NOVA_REDIS_PORT:6379}
+      password: ${NOVA_REDIS_PASSWORD:}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 业务配置
+nova:
+  jwt:
+    # 生产必须用环境变量覆盖: NOVA_JWT_SECRET
+    secret: ${NOVA_JWT_SECRET:CHANGE-ME-please-set-NOVA_JWT_SECRET-at-least-32-chars}
+    expire-minutes: 120
+  admin:
+    # 启动时若 admin 密码哈希不符则重置为此密码(仅首次/哈希不一致时生效)
+    init-password: ${NOVA_ADMIN_PASSWORD:Admin@2026}
+  security:
+    # 登录防爆破: IP 5次/5分钟 锁15分钟; 账号 10次/5分钟 锁30分钟
+    ip-fail-max: 5
+    ip-lock-minutes: 15
+    acct-fail-max: 10
+    acct-lock-minutes: 30
+  cors:
+    allowed-origins: ${NOVA_CORS:*}
+
+logging:
+  level:
+    com.novawaf: INFO
