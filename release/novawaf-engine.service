@@ -7,6 +7,9 @@ Type=simple
 User=root
 Environment=LD_LIBRARY_PATH=/opt/novawaf/lib
 Environment=NOVA_REDIS_HOST=127.0.0.1
+# 可信反向代理(网关)IP/CIDR，逗号分隔；仅命中才采信 X-Forwarded-For/X-Real-IP。
+# 网关与引擎同机填 127.0.0.1；网关在另一台机器则追加其地址，如 127.0.0.1,192.168.100.10
+Environment=NOVA_TRUSTED_PROXIES=127.0.0.1
 Environment=NOVA_YARA_RULES=/opt/novawaf/rules/yara
 ExecStart=/opt/novawaf/bin/novawaf-engine 8099 4
 Restart=always

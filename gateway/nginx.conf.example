@@ -23,7 +23,10 @@ server {
         proxy_set_header X-Original-URI $request_uri;
         proxy_set_header X-Original-Method $request_method;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # 替换式透传真实对端 IP：引擎取 XFF 最左 IP，切勿用 $proxy_add_x_forwarded_for
+        # （追加式会把客户端自带 XFF 拼到最前 → 可被伪造来源）。另需在引擎端
+        # NOVA_TRUSTED_PROXIES 中加入本网关地址（同机填 127.0.0.1）方会采信该头。
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_read_timeout 2s;
         # 检测超时则放行（fail-open，保证可用性）
         proxy_intercept_errors on;

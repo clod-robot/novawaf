@@ -41,6 +41,8 @@ sudo /opt/novawaf/status.sh  # 确认 :8099 与 :18081 监听
 | 引擎端口 | `novawaf.env` ENGINE_PORT | 网关反代目标，默认 8099 |
 | 管理后端端口 | `novawaf.env` ADMIN_PORT | 默认 18081 |
 | Redis 地址/密码 | `novawaf.env` NOVA_REDIS_* | 规则与事件中枢 |
+| 可信反向代理 | `novawaf.env`/systemd 单元 `NOVA_TRUSTED_PROXIES` | 网关地址；仅命中才采信 XFF/X-Real-IP，同机填 `127.0.0.1` |
+| 网关透传真实IP | nginx 站点配置 | XFF 必须用 `$remote_addr`（替换式），勿用 `$proxy_add_x_forwarded_for`（可被伪造） |
 | 引擎→业务上游 | 引擎 apps 配置 / Redis `novawaf:apps` | 受保护业务的 host:port |
 | 站点域名/证书 | nginx 站点配置 | 生产请配 TLS |
 
@@ -64,6 +66,7 @@ tail -f /opt/novawaf/logs/engine.log /opt/novawaf/logs/admin.log
 - 生产环境修改默认管理员密码；管理面启用 TLS
 - 规则热加载不重启、操作经后端审计落库
 - 引擎故障由网关 fail-open 保障业务可用性
+- 源 IP 识别：网关以替换式 `$remote_addr` 透传真实 IP，并在引擎 `NOVA_TRUSTED_PROXIES` 中加入网关地址；NAT 类型决定能否还原外网真实源 IP（DNAT 保留 / L7 注入 XFF / SNAT 丢失，详见仓库 README「源 IP 识别与网关 NAT」）
 
 ## 许可证
 AGPL-3.0，详见源码仓库 LICENSE。
