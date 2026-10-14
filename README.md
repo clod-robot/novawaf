@@ -94,6 +94,35 @@ cd deploy && docker compose up -d
 | `NOVA_GEO_BLOCK` / `NOVA_GEO_ALLOW` | 国家黑/白名单，逗号分隔 |
 | `NOVAAI_ENABLE/ENDPOINT/MODEL` | AI 深度审核（可选，异步非阻塞） |
 | `NOVA_IO_THREADS` | 上游异步转发线程数 |
+| `NOVA_TRUSTED_PROXIES` | 可信反向代理 IP/CIDR（逗号分隔），仅命中才采信 `X-Forwarded-For/X-Real-IP`；网关与引擎同机时填 `127.0.0.1` |
+
+## 源 IP 识别与网关 NAT
+
+引擎默认以 **socket 真实对端 IP** 作为客户端源 IP；**仅当**直连对端命中 `NOVA_TRUSTED_PROXIES`（可信反向代理）时，才采信其 `X-Forwarded-For`（取最左）/`X-Real-IP`。其余情况一律忽略客户端自带的这两个头，杜绝伪造 XFF 冒充白名单、绕过 IP 封禁 / 限速 / 地理围栏（防绕过）。
+
+**能否正确识别"外网真实源 IP"，取决于网关的 NAT 类型：**
+
+| 网关 / NAT 形态 | 源 IP 是否保留 | 能否识别 |
+|---|---|---|
+| L3/L4 端口映射（DNAT，仅改写目的地址） | **保留**真实源 IP | ✅ 能。网关 `$remote_addr` 即真实客户端 IP |
+| L7 反向代理 / ADC / 云 WAF（终结 TCP） | 被改写，但通常会注入 `X-Forwarded-For` | ✅ 能（前提：该代理注入了头，且其 IP 已加入 `NOVA_TRUSTED_PROXIES`） |
+| L3/L4 且做了 SNAT（源地址被改写） | 丢失 | ❌ 无法恢复（该层信息已丢，需在上游设备侧改为透传真实 IP） |
+
+### 接入要求（Nginx 示例）
+
+1. 把网关自身地址加入可信代理（否则引擎忽略 XFF，只认 socket 对端）：
+   ```bash
+   NOVA_TRUSTED_PROXIES=127.0.0.1          # 网关与引擎同机；跨机则追加网关 IP/CIDR：127.0.0.1,192.168.100.10
+   ```
+2. 网关向引擎 **替换式**（而非追加式）透传真实 IP，防止客户端伪造：
+   ```nginx
+   proxy_set_header X-Real-IP       $remote_addr;
+   proxy_set_header X-Forwarded-For $remote_addr;   # 切勿使用 $proxy_add_x_forwarded_for
+   ```
+   > `$proxy_add_x_forwarded_for` 会把客户端自带的 XFF **拼到最前**，而引擎取**最左** IP → 攻击者可伪装来源、栽赃他人。改用 `$remote_addr` 后仅保留网关看到的真实对端。
+3. 引擎直连端口（默认 8099）应仅对内网/本机开放，避免绕过网关直接命中。
+
+> 验证方法：在引擎落库的 `novawaf:traffic:*`（按应用隔离，含去重 IP 列表）或 `novawaf:access` 中核对客户端 IP：经网关应记为**真实客户端 IP**；伪造 `X-Forwarded-For` 不应改变记录值。
 
 ## 性能
 实测经 WAF 转发较直连仅增加 **~2-3ms** 开销（chunked/普通/SSE 响应）。
