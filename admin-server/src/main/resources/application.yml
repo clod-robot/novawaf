@@ -46,6 +46,16 @@ nova:
     acct-lock-minutes: 30
   cors:
     allowed-origins: ${NOVA_CORS:*}
+  deploy:
+    # 后台“一键探测”调起的 NAT 探测脚本固定绝对路径(无 shell、带超时、输出封顶)；留空则禁用一键探测
+    detect-script: ${NOVA_DETECT_SCRIPT:/opt/novawaf/scripts/detect_nat.py}
+    detect-timeout-ms: 10000
+  ipgroup:
+    # 威胁情报收集器（12 个公开源汇总，支持 -o 输出文件）与自定义源拉取脚本；均固定 argv 受控执行
+    threat-script: ${NOVA_THREAT_SCRIPT:/opt/novawaf/scripts/collect_malicious_ips.py}
+    fetch-script: ${NOVA_FETCH_IP_SCRIPT:/opt/novawaf/scripts/fetch_ip_list.py}
+    fetch-timeout-ms: 120000
+    threat-timeout-ms: 300000
 
 logging:
   level:

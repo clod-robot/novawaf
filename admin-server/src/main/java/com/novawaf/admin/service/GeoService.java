@@ -33,6 +33,9 @@ public class GeoService {
             Map.entry("PL", "波兰"), Map.entry("TR", "土耳其"), Map.entry("IR", "伊朗"), Map.entry("KP", "朝鲜"),
             Map.entry("MX", "墨西哥"), Map.entry("AR", "阿根廷"), Map.entry("ZA", "南非"), Map.entry("EG", "埃及"));
 
+    /** ISO CC → 中文国名（供 IP 组地域策略等国家展示用）；未收录返回 null。 */
+    public static String ccZh(String cc) { return cc == null ? null : CC_ZH.get(cc); }
+
     private static boolean isPrivate(String ip) {
         long u = ipToUint(ip); if (u == 0) return false;
         long a = (u >> 24) & 0xFF;
@@ -44,12 +47,19 @@ public class GeoService {
         return a >= 224;
     }
 
-    /** 解析 IP 归属：返回 {cc, name}；内网返回 {cc:"内网", name:"内网"}，未知返回空 map */
+    /** 解析 IP 归属：返回 {cc, name}；内网返回 {cc:"内网", name:"内网"}，未知返回空 map。
+     *  支持传入 CIDR（名单可能存网段），取其网络基址做归属解析。 */
     public Map<String, String> resolve(String ip) {
         Map<String, String> m = new HashMap<>();
         if (ip == null || ip.isBlank()) return m;
-        if (isPrivate(ip)) { m.put("cc", "内网"); m.put("name", "内网"); return m; }
-        long u = ipToUint(ip);
+        String probe = ip.trim();
+        if (probe.contains("/")) {
+            long[] se = parseCidr(probe);
+            if (se == null) return m;
+            probe = uintToIp(se[0]);   // 用网段基址代表该 CIDR 的归属
+        }
+        if (isPrivate(probe)) { m.put("cc", "内网"); m.put("name", "内网"); return m; }
+        long u = ipToUint(probe);
         if (u == 0) return m;
         ensureLoaded();
         List<Range> rs = snap.get().ranges;
@@ -100,6 +110,7 @@ public class GeoService {
     }
 
     static long ipToUint(String ip) {
+        if (ip == null) return 0;
         String[] p = ip.split("\\.");
         if (p.length != 4) return 0;
         try {
@@ -109,13 +120,47 @@ public class GeoService {
         } catch (NumberFormatException e) { return 0; }
     }
 
+    /** 四段式 IPv4 格式校验（与数值 0 解耦：0.0.0.0 是合法地址）。 */
+    static boolean isValidIp(String ip) {
+        if (ip == null) return false;
+        String[] p = ip.split("\\.");
+        if (p.length != 4) return false;
+        try {
+            for (String s : p) {
+                int v = Integer.parseInt(s);
+                if (v < 0 || v > 255) return false;
+            }
+            return true;
+        } catch (NumberFormatException e) { return false; }
+    }
+
+    static String uintToIp(long u) {
+        return ((u >> 24) & 0xFF) + "." + ((u >> 16) & 0xFF) + "." + ((u >> 8) & 0xFF) + "." + (u & 0xFF);
+    }
+
+    /** 判断单 IP 是否落在给定 CIDR/IP 条目内（条目可为单 IP 或 a.b.c.d/n）。 */
+    public static boolean inRange(String entry, String ip) {
+        if (entry == null || ip == null) return false;
+        String i = ip.trim();
+        if (!isValidIp(i)) return false;
+        long ipu = ipToUint(i);
+        String e = entry.trim();
+        if (e.contains("/")) {
+            long[] se = parseCidr(e);
+            return se != null && ipu >= se[0] && ipu <= se[1];
+        }
+        return isValidIp(e) && ipToUint(e) == ipu;
+    }
+
     static long[] parseCidr(String s) {
         int slash = s.indexOf('/');
-        if (slash < 0) { long ip = ipToUint(s); return ip == 0 ? null : new long[]{ip, ip}; }
-        long net = ipToUint(s.substring(0, slash));
+        if (slash < 0) { return isValidIp(s) ? new long[]{ipToUint(s), ipToUint(s)} : null; }
+        String netStr = s.substring(0, slash);
+        if (!isValidIp(netStr)) return null;
+        long net = ipToUint(netStr);
         int bits;
         try { bits = Integer.parseInt(s.substring(slash + 1)); } catch (NumberFormatException e) { return null; }
-        if (net == 0 || bits < 0 || bits > 32) return null;
+        if (bits < 0 || bits > 32) return null;
         long mask = (bits == 0) ? 0 : (0xFFFFFFFFL << (32 - bits));
         long start = net & mask;
         long end = (bits == 32) ? start : (start | (~mask & 0xFFFFFFFFL));

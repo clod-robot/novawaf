@@ -33,6 +33,12 @@
           <el-tag size="small" effect="dark" class="geo-tag" :type="geoType(row.geo)">{{ row.geo }}</el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="访问应用" min-width="150">
+        <template #default="{ row }">
+          <span v-if="row.lastHost" class="host mono" :title="row.lastHost">{{ row.lastHost }}</span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
       <el-table-column label="动作" width="90">
         <template #default="{ row }">
           <el-tag size="small" :type="type === 'black' ? 'danger' : 'success'">
@@ -72,7 +78,7 @@
     </div>
 
     <!-- 新增弹窗 -->
-    <el-dialog v-model="showAdd" :title="type==='black'?'新增黑名单 IP':'新增白名单 IP'" width="460px">
+    <el-dialog v-model="showAdd" :title="type==='black'?'新增黑名单 IP':'新增白名单 IP'" width="460px" append-to-body>
       <el-form label-width="80px">
         <el-form-item label="IP/CIDR"><el-input v-model="form.ip" placeholder="如 1.2.3.4 或 10.0.0.0/8" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="form.note" placeholder="可选" /></el-form-item>
@@ -162,6 +168,8 @@ onBeforeUnmount(closeStream)
 .live { font-size: 12px; color: #566; } .live.on { color: #4af3ff; text-shadow: 0 0 6px #4af3ff; }
 .count { margin-left: auto; font-size: 12px; color: #9ad; }
 .ip { font-weight: 600; }
+.host { color: var(--cyan); font-size: 12px; }
+.muted { color: var(--muted); }
 .geo-tag { margin-left: 8px; font-size: 11px; }
 .mono { font-family: monospace; }
 .hot { color: #ff6b6b; text-shadow: 0 0 6px rgba(255,107,107,.6); }

@@ -74,11 +74,13 @@ public:
             }
         }
 
-        // 维度2：全局热点 URL（单独锁，路径较短）
+        // 维度2：全局热点 URL（按 path 分片，消除全局单锁串行化）
         {
-            std::lock_guard<std::mutex> lk(hotMtx_);
-            evictHot(now);
-            auto& v = hotUrl_[path];
+            size_t hi = std::hash<std::string>{}(path) & (kHotShards - 1);
+            auto& hs = hotShards_[hi];
+            std::lock_guard<std::mutex> lk(hs.mtx);
+            evictHot(hs, now);
+            auto& v = hs.urls[path];
             v.push_back(now);
             int g = (int)v.size();
             if (g > hot) {
@@ -109,9 +111,13 @@ private:
     std::vector<Shard> shards_;
     std::atomic<double> factor_{1.0};
 
-    std::mutex hotMtx_;
-    std::unordered_map<std::string, std::deque<int64_t>> hotUrl_;
-    int64_t lastHotEvict_ = 0;
+    struct HotShard {
+        mutable std::mutex mtx;
+        std::unordered_map<std::string, std::deque<int64_t>> urls;
+        int64_t lastEvict = 0;
+    };
+    static constexpr size_t kHotShards = 32;
+    std::vector<HotShard> hotShards_{kHotShards};
 
     Shard& shard(const std::string& ip) {
         return shards_[std::hash<std::string>{}(ip) & (kShards - 1)];
@@ -126,14 +132,14 @@ private:
             st.urlHits.clear();
         }
     }
-    void evictHot(int64_t now) {
-        if (now - lastHotEvict_ < 2000) return;  // 每 2s 才清理一次，降开销
-        lastHotEvict_ = now;
+    void evictHot(HotShard& hs, int64_t now) {
+        if (now - hs.lastEvict < 2000) return;  // 每 2s 才清理一次，降开销
+        hs.lastEvict = now;
         int64_t cutoff = now - cfg_.windowMs;
-        for (auto it = hotUrl_.begin(); it != hotUrl_.end();) {
+        for (auto it = hs.urls.begin(); it != hs.urls.end();) {
             auto& d = it->second;
             while (!d.empty() && d.front() < cutoff) d.pop_front();
-            if (d.empty()) it = hotUrl_.erase(it); else ++it;
+            if (d.empty()) it = hs.urls.erase(it); else ++it;
         }
     }
 

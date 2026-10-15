@@ -27,7 +27,8 @@ async function doLogin() {
   loading.value = true
   try {
     const d = await api.login(f)
-    localStorage.setItem('nova_token', d.token)
+    // 令牌由后端写入 HttpOnly Cookie，JS 不可读、不可存；仅记非敏感登录标志与权限快照
+    localStorage.setItem('nova_authed', '1')
     localStorage.setItem('nova_perms', JSON.stringify(d.perms || []))
     localStorage.setItem('nova_admin', d.admin ? '1' : '0')
     localStorage.setItem('nova_user', d.nickname || d.username)

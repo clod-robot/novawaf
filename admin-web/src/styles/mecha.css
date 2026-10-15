@@ -1,14 +1,22 @@
 :root {
   --bg: #070b12;
   --bg2: #0c1320;
-  --panel: rgba(13, 22, 38, 0.85);
-  --line: rgba(0, 229, 255, 0.25);
+  --panel: rgba(13, 22, 38, 0.92);
+  --line: rgba(0, 229, 255, 0.28);
   --cyan: #00e5ff;
   --green: #00ff9d;
   --amber: #ffb020;
   --red: #ff4d6d;
-  --text: #cfe9ff;
-  --muted: #6f8bb0;
+  --text: #e8f4ff;          /* 主文本：提亮，暗色下清晰 */
+  --text-soft: #a9c4e6;     /* 次级文本 */
+  --muted: #7e9cc4;
+  /* 覆盖 Element Plus 默认文本色（默认深色会导致暗色下“发白看不清”） */
+  --el-text-color-primary: #e8f4ff;
+  --el-text-color-regular: #cfe2f5;
+  --el-text-color-secondary: #9fb8d6;
+  --el-text-color-placeholder: #6f8bb0;
+  --el-border-color: rgba(0, 229, 255, 0.28);
+  --el-fill-color-blank: transparent;
 }
 * { box-sizing: border-box; }
 html, body, #app { height: 100%; margin: 0; }
@@ -38,15 +46,56 @@ body {
 .glow-cyan { color: var(--cyan); text-shadow: 0 0 8px rgba(0,229,255,0.6); }
 .hud-title { font-size: 13px; letter-spacing: 2px; color: var(--muted); text-transform: uppercase; }
 
-/* Element Plus 暗色适配 */
-.el-table, .el-table tr, .el-table th.el-table__cell { background: transparent !important; color: var(--text); }
-.el-table--border .el-table__cell { border-color: var(--line) !important; }
-.el-table__body tr:hover > td { background: rgba(0,229,255,0.08) !important; }
-.el-pagination, .el-pagination button, .el-pager li { color: var(--muted) !important; background: transparent !important; }
+/* Element Plus 暗色适配 —— 表格文本/表头/单元格全覆盖，杜绝默认深色字看不清 */
+.el-table { color: var(--text); background: transparent; --el-table-border-color: var(--line);
+  --el-table-header-bg-color: rgba(0,229,255,0.06); --el-table-row-hover-bg-color: rgba(0,229,255,0.10);
+  --el-table-bg-color: transparent; --el-table-tr-bg-color: transparent; }
+.el-table tr, .el-table th.el-table__cell { background: transparent !important; }
+.el-table th.el-table__cell { color: var(--cyan) !important; font-weight: 600; letter-spacing: .5px;
+  text-shadow: 0 0 6px rgba(0,229,255,.35); border-bottom: 1px solid var(--line) !important; }
+.el-table td.el-table__cell { color: var(--text) !important; border-bottom: 1px solid rgba(0,229,255,.12) !important; }
+.el-table .cell { color: inherit; line-height: 1.5; }
+/* 斑马纹：用低透明青底区分行，保持文字高亮 */
+.el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell {
+  background: rgba(0,229,255,0.04) !important; }
+.el-table__body tr:hover > td { background: rgba(0,229,255,0.10) !important; }
+/* 空数据提示 */
+.el-table__empty-text { color: var(--muted) !important; }
+/* 标签暗色可读 */
+.el-tag { font-weight: 600; border-width: 1px; }
+.el-tag--info { color: #9fc4e8 !important; }
+/* 分页 / 输入 */
+.el-pagination, .el-pagination button, .el-pager li { color: var(--text-soft) !important; background: transparent !important; }
+.el-pager li.is-active { color: var(--cyan) !important; text-shadow: 0 0 6px rgba(0,229,255,.5); }
+.el-input__inner, .el-textarea__inner { color: var(--text) !important; }
 .el-input__wrapper, .el-textarea__inner, .el-select__wrapper {
   background: rgba(8,14,24,0.9) !important; box-shadow: 0 0 0 1px var(--line) inset !important;
 }
-.el-card { background: var(--panel); border: 1px solid var(--line); }
+.el-input__inner::placeholder { color: var(--muted) !important; }
+/* 弹窗/表单 */
+.el-dialog { background: var(--bg2); border: 1px solid var(--line); }
+/* 抽屉(append-to-body 后脱离页面容器，需显式深色底，避免白底浅字看不清) */
+.el-drawer { background: var(--bg2); border-left: 1px solid var(--line); color: var(--text); }
+.el-drawer__header { color: var(--text); }
+.el-form-item__label { color: var(--text-soft) !important; }
+.el-card { background: var(--panel); border: 1px solid var(--line); color: var(--text); }
 .el-menu { border-right: none !important; }
+
+/* ===== 传送至 body 的浮层深色适配：:root 文字变量为浅色，EP 默认白底会致白底浅字看不清 ===== */
+/* 描述列表(证据摘要/详情) */
+.el-descriptions__body { background: transparent !important; }
+.el-descriptions__label { background: rgba(0,229,255,0.06) !important; color: var(--text-soft) !important; }
+.el-descriptions__content { color: var(--text) !important; }
+/* 下拉/日期等 popper 浮层 */
+.el-popper.is-light { background: var(--bg2) !important; border-color: var(--line) !important; color: var(--text) !important; }
+.el-popper.is-light .el-popper__arrow::before { background: var(--bg2) !important; border-color: var(--line) !important; }
+.el-select-dropdown__item { color: var(--text) !important; }
+.el-select-dropdown__item.is-hovering, .el-select-dropdown__item:hover { background: rgba(0,229,255,0.10) !important; }
+.el-select-dropdown__item.is-selected { color: var(--cyan) !important; }
+/* 消息与确认框 */
+.el-message { background: var(--bg2) !important; border-color: var(--line) !important; }
+.el-message .el-message__content { color: var(--text) !important; }
+.el-message-box { background: var(--bg2) !important; border-color: var(--line) !important; }
+.el-message-box__title, .el-message-box__content, .el-message-box__message { color: var(--text) !important; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.3); border-radius: 4px; }

@@ -27,6 +27,9 @@ _run.bat
 *.log
 # 临时调试脚本（本机排障用，不入库）
 _*.sh
+# Python 缓存
+__pycache__/
+*.pyc
 # 前端构建产物
 admin-web/dist/
 

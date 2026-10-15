@@ -1,0 +1,12 @@
+[Unit]
+Description=NovaWAF GeoIP 每周五 02:00 定时更新
+
+[Timer]
+# 每周五 02:00（OnCalendar 语法：星期-年-月-日 时:分）
+OnCalendar=Fri *-*-* 02:00:00
+# 错过的任务在下次启动后补跑一次
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

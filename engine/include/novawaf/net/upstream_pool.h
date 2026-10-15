@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -85,6 +86,9 @@ private:
             return -1;
         int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) { freeaddrinfo(res); return -1; }
+        // 代理→上游：禁用 Nagle，避免小请求/响应与对端延迟 ACK 相互作用产生 ~40ms 卡顿
+        int nodelay = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         timeval tv{5, 0};
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         timeval rtv{3, 0};

@@ -32,10 +32,12 @@ public class IpListService {
         List<Map<String, Object>> all;
         try { all = (raw == null || raw.isBlank()) ? new ArrayList<>() : om.readValue(raw, List.class); }
         catch (Exception e) { all = new ArrayList<>(); }
-        // 实时富集 geo（数据真实，不缓存脏值）
+        // 实时富集 geo（数据真实，不缓存脏值）+ 最近访问的应用域名
+        Map<String, String> hostOf = recentHostByIp();
         for (Map<String, Object> e : all) {
             String ip = String.valueOf(e.get("ip"));
             e.put("geo", geo.label(ip));
+            e.put("lastHost", lastHostFor(hostOf, ip));
         }
         if (q != null && !q.isBlank()) {
             String kw = q.toLowerCase();
@@ -101,7 +103,7 @@ public class IpListService {
             List<Map<String, Object>> all = list(type, null);
             boolean changed = false;
             for (Map<String, Object> e : all) {
-                if (ip.equalsIgnoreCase(String.valueOf(e.get("ip")))) {
+                if (GeoService.inRange(String.valueOf(e.get("ip")), ip)) {
                     e.put("hits", toLong(e.get("hits")) + 1);
                     e.put("lastHit", System.currentTimeMillis());
                     changed = true;
@@ -124,4 +126,41 @@ public class IpListService {
     }
 
     private static long toLong(Object o) { if (o instanceof Number n) return n.longValue(); try { return Long.parseLong(String.valueOf(o)); } catch (Exception e) { return 0; } }
+
+    /** 从 novawaf:access 最近日志建立 ip->最近访问域名(host) 的映射（CIDR 名单需额外匹配）。 */
+    @SuppressWarnings("unchecked")
+    private Map<String, String> recentHostByIp() {
+        Map<String, String> m = new HashMap<>();
+        try {
+            List<String> raw = redis.opsForList().range("novawaf:access", -3000, -1);
+            if (raw == null) return m;
+            for (String s : raw) {
+                try {
+                    Object o = om.readValue(s, Object.class);
+                    if (!(o instanceof Map)) continue;
+                    Map<String, Object> r = (Map<String, Object>) o;
+                    String ip = String.valueOf(r.get("ip"));
+                    String host = String.valueOf(r.get("host"));
+                    if (ip == null || host == null || host.isBlank()) continue;
+                    m.putIfAbsent(ip, host);   // 从旧到新遍历，新的在后，putIfAbsent 保留最新
+                } catch (Exception ignore) {}
+            }
+        } catch (Exception ignore) {}
+        return m;
+    }
+
+    /** 名单条目(单 IP 或 CIDR)匹配到的最近访问应用域名；无则空串。 */
+    private String lastHostFor(Map<String, String> hostOf, String entry) {
+        if (entry == null) return "";
+        // 先精确匹配
+        String h = hostOf.get(entry);
+        if (h != null) return h;
+        // CIDR 条目：扫描所有访问 IP 是否落在该网段
+        if (entry.contains("/")) {
+            for (Map.Entry<String, String> en : hostOf.entrySet()) {
+                if (GeoService.inRange(entry, en.getKey())) return en.getValue();
+            }
+        }
+        return "";
+    }
 }

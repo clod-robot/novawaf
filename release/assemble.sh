@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$ROOT/out}"
 REL="$OUT/pkg/novawaf-release"
-rm -rf "$OUT/pkg"; mkdir -p "$REL"/{bin,lib,web,conf,rules/yara}
+rm -rf "$OUT/pkg"; mkdir -p "$REL"/{bin,lib,web,conf,rules/yara,scripts}
 
 echo "[assemble] 二进制 + jar"
 cp -f "$OUT/bin/novawaf-engine" "$REL/bin/" && chmod +x "$REL/bin/novawaf-engine"
@@ -31,6 +31,16 @@ cp -f "$ROOT/release/novawaf-engine.service" "$REL/conf/"
 [ -f "$ROOT/admin-server/deploy/nac.conf" ] && cp -f "$ROOT/admin-server/deploy/nac.conf" "$REL/conf/"
 cp -f "$ROOT/release/"{install.sh,start.sh,stop.sh,status.sh,env.example,README-部署.md} "$REL/"
 chmod +x "$REL"/*.sh
+
+echo "[assemble] 运维脚本(NAT 部署类型探测，纯 Python3 标准库)"
+cp -f "$ROOT/scripts/detect_nat.py" "$REL/scripts/"
+chmod 0755 "$REL/scripts/detect_nat.py"
+
+echo "[assemble] 运维脚本(IP 组：自定义源拉取 + 威胁情报收集器 + GeoIP 每周五更新)"
+cp -f "$ROOT/scripts/fetch_ip_list.py" "$REL/scripts/"
+cp -f "$ROOT/../threat_intel/collect_malicious_ips.py" "$REL/scripts/"
+cp -f "$ROOT/release/novawaf-geoip-update.service" "$ROOT/release/novawaf-geoip-update.timer" "$REL/"
+chmod 0755 "$REL/scripts/fetch_ip_list.py" "$REL/scripts/collect_malicious_ips.py"
 
 echo "[assemble] 打包"
 tar czf "$OUT/novawaf-release.tar.gz" -C "$OUT/pkg" novawaf-release

@@ -95,6 +95,57 @@ CREATE TABLE IF NOT EXISTS sys_login_log (
   KEY idx_time (create_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='登录日志';
 
+-- ---------- API 路径级防护策略(引擎经 Redis novawaf:pathpolicy 热加载) ----------
+CREATE TABLE IF NOT EXISTS waf_api_policy (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  name        VARCHAR(64)  NOT NULL COMMENT '策略名称',
+  prefix      VARCHAR(255) NOT NULL COMMENT '路径前缀，末尾*为通配',
+  action      VARCHAR(16)  NOT NULL DEFAULT 'block' COMMENT '动作: block拦截/log仅记录/pass放行',
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用',
+  remark      VARCHAR(255) DEFAULT NULL COMMENT '备注',
+  create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_prefix (prefix)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='API路径级防护策略';
+
+-- ---------- 部署方式-HA配置(单行 id=1；保存后发布 Redis novawaf:deploy:config) ----------
+CREATE TABLE IF NOT EXISTS waf_deploy_config (
+  id          BIGINT       NOT NULL COMMENT '固定为 1',
+  ha_mode     VARCHAR(16)  NOT NULL DEFAULT 'single' COMMENT 'single单机/master-backup主备/cluster集群',
+  vip         VARCHAR(64)  DEFAULT NULL COMMENT '虚拟IP(可空)',
+  nodes       TEXT         DEFAULT NULL COMMENT '节点JSON数组: name/ip/role/priority/enabled',
+  remark      VARCHAR(255) DEFAULT NULL COMMENT '备注',
+  create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='部署方式-HA配置(单行)';
+
+-- ---------- IP 组(通用设置-IP组)：组元数据；条目本体在 Redis SET novawaf:ipgroup:{id} ----------
+CREATE TABLE IF NOT EXISTS waf_ip_group (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  name        VARCHAR(64)  NOT NULL COMMENT '组名',
+  type        VARCHAR(16)  NOT NULL DEFAULT 'custom' COMMENT 'custom自定义/threat威胁情报',
+  action      VARCHAR(16)  NOT NULL DEFAULT 'block' COMMENT 'custom生效动作: block并入黑名单/allow并入白名单; threat固定block',
+  source_url  VARCHAR(512) DEFAULT NULL COMMENT '自定义源URL(手动更新拉取)',
+  remark      VARCHAR(255) DEFAULT NULL COMMENT '备注',
+  enabled     TINYINT      NOT NULL DEFAULT 1 COMMENT '禁用后从生效通道摘除',
+  create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_waf_ip_group_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='IP 组';
+
+-- ---------- GeoIP 地域访问策略(单行 id=1；保存后发布 Redis novawaf:geo:policy, 引擎 3s 热加载) ----------
+CREATE TABLE IF NOT EXISTS waf_geo_policy (
+  id          BIGINT      NOT NULL COMMENT '固定为 1',
+  enabled     TINYINT     NOT NULL DEFAULT 0 COMMENT '策略开关',
+  mode        VARCHAR(16) NOT NULL DEFAULT 'whitelist' COMMENT 'whitelist仅允许/blacklist封禁',
+  countries   TEXT        DEFAULT NULL COMMENT 'ISO两位国家码JSON数组',
+  update_time DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='GeoIP 地域访问策略(单行)';
+
 -- ============================================================
 -- 初始数据: admin / Admin@2026 (BCrypt)
 -- ============================================================
@@ -121,12 +172,23 @@ INSERT INTO sys_menu (id, parent_id, menu_name, perms, type, path, component, so
  (6, 0, '系统管理', NULL,           1, '/system',   NULL,            9),
  (7, 6, '用户管理', 'sys:user:list',2, '/system/user','system/user',1),
  (8, 6, '角色管理', 'sys:role:list',2,'/system/role','system/role',2),
- (9, 6, '审计日志', 'sys:log:list', 2, '/system/log','system/log',  3)
+ (9, 6, '审计日志', 'sys:log:list', 2, '/system/log','system/log',  3),
+ (10,0, '通用设置', NULL,             1, '/common',        NULL,                   8),
+ (11,10,'防护策略', NULL,             1, '/common/protect',NULL,                   1),
+ (12,11,'API防护策略','waf:apipolicy:list',2,'/common/protect/api-policy','common/ApiPolicy',1),
+ (13,10,'部署方式','system:deploy:view',2,'/common/deploy','common/Deploy',2),
+ (14,10,'IP 组','waf:ipgroup:list',2,'/common/ipgroup','common/IpGroup',3)
  ON DUPLICATE KEY UPDATE menu_name=VALUES(menu_name);
 
 -- admin 全部菜单; auditor 只读(1,3,5,9); operator 规则/ioc
+-- 部署方式(13)/IP 组(14) 仅授予 admin：HA 编辑、地域拦截与名单变更均属高危运维操作
 INSERT INTO sys_role_menu (role_id, menu_id) VALUES
- (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),
+ (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),(1,10),(1,11),(1,12),(1,13),(1,14),
  (2,1),(2,3),(2,5),(2,9),
  (3,1),(3,4),(3,5)
  ON DUPLICATE KEY UPDATE menu_id=VALUES(menu_id);
+
+-- HA 配置初始单行：单机模式、空节点
+INSERT INTO waf_deploy_config (id, ha_mode, vip, nodes, remark) VALUES
+ (1, 'single', NULL, '[]', '初始化')
+ ON DUPLICATE KEY UPDATE id=id;

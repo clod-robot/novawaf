@@ -8,11 +8,16 @@
 #include "novawaf/core/traffic_sink.h"
 #include "novawaf/net/upstream_pool.h"
 
-#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -41,6 +46,10 @@ public:
         std::string path;
         std::string referer;
         std::string country;
+        bool        keepAlive = false;   // 客户端连接是否复用(keep-alive)
+        // 转发完成回调（在 IO 线程执行）：keepAlive=true 时由回调把客户端 fd 重新挂回 epoll；
+        // keepAlive=false 时回调负责关闭 fd。为空则沿用旧行为(直接关闭)。
+        std::function<void(int clientFd, bool keepAlive)> onComplete;
     };
 
     // 连接关闭回调（用于释放 DDoS 并发计数等），依赖倒置避免耦合具体防护类
@@ -69,47 +78,114 @@ public:
     }
 
 private:
+    // 归一化响应的 Connection 头（大小写不敏感替换）
+    // 规范构造：head 为不含末尾空行的头区、body 为空行之后的精确字节；
+    // 逐行重建时每条头行统一补 CRLF，最后再补一个空行(CRLF)，杜绝空行 CRLF 被计入 body
+    // 导致响应体错位（历史缺陷：body=substr(he) 含空行，真实 body 被顶掉）。
+    static void setResponseConnection(std::string& resp, bool keepAlive) {
+        size_t he = resp.find("\r\n\r\n");
+        std::string head = (he == std::string::npos) ? resp : resp.substr(0, he);
+        std::string body = (he == std::string::npos) ? "" : resp.substr(he + 4);
+        std::string out;
+        size_t pos = 0;
+        while (pos < head.size()) {
+            size_t eol = head.find("\r\n", pos);
+            std::string line = (eol == std::string::npos) ? head.substr(pos) : head.substr(pos, eol - pos);
+            std::string low = line;
+            for (auto& c : low) c = (char)tolower((unsigned char)c);
+            if (low.compare(0, 11, "connection:") != 0) {
+                out += line;
+                out += "\r\n";   // 每条头行（含最后一条）统一行终止
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 2;
+        }
+        size_t firstEol = out.find("\r\n");
+        if (firstEol != std::string::npos)
+            out.insert(firstEol + 2,
+                       std::string("Connection: ") + (keepAlive ? "keep-alive" : "close") + "\r\n");
+        resp = out + "\r\n" + body;  // 头区已各自带 CRLF，此处补空行 + 精确 body
+    }
+
+    // 客户端连接收尾：keep-alive 交回 reactor 复用，否则关闭
+    void finishClient(Ctx& ctx) {
+        setCliNonblock(ctx.clientFd);  // 复位非阻塞，交还 reactor 做 ET 读
+        if (ctx.onComplete) {
+            ctx.onComplete(ctx.clientFd, ctx.keepAlive);
+        } else {
+            ::close(ctx.clientFd);
+            if (onDisconnect_) onDisconnect_(ctx.clientIp);
+        }
+    }
+
+    // 客户端 fd 在 reactor 中为非阻塞(ET 读)；IO 线程回写时切阻塞，保证响应完整发出
+    static void setCliBlocking(int fd) {
+        int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    // 回写完成后复位非阻塞，交还 reactor 做 ET 读
+    static void setCliNonblock(int fd) {
+        int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+
     void run(Ctx ctx) {
         static const std::string k502 =
-            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        int ufd = connPool_.acquire(ctx.upstreamHost, ctx.upstreamPort);
-        if (ufd < 0 || !sendAll(ufd, ctx.data.data(), ctx.data.size())) {
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        setCliBlocking(ctx.clientFd);  // 回写期间阻塞，保证响应完整（收尾时 reactor 会复位非阻塞）
+
+        // 单次尝试：取连接→发请求→读响应。成功返回 true 并填充 outResp/ufd。
+        auto attempt = [&](int& ufdOut, std::string& resp) -> bool {
+            int ufd = connPool_.acquire(ctx.upstreamHost, ctx.upstreamPort);
+            if (ufd < 0) return false;
+            if (!sendAll(ufd, ctx.data.data(), ctx.data.size())) {
+                connPool_.discard(ufd);   // 发送失败：连接已坏
+                return false;
+            }
+            std::string head;
+            if (!readHead(ufd, head)) {
+                connPool_.discard(ufd);   // 读头失败：对端关闭/空闲死连接
+                return false;
+            }
+            if (isStreamResp(head)) { resp = head; ufdOut = ufd; return true; }
+            resp = head;
+            if (!readBody(ufd, resp)) { connPool_.discard(ufd); return false; }
+            connPool_.release(ctx.upstreamHost, ctx.upstreamPort, ufd);
+            ufdOut = ufd;
+            return true;
+        };
+
+        std::string outResp;
+        int ufd = -1;
+        bool ok = attempt(ufd, outResp);
+        if (!ok) {                       // 死连接重试一次（池化空闲连接可能已被上游 FIN）
+            outResp.clear();
+            ok = attempt(ufd, outResp);
+        }
+
+        if (!ok) {
+            std::string e = k502;
+            setResponseConnection(e, false);
+            writeAll(ctx.clientFd, e);
+            finishClient(ctx);
+            return;
+        }
+        // SSE(101/事件流)：流式中继，长连接不复用
+        if (isStreamResp(outResp)) {
+            if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
+            setResponseConnection(outResp, false);
+            writeAll(ctx.clientFd, outResp);
+            relay(ctx.clientFd, ufd);
             connPool_.discard(ufd);
-            writeAll(ctx.clientFd, k502);
-            ::close(ctx.clientFd);
-            if (onDisconnect_) onDisconnect_(ctx.clientIp);
+            if (ctx.statsEnabled) emitStat(ctx, respStatus(outResp), false);
+            finishClient(ctx);
             return;
         }
-        // 读取响应头（可能附带首批 body）
-        std::string head;
-        if (!readHead(ufd, head)) {
-            connPool_.discard(ufd);
-            writeAll(ctx.clientFd, k502);
-            ::close(ctx.clientFd);
-            if (onDisconnect_) onDisconnect_(ctx.clientIp);
-            return;
-        }
-        // SSE(101 升级 或 text/event-stream) → 流式双向透传，不缓冲整包
-        if (isStreamResp(head)) {
-            if (ctx.newSess) injectHeader(head, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
-            writeAll(ctx.clientFd, head);
-            relay(ctx.clientFd, ufd);          // 边收边发，任一端关闭即结束
-            connPool_.discard(ufd);            // 长连接不复用
-            if (ctx.statsEnabled) emitStat(ctx, respStatus(head), false);
-            ::close(ctx.clientFd);
-            if (onDisconnect_) onDisconnect_(ctx.clientIp);
-            return;
-        }
-        // 普通响应：读取完整 body（Content-Length 定长或 EOF 结束）
-        std::string outResp = head;
-        bool ok = readBody(ufd, outResp);
-        if (ok) connPool_.release(ctx.upstreamHost, ctx.upstreamPort, ufd);
-        else { connPool_.discard(ufd); outResp = k502; }
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
+        setResponseConnection(outResp, ctx.keepAlive);
         if (ctx.statsEnabled) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
-        ::close(ctx.clientFd);
-        if (onDisconnect_) onDisconnect_(ctx.clientIp);
+        finishClient(ctx);
     }
 
     void emitStat(const Ctx& ctx, int status, bool blocked) {

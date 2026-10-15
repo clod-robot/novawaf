@@ -50,7 +50,7 @@
     </div>
 
     <!-- 详情弹窗 -->
-    <el-dialog v-model="detailShow" :title="'应用详情 · ' + (cur.name || cur.id)" width="460px" class="mecha-dialog">
+    <el-dialog v-model="detailShow" :title="'应用详情 · ' + (cur.name || cur.id)" width="460px" class="mecha-dialog" append-to-body>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="应用ID">{{ cur.id }}</el-descriptions-item>
         <el-descriptions-item label="应用名称">{{ cur.name }}</el-descriptions-item>
@@ -65,7 +65,7 @@
     </el-dialog>
 
     <!-- 添加/修改应用 -->
-    <el-dialog v-model="showAdd" :title="editingId ? '修改防护应用' : '添加防护应用'" width="460px">
+    <el-dialog v-model="showAdd" :title="editingId ? '修改防护应用' : '添加防护应用'" width="460px" append-to-body>
       <el-form :model="form" label-width="90px" size="default">
         <el-form-item label="应用名称">
           <el-input v-model="form.name" placeholder="如：NAC 认证网关" />
@@ -91,7 +91,7 @@
     </el-dialog>
 
     <!-- 运行模式切换 -->
-    <el-dialog v-model="modeShow" :title="'运行模式 · ' + (modeApp.name || modeApp.id)" width="560px" class="mecha-dialog">
+    <el-dialog v-model="modeShow" :title="'运行模式 · ' + (modeApp.name || modeApp.id)" width="560px" class="mecha-dialog" append-to-body>
       <div class="mode-cards">
         <div v-for="m in modes" :key="m.val" class="mode-card" :class="{ active: selMode === m.val, [m.val]: true }" @click="selMode = m.val">
           <div class="mc-title">{{ m.label }}</div>

@@ -1,0 +1,14 @@
+[Unit]
+Description=NovaWAF GeoIP 数据每周刷新（GeoLite2 CSV -> novawaf:geoip）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 环境配置（NOVA_REDIS_HOST/PASS、NOVA_GEOIP_CSV_DIR 等）；文件不存在不报错
+EnvironmentFile=-/opt/novawaf/novawaf.env
+# GeoLite2-Country CSV 解压目录由 NOVA_GEOIP_CSV_DIR 指定（默认 /opt/novawaf/geoip-src）；
+# 目录缺失说明未配置数据源：记日志正常退出（定时任务空跑，不算失败）。
+# 注意：maxmind_to_redis.py 读取 REDIS_HOST/REDIS_PASS 环境变量，此处从 NOVA_* 映射。
+ExecStart=/bin/sh -c 'SRC="${NOVA_GEOIP_CSV_DIR:-/opt/novawaf/geoip-src}"; if [ ! -d "$SRC" ]; then echo "[geoip-update] CSV 目录不存在($SRC)，跳过本次更新（请在 novawaf.env 配置 NOVA_GEOIP_CSV_DIR）"; exit 0; fi; export REDIS_HOST="${NOVA_REDIS_HOST:-127.0.0.1}" REDIS_PORT="${NOVA_REDIS_PORT:-6379}" REDIS_PASS="${NOVA_REDIS_PASS:-}"; exec /usr/bin/python3 /opt/novawaf/scripts/maxmind_to_redis.py --dir "$SRC" -o /opt/novawaf/rules/geoip.txt'
+TimeoutStartSec=600

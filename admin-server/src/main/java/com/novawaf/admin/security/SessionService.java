@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 @RequiredArgsConstructor
 public class SessionService {
     public static final String TOKEN_PREFIX = "nova:token:";
+    public static final String COOKIE_NAME = "nova_session";
 
     private final JwtUtil jwtUtil;
     private final SysMenuMapper menuMapper;
@@ -37,11 +38,20 @@ public class SessionService {
     /** 解析并构建 LoginUser(同时校验 Redis 白名单 + 滑动续期) */
     public LoginUser resolve(HttpServletRequest request) {
         String token = null;
-        String auth = request.getHeader("Authorization");
-        if (auth != null && auth.startsWith("Bearer ")) {
-            token = auth.substring(7);
-        } else {
-            // 兼容 EventSource 无法设置请求头: 允许 ?token=xxx（仅用于 SSE 流）
+        // 1) 优先 HttpOnly Cookie（防 XSS 窃取，会话存 Redis 可即时失效）
+        if (request.getCookies() != null) {
+            for (jakarta.servlet.http.Cookie c : request.getCookies()) {
+                if (COOKIE_NAME.equals(c.getName()) && c.getValue() != null && !c.getValue().isBlank()) {
+                    token = c.getValue(); break;
+                }
+            }
+        }
+        // 2) 兼容 Bearer 头 / 3) EventSource 的 ?token=
+        if (token == null) {
+            String auth = request.getHeader("Authorization");
+            if (auth != null && auth.startsWith("Bearer ")) token = auth.substring(7);
+        }
+        if (token == null) {
             String q = request.getParameter("token");
             if (q != null && !q.isBlank()) token = q;
         }

@@ -25,6 +25,7 @@
 #include "novawaf/protect/fingerprint.h"
 #include "novawaf/protect/geo_filter.h"
 #include "novawaf/protect/iplist_filter.h"
+#include "novawaf/protect/path_policy.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -39,27 +40,83 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/random.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace novawaf;
 
 static std::atomic<bool> g_running{true};
 
+// 热路径调试日志开关：默认关闭。printf 内部持有 libc 全局 stdout 锁，
+// 高并发下每个拦截请求都 printf 会把所有 reactor 串行化，严重损耗多核扩展。
+// 仅当 NOVA_DEBUG=1 时才输出。
+static const bool g_debugLog = [] {
+    const char* e = getenv("NOVA_DEBUG");
+    return e && std::string(e) == "1";
+}();
+
 // 异步上游转发器（独立 IO 线程池），在 main 中初始化；
 // reactor 对放行请求优先提交给它转发，避免阻塞 reactor 线程。
 static std::shared_ptr<UpstreamForwarder> g_upstream;
+
+// ---- per-reactor 观测（定位多核串行点）：NOVA_REACTOR_STATS=1 时每 2s 打印 ----
+static std::atomic<uint64_t> g_rReq[64];      // 各 reactor 累计处理请求数
+static std::atomic<uint64_t> g_rBusyNs[64];   // 各 reactor 处理请求累计耗时(纳秒)
+static const bool g_reactorStats = [] {
+    const char* e = getenv("NOVA_REACTOR_STATS");
+    return e && std::string(e) == "1";
+}();
+// 单个请求处理作用域：析构时累计该 reactor 的请求数与处理耗时
+struct ReactorReqScope {
+    int idx;
+    uint64_t t0 = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    ~ReactorReqScope() {
+        if (g_reactorStats) {
+            uint64_t t1 = (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+            g_rReq[idx].fetch_add(1, std::memory_order_relaxed);
+            g_rBusyNs[idx].fetch_add(t1 - t0, std::memory_order_relaxed);
+        }
+    }
+};
+
+// ---- 分阶段耗时（微秒）累计，NOVA_REACTOR_STATS=1 时随 rstat 打印各阶段均耗时 ----
+enum Stage { S_PARSE=0, S_GUARD, S_FP_TI, S_GEO_CC_BOT, S_PIPE, S_POST, S_WRITE, S__N };
+static std::atomic<uint64_t> g_stNs[S__N];
+static std::atomic<uint64_t> g_stCnt[S__N];
+static inline uint64_t nowNs() {
+    return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+}
+struct StageTimer {
+    Stage s; uint64_t t0;
+    explicit StageTimer(Stage x) : s(x), t0(nowNs()) {}
+    ~StageTimer() {
+        if (g_reactorStats) {
+            g_stNs[s].fetch_add(nowNs() - t0, std::memory_order_relaxed);
+            g_stCnt[s].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
 
 // 态势统计：拦截事件发布到事件总线（观察者模式），由各订阅者异步消费，热路径不阻塞
 static void emitEvt(const std::string& ip, const std::string& cat,
@@ -81,6 +138,37 @@ static std::vector<std::string> splitCsvStr(const char* s) {
     }
     if (!cur.empty()) out.push_back(cur);
     return out;
+}
+
+// 防绕过：仅当直连对端是可信反向代理时，才采信其 X-Forwarded-For/X-Real-IP。
+// 否则一律用 socket 真实对端 IP，杜绝客户端伪造 XFF 冒充白名单/绕开地理与限速。
+static uint32_t ipU(const std::string& ip) {
+    int a,b,c,d; if (std::sscanf(ip.c_str(),"%d.%d.%d.%d",&a,&b,&c,&d)!=4) return 0;
+    if ((a|b|c|d)<0||a>255||b>255||c>255||d>255) return 0;
+    return (uint32_t(a)<<24)|(uint32_t(b)<<16)|(uint32_t(c)<<8)|uint32_t(d);
+}
+static bool isTrustedProxy(const std::string& peerIp) {
+    static const auto ranges = []() -> std::vector<std::pair<uint32_t,uint32_t>> {
+        std::vector<std::pair<uint32_t,uint32_t>> r;
+        const char* e = getenv("NOVA_TRUSTED_PROXIES");
+        if (!e || !*e) return r;
+        for (auto& s : splitCsvStr(e)) {
+            auto slash = s.find('/');
+            if (slash == std::string::npos) { uint32_t ip=ipU(s); if(ip) r.push_back({ip,ip}); }
+            else {
+                uint32_t net = ipU(s.substr(0,slash)); int bits = std::atoi(s.substr(slash+1).c_str());
+                if (net && bits>=0 && bits<=32) {
+                    uint32_t mask = bits==0?0:(0xFFFFFFFFu<<(32-bits));
+                    uint32_t st=net&mask; r.push_back({st, bits==32?st:(st|(~mask))});
+                }
+            }
+        }
+        return r;
+    }();
+    if (ranges.empty()) return false;
+    uint32_t u = ipU(peerIp); if (!u) return false;
+    for (auto& rg : ranges) if (u>=rg.first && u<=rg.second) return true;
+    return false;
 }
 
 // 把一段文本按行切分（用于 Redis 返回的整文件内容）
@@ -156,6 +244,9 @@ static int createListenFd(int port, int backlog) {
 static void setNonblock(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 }
+static void setBlocking(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+}
 
 // 解析 "host:port" → host, port
 static bool parseHostPort(const std::string& s, std::string& host, int& port) {
@@ -229,14 +320,29 @@ static bool forwardToUpstream(const std::string& host, int port,
     return ok && !outResp.empty();
 }
 
-// 生成不可预测的 session id（16 字节随机 → hex）
+// 生成不可预测的 session id（16 字节随机 → hex）。
+// 用 getrandom() 单次系统调用，避免每请求 fopen/fclose /dev/urandom 的高开销。
 static std::string genSid() {
     static std::atomic<unsigned> ctr{0};
     unsigned char buf[16];
-    FILE* f = fopen("/dev/urandom", "rb");
-    if (f) { size_t rd = fread(buf, 1, sizeof(buf), f); fclose(f); if (rd != sizeof(buf)) {
-        for (int i = 0; i < 16; ++i) buf[i] = (unsigned char)(rand() ^ (ctr.fetch_add(1) * 2654435761u)); } }
-    else { for (int i = 0; i < 16; ++i) buf[i] = (unsigned char)(rand() ^ (ctr.fetch_add(1) * 2654435761u)); }
+    ssize_t got = -1;
+#if defined(__linux__)
+    got = getrandom(buf, sizeof(buf), 0);  // <sys/random.h>
+#endif
+    if (got != (ssize_t)sizeof(buf)) {     // 回退：常驻 fd（只在首次打开）
+        static int urd = [] { int f = open("/dev/urandom", O_RDONLY); return f; }();
+        if (urd >= 0) {
+            size_t off = 0;
+            while (off < sizeof(buf)) {
+                ssize_t rd = read(urd, buf + off, sizeof(buf) - off);
+                if (rd > 0) off += (size_t)rd; else break;
+            }
+            if (off != sizeof(buf))
+                for (int i = 0; i < 16; ++i) buf[i] = (unsigned char)(rand() ^ (ctr.fetch_add(1) * 2654435761u));
+        } else {
+            for (int i = 0; i < 16; ++i) buf[i] = (unsigned char)(rand() ^ (ctr.fetch_add(1) * 2654435761u));
+        }
+    }
     static const char* hx = "0123456789abcdef";
     std::string s; s.reserve(32);
     for (int i = 0; i < 16; ++i) { s += hx[buf[i] >> 4]; s += hx[buf[i] & 0xf]; }
@@ -287,6 +393,69 @@ static std::string hdrCi(const HttpRequest& req, const std::string& key) {
     return {};
 }
 
+// ---- HTTP keep-alive 支持 ----
+// 从接收缓冲区切出一个完整请求：返回 1=完整(rawReq/totalLen) 0=不完整 -1=协议错误
+static int nextRequest(const std::string& buf, std::string& rawReq, size_t& totalLen) {
+    size_t he = buf.find("\r\n\r\n");
+    if (he == std::string::npos) {
+        // 请求行/头过长仍不完整，按畸形处理，防止无限缓冲
+        return buf.size() > 65536 ? -1 : 0;
+    }
+    std::string head = buf.substr(0, he);
+    long long bodyLen = -1;
+    {   // 解析 Content-Length（大小写不敏感）
+        std::string low = head;
+        for (auto& c : low) c = (char)tolower((unsigned char)c);
+        size_t p = low.find("content-length:");
+        if (p != std::string::npos) {
+            size_t e = low.find("\r\n", p);
+            std::string v = low.substr(p + 15, (e == std::string::npos ? low.size() : e) - (p + 15));
+            bodyLen = std::atoll(v.c_str());
+        }
+    }
+    if (bodyLen < 0) bodyLen = 0;
+    totalLen = he + 4 + (size_t)bodyLen;
+    if (buf.size() < totalLen) return 0;
+    rawReq = buf.substr(0, totalLen);
+    return 1;
+}
+
+// 按 HTTP 版本与 Connection 头判定是否复用连接
+static bool wantsKeepAlive(const HttpRequest& req) {
+    std::string conn = hdrCi(req, "Connection");
+    for (auto& c : conn) c = (char)tolower((unsigned char)c);
+    bool is11 = req.version.find("1.1") != std::string::npos;
+    if (conn.find("close") != std::string::npos) return false;
+    if (conn.find("keep-alive") != std::string::npos) return true;
+    return is11;  // HTTP/1.1 默认 keep-alive，1.0 默认关闭
+}
+
+// 归一化本地生成响应的 Connection 头（大小写不敏感替换/插入）
+static void setRespConnection(std::string& resp, bool keepAlive) {
+    size_t he = resp.find("\r\n\r\n");
+    std::string head = (he == std::string::npos) ? resp : resp.substr(0, he);
+    std::string body = (he == std::string::npos) ? "" : resp.substr(he + 4);
+    std::string out;
+    size_t pos = 0;
+    while (pos < head.size()) {
+        size_t eol = head.find("\r\n", pos);
+        std::string line = (eol == std::string::npos) ? head.substr(pos) : head.substr(pos, eol - pos);
+        std::string low = line;
+        for (auto& c : low) c = (char)tolower((unsigned char)c);
+        if (low.compare(0, 11, "connection:") != 0) {
+            out += line;
+            out += "\r\n";
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 2;
+    }
+    size_t firstEol = out.find("\r\n");
+    if (firstEol != std::string::npos)
+        out.insert(firstEol + 2,
+                   std::string("Connection: ") + (keepAlive ? "keep-alive" : "close") + "\r\n");
+    resp = out + "\r\n" + body;
+}
+
 // 单 Reactor 线程：监听 + 读请求 + 检测 + 简单回包（演示版）
 static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         RateLimiter& limiter, DdosGuard& ddos,
@@ -301,12 +470,56 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
     epoll_ctl(epfd, EPOLL_CTL_ADD, listenFd, &ev);
 
     std::vector<epoll_event> events(1024);
+
+    // ---- per-connection 状态（keep-alive 复用读缓冲）----
+    struct ConnState {
+        std::string inbuf;
+        std::string peerIp;
+        bool peerReady = false;
+        // 非阻塞回写：send 遇到 EAGAIN 时，剩余响应在此排队，由 EPOLLOUT 排空（不阻塞 reactor）
+        std::string outQ;
+        size_t outPos = 0;
+        bool closeAfterFlush = false;
+        int64_t lastActiveMs = 0;
+    };
+    std::unordered_map<int, ConnState> conns;
+    std::mutex busyMtx;
+    std::unordered_set<int> busy;   // 已交给异步转发器、尚未回写完成的 fd
+    constexpr int64_t kKeepAliveIdleMs = 15000;  // 空闲连接 15s 回收
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count(); };
+
+    // 关闭并清理一条客户端连接（reactor 线程与异步完成回调共用，幂等）
+    auto closeConn = [&](int cfd) {
+        {
+            std::lock_guard<std::mutex> lk(busyMtx);
+            if (busy.count(cfd)) return;   // 异步转发进行中，由完成回调收尾
+            if (conns.erase(cfd) == 0) return;  // 已被异步回调关闭，避免重复 close
+        }
+        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+        sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+        if (getpeername(cfd, (sockaddr*)&peer, &plen) == 0) {
+            char ipstr[32] = {0};
+            inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
+            ddos.onDisconnect(ipstr);
+        }
+        ::close(cfd);
+    };
+
+    // 1s 周期 timerfd：驱动 keep-alive 空闲连接回收
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    itimerspec its{}; its.it_interval.tv_sec = 1; its.it_value.tv_sec = 1;
+    timerfd_settime(tfd, 0, &its, nullptr);
+    epoll_event tev{}; tev.events = EPOLLIN; tev.data.fd = tfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &tev);
+
     std::printf("[reactor %d] started\n", idx);
 
     while (g_running) {
         int n = epoll_wait(epfd, events.data(), (int)events.size(), 200);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
+            if (fd == tfd) { uint64_t exp; while (read(tfd, &exp, 8) > 0) {} continue; }
             if (fd == listenFd) {
                 while (true) {
                     sockaddr_in caddr{};
@@ -320,45 +533,141 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         close(cfd);  // 直接丢弃，不消耗应用层资源
                         continue;
                     }
+                    // 读保持非阻塞(ET 边沿触发需 drain 到 EAGAIN)；写响应时临时切阻塞以发完整
                     setNonblock(cfd);
+                    int one = 1;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  // 降低小包延迟
+                    // TCP keepalive：及时发现半开/失活对端
+                    int on = 1, idle = 10, intv = 3, cnt = 3;
+                    setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &intv, sizeof(intv));
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+                    timeval sndtv{10, 0}, rcvtv{15, 0};  // 防慢客户端长期占用 reactor
+                    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &sndtv, sizeof(sndtv));
+                    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rcvtv, sizeof(rcvtv));
                     epoll_event ce{};
                     ce.events = EPOLLIN | EPOLLET;
                     ce.data.fd = cfd;
                     epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ce);
+                    conns[cfd].lastActiveMs = nowMs();
                 }
-            } else {
+                continue;
+            }
+            // 单连接处理异常护栏：资源耗尽等异常只丢弃该连接，绝不让异常逃逸到
+            // reactor 线程触发 std::terminate/abort（保证高并发下进程可用性）。
+            try {
+            {
+                bool isBusy = false;
+                { std::lock_guard<std::mutex> lk(busyMtx); isBusy = busy.count(fd) > 0; }
+                if (isBusy) continue;  // 异步转发进行中，交由 IO 线程回写
+            }
+            // 非阻塞回写排空：该连接此前 send EAGAIN，现 EPOLLOUT 可写，把剩余响应发完
+            {
+                auto cd = conns.find(fd);
+                if (cd != conns.end() && !cd->second.outQ.empty()) {
+                    ConnState& cs = cd->second;
+                    bool werr = false;
+                    while (cs.outPos < cs.outQ.size()) {
+                        ssize_t w = send(fd, cs.outQ.data() + cs.outPos,
+                                         cs.outQ.size() - cs.outPos, MSG_NOSIGNAL | MSG_DONTWAIT);
+                        if (w > 0) { cs.outPos += (size_t)w; }
+                        else if (w < 0 && errno == EINTR) { continue; }
+                        else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { break; }
+                        else { werr = true; break; }
+                    }
+                    if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) werr = true;
+                    if (werr) { closeConn(fd); continue; }
+                    if (cs.outPos < cs.outQ.size()) continue;  // 仍背压，等待下一次 EPOLLOUT
+                    // 本响应已完整排空
+                    bool doClose = cs.closeAfterFlush;
+                    cs.outQ.clear(); cs.outPos = 0; cs.closeAfterFlush = false;
+                    epoll_event ev{}; ev.events = EPOLLIN | EPOLLET; ev.data.fd = fd;
+                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);  // 回到只关心可读
+                    if (doClose) { closeConn(fd); continue; }
+                    // 落到下面正常读/处理，顺带把背压期间已到达的请求 drain 掉（避免漏 ET 边沿）
+                }
+            }
+            {
                 char buf[8192];
-                std::string data;
+                bool peerClosed = false, readErr = false;
                 while (true) {
                     ssize_t r = read(fd, buf, sizeof(buf));
-                    if (r > 0) data.append(buf, r);
-                    else if (r == 0 || (r < 0 && errno != EAGAIN)) { goto closefd; }
+                    if (r > 0) conns[fd].inbuf.append(buf, (size_t)r);
+                    else if (r == 0) { peerClosed = true; break; }
+                    else if (r < 0 && errno != EAGAIN) { readErr = true; break; }
                     else break;
                 }
+                if (peerClosed || readErr) { closeConn(fd); continue; }
+            }
+            {
+              // 每条连接可连续处理多个完整请求（keep-alive），畸形则关闭
+              bool keepOpen = true;
+              bool draining = false;  // 响应进入 outQ 由 EPOLLOUT 异步排空，fd 暂不关闭
+              while (keepOpen && g_running) {
+                {   // 空闲超时回收（惰性）
+                    auto it = conns.find(fd);
+                    if (it != conns.end() && nowMs() - it->second.lastActiveMs > kKeepAliveIdleMs) {
+                        keepOpen = false; break;
+                    }
+                }
+                std::string rawReq; size_t reqLen = 0;
                 {
-                    // 解析 + 检测（独立块作用域，变量不越过 goto 标签）
+                    auto it = conns.find(fd);
+                    if (it == conns.end()) { keepOpen = false; break; }
+                    int nr = nextRequest(it->second.inbuf, rawReq, reqLen);
+                    if (nr == 0) break;        // 数据不完整，等更多字节
+                    if (nr < 0) { keepOpen = false; break; }  // 协议错误
+                }
+                bool keepAlive = false;
+                const std::string data = rawReq;   // 检测/转发使用的完整请求字节
+                {
+                    ReactorReqScope _rs{idx};
+                    uint64_t _mk[8]; int _mi=0;
+                    auto _mark=[&](){ if(g_reactorStats && _mi<8) _mk[_mi++]=nowNs(); };
+                    auto _flush=[&](const int idxm[8]){
+                        if(!g_reactorStats || _mi<8) return;
+                        for(int k=0;k<7;++k){ g_stNs[k].fetch_add(_mk[idxm[k+1]]-_mk[idxm[k]],std::memory_order_relaxed);
+                                             g_stCnt[k].fetch_add(1,std::memory_order_relaxed); }
+                    };
+                    static const int SEQ[8]={0,1,2,3,4,5,6,7};
+                    _mark();
+                    // HTTP 解析仅一次：keep-alive 判定与后续检测共用同一份 req
                     HttpParser parser;
                     parser.feed(data);
+                    if (parser.hasError()) { keepOpen = false; break; }
                     HttpRequest req = parser.request();
-                    char ipstr[32] = {0};
-                    sockaddr_in peer{};
-                    socklen_t plen = sizeof(peer);
-                    getpeername(fd, (sockaddr*)&peer, &plen);
-                    inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
-                    req.clientIp = ipstr;
-                    // 若位于反向代理/CDN 之后，真实客户端 IP 在 X-Forwarded-For / X-Real-IP
-                    // 取最左侧（原始）IP，用于地理围栏等基于真实来源的判定
-                    for (auto& [k, v] : req.headers) {
-                        std::string lk = k;
-                        for (auto& c : lk) c = (char)tolower((unsigned char)c);
-                        if (lk == "x-forwarded-for" || lk == "x-real-ip") {
-                            std::string ff = v;
-                            auto comma = ff.find(',');
-                            if (comma != std::string::npos) ff = ff.substr(0, comma);
-                            // trim
-                            size_t a = 0; while (a < ff.size() && isspace((unsigned char)ff[a])) a++;
-                            ff = ff.substr(a);
-                            if (!ff.empty()) { req.clientIp = ff; break; }
+                    keepAlive = wantsKeepAlive(req);
+                    // 直连对端 IP 按连接缓存（keep-alive 多请求只解析一次）
+                    {
+                        auto csIt = conns.find(fd);
+                        if (csIt == conns.end()) { keepOpen = false; break; }
+                        ConnState& _cs = csIt->second;
+                        if (!_cs.peerReady) {
+                            sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+                            if (getpeername(fd, (sockaddr*)&peer, &plen) == 0) {
+                                char ip[32] = {0};
+                                if (inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) _cs.peerIp = ip;
+                            }
+                            _cs.peerReady = true;
+                        }
+                        req.clientIp = _cs.peerIp;
+                    }
+                    const char* ipstr = req.clientIp.c_str();
+                    // 防绕过：仅当直连对端是可信反向代理(NOVA_TRUSTED_PROXIES)时，才采信
+                    // X-Forwarded-For/X-Real-IP 的最左原始 IP；否则忽略客户端伪造头，用真实对端 IP。
+                    if (isTrustedProxy(ipstr)) {
+                        for (auto& [k, v] : req.headers) {
+                            std::string lk = k;
+                            for (auto& c : lk) c = (char)tolower((unsigned char)c);
+                            if (lk == "x-forwarded-for" || lk == "x-real-ip") {
+                                std::string ff = v;
+                                auto comma = ff.find(',');
+                                if (comma != std::string::npos) ff = ff.substr(0, comma);
+                                size_t a = 0; while (a < ff.size() && isspace((unsigned char)ff[a])) a++;
+                                ff = ff.substr(a);
+                                if (!ff.empty()) { req.clientIp = ff; break; }
+                            }
                         }
                     }
 
@@ -377,6 +686,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     const App* app = apps ? app_reg::select(*apps, hostHdr) : nullptr;
                     std::string appId = app ? app->id : "";
                     int appMode = app ? app->mode : 0; // 0防护 1观察 2维护
+                    // API 路径级防护策略：仅记录(log)/放行(pass)，最长前缀匹配（控制台热配置）
+                    PathPolicy::Verdict pathVerdict = PathPolicy::instance().match(req.path);
+                    const bool policyPass = (pathVerdict == PathPolicy::Verdict::PASS); // 跳过WAF检测
+                    const bool policyLog  = (pathVerdict == PathPolicy::Verdict::LOG);  // 命中只记录不拦截
                     // 维护页（静态，仅构造一次）
                     static const std::string kMaint = []{
                         std::string b = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>系统维护中</title>"
@@ -396,7 +709,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     bool asyncHandled = false;  // 异步转发器接管后，reactor 跳过回写与关闭
                     // 转发到上游：异步优先，失败回退同步；返回 true 表示已由异步 IO 接管
                     auto forwardToApp = [&]() -> bool {
-                        static const std::string k502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        static const std::string k502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
                         if (app && g_upstream) {
                             UpstreamForwarder::Ctx ctx;
                             ctx.clientFd = fd; ctx.data = data;
@@ -406,15 +719,46 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             ctx.ua = hdrCi(req, "User-Agent"); ctx.host = hdrCi(req, "Host");
                             ctx.path = req.path; ctx.referer = hdrCi(req, "Referer");
                             ctx.country = geo.country(req.clientIp);
-                            if (g_upstream->submit(std::move(ctx))) {
-                                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                                return true;
-                            }
+                            ctx.keepAlive = keepAlive;
+                            // 异步转发完成(在 IO 线程)：keep-alive 则重新挂回 epoll 复用，否则关闭。
+                            // 注：ddos 并发计数由转发器的 onDisconnect 统一释放，此处不重复。
+                            ctx.onComplete = [epfd, &busyMtx, &busy, &conns, nowMs]
+                                             (int cfd, bool ka) {
+                                if (ka) {
+                                    { std::lock_guard<std::mutex> lk(busyMtx); busy.erase(cfd); }
+                                    auto it = conns.find(cfd);
+                                    if (it != conns.end()) it->second.lastActiveMs = nowMs();
+                                    epoll_event e2{}; e2.events = EPOLLIN | EPOLLET; e2.data.fd = cfd;
+                                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &e2) < 0 && errno == EEXIST)
+                                        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &e2);  // 兜底：已注册则改事件
+                                } else {
+                                    { std::lock_guard<std::mutex> lk(busyMtx); busy.erase(cfd); }
+                                    epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+                                    conns.erase(cfd);
+                                    ::close(cfd);
+                                }
+                            };
+                            // 修复 keepalive 挂死竞态：必须先置 busy 并从 epoll 摘除，再入队。
+                            // 否则 IO 线程可能在 reactor DEL 前就完成转发并执行 onComplete 的
+                            // EPOLL_CTL_ADD(返回 EEXIST 被忽略)，随后 reactor 又 DEL —— 净效果
+                            // fd 永久脱离 epoll、永不再 re-arm，4 个 IO 线程空转、连接挂死。
+                            { std::lock_guard<std::mutex> lk(busyMtx); busy.insert(fd); }
+                            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                            if (g_upstream->submit(std::move(ctx))) return true;
+                            // submit 失败(队列满/未运行)：回滚，恢复可读，回退同步转发
+                            { std::lock_guard<std::mutex> lk(busyMtx); busy.erase(fd); }
+                            epoll_event re{}; re.events = EPOLLIN | EPOLLET; re.data.fd = fd;
+                            epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &re);
                         }
-                        if (app && forwardToUpstream(app->upstreamHost, app->upstreamPort, data, outResp)) return false;
+                        if (app && forwardToUpstream(app->upstreamHost, app->upstreamPort, data, outResp)) {
+                            setRespConnection(outResp, keepAlive);
+                            return false;
+                        }
                         outResp = k502;
+                        setRespConnection(outResp, false);
                         return false;
                     };
+                    _mark();  // [1] 解析+sid+app 结束，进入限流判定
                     if (appMode == 2) {
                         // 维护模式：所有请求返回维护页，不检测、不转发
                         outResp = kMaint;
@@ -432,6 +776,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         FwBanPoster::instance()->enqueue(req.clientIp, "RateLimit", "rate");
                         tBlocked = true;
                     } else {
+                        _mark();  // [2] 限流通过，进入指纹/威胁情报
                         // 动态防护统计
                         shield.recordRequest();
                         shield.recordIp(req.clientIp);
@@ -453,7 +798,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             case IpListFilter::Verdict::WHITE: whitelisted = true; break;
                             case IpListFilter::Verdict::BLACK:
                                 outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 52\r\n\r\n"
+                                       "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
                                 emitEvt(req.clientIp, "IpList", "block", "IP-BLACK",
@@ -462,43 +807,44 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 break;
                             default: break;
                         }
-                        if (!whitelisted && ti) {
+                        if (!whitelisted && !policyPass && ti) {
                             auto tr = ti->match(req, ja4, httpFp);
                             if (tr && tr->isBlocked()) {
-                                std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
+                                if (g_debugLog) std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
                                             idx, tr->category.c_str(), ipstr, tr->matched.c_str());
                                 outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 52\r\n\r\n"
+                                       "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
                                 emitEvt(req.clientIp, tr->category, "block", tr->ruleId, tr->matched);
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
+                        _mark();  // [3] 指纹+IP名单+威胁情报 结束，进入 CC/Geo/Bot
                         // CC 攻击防护
-                        if (!whitelisted && !blocked) {
+                        if (!whitelisted && !policyPass && !blocked) {
                             // 地理位置拦截（GeoIP 地理围栏）
                             auto gr = geo.assess(req.clientIp);
                             if (gr && gr->isBlocked()) {
-                                std::printf("[reactor %d] BLOCK Geo from %s: %s\n",
+                                if (g_debugLog) std::printf("[reactor %d] BLOCK Geo from %s: %s\n",
                                             idx, ipstr, gr->matched.c_str());
                                 outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 52\r\n\r\n"
+                                       "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
                                 emitEvt(req.clientIp, "Geo", "block", gr->ruleId, gr->matched);
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
-                        if (!whitelisted && !blocked) {
+                        if (!whitelisted && !policyPass && !blocked) {
                             DetectionResult cr = cc.assess(req.clientIp, req.path);
                             if (cr.action != Action::PASS) {
-                                std::printf("[reactor %d] %s CC from %s: %s\n",
+                                if (g_debugLog) std::printf("[reactor %d] %s CC from %s: %s\n",
                                             idx, cr.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, cr.matched.c_str());
                                 outResp = (cr.action == Action::BLOCK)
                                        ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 52\r\n\r\n"
+                                         "Content-Length: 44\r\n\r\n"
                                          "<html><body>Blocked by NovaWAF</body></html>"
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
@@ -508,15 +854,15 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                         // Bot 行为防护
-                        if (!whitelisted && !blocked) {
+                        if (!whitelisted && !policyPass && !blocked) {
                             DetectionResult br = bot.assess(req, ja4);
                             if (br.action != Action::PASS) {
-                                std::printf("[reactor %d] %s Bot from %s: %s\n",
+                                if (g_debugLog) std::printf("[reactor %d] %s Bot from %s: %s\n",
                                             idx, br.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, br.matched.c_str());
                                 outResp = (br.action == Action::BLOCK)
                                        ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 52\r\n\r\n"
+                                         "Content-Length: 44\r\n\r\n"
                                          "<html><body>Blocked by NovaWAF</body></html>"
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
@@ -525,14 +871,15 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
+                        _mark();  // [4] Geo/CC/Bot 结束，进入规则+AI 检测流水线
                         // 规则 + AI 二阶复核
-                        if (!whitelisted && !blocked) {
+                        if (!whitelisted && !policyPass && !blocked) {
                             DetectionResult dr = detectWithAiReview(pipeline, ai, req);
                             if (dr.isBlocked()) {
-                                std::printf("[reactor %d] BLOCK %s from %s: %s\n",
+                                if (g_debugLog) std::printf("[reactor %d] BLOCK %s from %s: %s\n",
                                             idx, dr.category.c_str(), ipstr, dr.matched.c_str());
                                 outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 52\r\n\r\n"
+                                       "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
                                 emitEvt(req.clientIp, dr.category, "block", dr.ruleId, dr.matched);
@@ -541,20 +888,24 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 asyncHandled = forwardToApp();
                             }
                         }
-                        // 白名单：跳过全部检测，直接放行转发上游
-                        if (whitelisted) asyncHandled = forwardToApp();
+                        // 白名单 或 路径放行策略：跳过全部检测，直接转发上游
+                        if (whitelisted || policyPass) asyncHandled = forwardToApp();
                     }
-                    // 观察模式：命中攻击仅记录事件(tAttack 已置位)，不拦截、不封禁，仍转发上游
-                    if (appMode == 1 && tAttack && app) {
+                    _mark();  // [5] 检测/转发决策结束，进入后置处理
+                    // 观察模式 / 路径“仅记录”策略：命中攻击仅记录事件(tAttack 已置位)，不拦截、不封禁，仍转发上游
+                    if ((appMode == 1 || policyLog) && tAttack && app) {
                         tBlocked = false;
                         asyncHandled = forwardToApp();
                     }
                     if (asyncHandled) {
-                        // fd 已交由异步转发器回写并关闭，reactor 直接处理下一事件
-                        continue;
+                        // fd 已从 epoll 摘除并标记 busy，交给异步转发器回写；
+                        // 消费掉本请求字节，停止本连接的处理循环，等待完成回调 re-arm。
+                        { auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        keepOpen = false;
+                        break;
                     }
-                    // 确认攻击命中 → 投递防火墙联动封禁（观察模式只记录不封禁）
-                    if (tAttack && appMode != 1) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
+                    // 确认攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁）
+                    if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
                     if (newSess && !outResp.empty())
                         injectHeader(outResp, "Set-Cookie: novasid=" + sid + "; Path=/; HttpOnly");
                     // 流量统计埋点（仅已启用统计的应用；热路径入队不阻塞）
@@ -571,25 +922,66 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         tr.country = geo.country(req.clientIp);
                         TrafficSink::instance().emit(std::move(tr));
                     }
-                    ssize_t w = write(fd, outResp.data(), outResp.size());
-                    (void)w;
-                }
-            closefd:
-                {
-                    // 释放 DDoS 并发连接计数
-                    char ipstr[32] = {0};
-                    sockaddr_in peer{};
-                    socklen_t plen = sizeof(peer);
-                    if (getpeername(fd, (sockaddr*)&peer, &plen) == 0) {
-                        inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
-                        ddos.onDisconnect(ipstr);
+                    _mark();  // [6] 后置处理(封禁/事件/统计/注入Cookie)结束，进入回写
+                    // 归一化 Connection 头，保证客户端能据 keep-alive 正确定界与复用
+                    setRespConnection(outResp, keepAlive);
+                    {
+                        // 非阻塞回写：尽量一次发完；内核发送缓冲不足则把剩余响应排入 outQ、
+                        // 由 EPOLLOUT 异步排空，reactor 立即转去处理其它连接，
+                        // 消除"单个慢客户端的 send 阻塞拖垮整个 reactor"的串行点。
+                        const char* p = outResp.data(); size_t left = outResp.size();
+                        bool writeFail = false;
+                        while (left > 0) {
+                            ssize_t w = send(fd, p, left, MSG_NOSIGNAL | MSG_DONTWAIT);
+                            if (w > 0) { p += w; left -= (size_t)w; }
+                            else if (w < 0 && errno == EINTR) { continue; }
+                            else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { break; }
+                            else { writeFail = true; break; }
+                        }
+                        // 消费本请求字节（响应是否排队都不再需要它）
+                        { auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        if (writeFail) { keepOpen = false; break; }
+                        if (left > 0) {
+                            auto ci = conns.find(fd);
+                            if (ci == conns.end()) { keepOpen = false; break; }
+                            ci->second.outQ.assign(p, left);
+                            ci->second.outPos = 0;
+                            ci->second.closeAfterFlush = !keepAlive;
+                            epoll_event ev{}; ev.events = EPOLLIN | EPOLLOUT | EPOLLET; ev.data.fd = fd;
+                            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+                            draining = true; keepOpen = false; break;  // 交 EPOLLOUT 排空，本连接暂停
+                        }
+                        if (!keepAlive) { keepOpen = false; break; }
+                        if (auto ci = conns.find(fd); ci != conns.end()) ci->second.lastActiveMs = nowMs();
+                        _mark();  // [7] 回写结束（响应已全部进入内核缓冲或已排队异步排空）
+                        _flush(SEQ);
                     }
-                }
-                epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                close(fd);
+                }  // end per-request detection scope
+              }    // end keep-alive request loop
+              // 响应进入 outQ 时 fd 保持打开由 EPOLLOUT 排空；其余情况按 keep-alive/错误关闭
+              if (!keepOpen && !draining) closeConn(fd);
+            }      // end client-fd scope
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[reactor %d] fd=%d exception: %s -> drop conn\n", idx, fd, e.what());
+                closeConn(fd);
+            } catch (...) {
+                std::fprintf(stderr, "[reactor %d] fd=%d unknown exception -> drop conn\n", idx, fd);
+                closeConn(fd);
             }
+        }          // end epoll events for
+        // 周期空闲连接回收（即使无事件触发也能关闭超时 keep-alive 连接）
+        {
+            int64_t now = nowMs();
+            std::vector<int> stale;
+            {
+                std::lock_guard<std::mutex> lk(busyMtx);
+                for (auto& [cfd, st] : conns)
+                    if (!busy.count(cfd) && now - st.lastActiveMs > kKeepAliveIdleMs) stale.push_back(cfd);
+            }  // 先释放锁，再逐个关闭（closeConn 自身会加锁）
+            for (int cfd : stale) closeConn(cfd);
         }
-    }
+    }              // end while(g_running)
+    close(tfd);
     close(epfd);
 }
 
@@ -598,12 +990,26 @@ int main(int argc, char** argv) {
     int threads = (argc > 2) ? atoi(argv[2]) : (int)std::thread::hardware_concurrency();
     signal(SIGPIPE, SIG_IGN);
 
+    // 提升文件描述符软限到硬限，避免高并发连接（默认软限常为 1024）导致 accept EMFILE、
+    // 资源分配抛异常而中断服务；提升失败不致命（沿用系统限制）。
+    {
+        struct rlimit rl{};
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rlim_t target = rl.rlim_max;
+            if (target > 1048576) target = 1048576;  // 封顶，避免超大表的无谓内存
+            struct rlimit nr = rl; nr.rlim_cur = target;
+            if (setrlimit(RLIMIT_NOFILE, &nr) != 0) { nr.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &nr); }
+        }
+    }
+
     // 态势统计事件汇聚（异步写 Redis，可视化大屏数据源）
     EventSink::instance().start();
     TrafficSink::instance().start();
 
     DetectionPipeline pipeline;
-    RateLimiter limiter(100, 1000);  // 每 IP 突发 100，每秒补 1000
+    int rlBurst = getenv("NOVA_RL_BURST") ? atoi(getenv("NOVA_RL_BURST")) : 100;   // 每 IP 突发
+    int rlRate  = getenv("NOVA_RL_RATE")  ? atoi(getenv("NOVA_RL_RATE"))  : 1000;  // 每秒补充
+    RateLimiter limiter(rlBurst, rlRate);
 
     // ---- 威胁情报 IOC：优先从 Redis 加载（免磁盘 IO），失败回退文件，支持热更新 ----
     auto threatIntel = std::make_shared<ThreatIntel>(TiSeverity::HIGH);
@@ -751,11 +1157,39 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
-    // DDoS / 网络攻击防护配置
+    // ---- API 路径级防护策略：从 Redis novawaf:pathpolicy 热加载（联动控制台，保存即发布）----
+    auto loadPathPolicy = [](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        static std::string s_ver = "-";
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        auto ver = r.get("novawaf:pathpolicy:version");
+        std::string cur = ver.value_or("");
+        if (cur == s_ver && !initial) return;
+        auto blob = r.get("novawaf:pathpolicy");
+        s_ver = cur;
+        size_t n = PathPolicy::instance().reload(blob.value_or(""));
+        std::printf("  PathPolicy: %s rules=%zu (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", n, cur.c_str());
+    };
+    loadPathPolicy(true);
+    std::thread([loadPathPolicy]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!g_running) break;
+            loadPathPolicy(false);
+        }
+    }).detach();
+
+    // DDoS / 网络攻击防护配置（可通过环境变量覆盖，便于压测；默认仍为生产安全值）
     DdosGuard::Config ddosCfg;
-    ddosCfg.maxConcurrentPerIp = 200;   // 单 IP 并发连接上限
-    ddosCfg.newConnPerSec       = 200;  // 单 IP 新建连接速率
-    ddosCfg.reqPerSec           = 1000; // 单 IP 请求速率
+    ddosCfg.maxConcurrentPerIp = getenv("NOVA_DDOS_MAXCONN") ? atoi(getenv("NOVA_DDOS_MAXCONN")) : 200;   // 单 IP 并发连接上限
+    ddosCfg.newConnPerSec       = getenv("NOVA_DDOS_NEWCONN") ? atoi(getenv("NOVA_DDOS_NEWCONN")) : 200;  // 单 IP 新建连接速率
+    ddosCfg.reqPerSec           = getenv("NOVA_DDOS_RPS")     ? atoi(getenv("NOVA_DDOS_RPS"))     : 1000; // 单 IP 请求速率
     ddosCfg.slowTimeoutMs       = 5000; // 慢速攻击判定超时
     ddosCfg.banThreshold        = 5;    // 违规 5 次触发封禁
     ddosCfg.banSeconds          = 300;  // 封禁 5 分钟，到期自动解封
@@ -763,9 +1197,11 @@ int main(int argc, char** argv) {
 
     // ---- 应用层防护：CC / Bot / 动态自适应 / 指纹威胁情报 ----
     CcGuard::Config ccCfg;
-    ccCfg.maxReqPerWindow  = 300;   // 单 IP 10s 内 300 次（正常浏览远低于此）
-    ccCfg.burstPerUrl      = 80;    // 单 IP 刷同 URL 上限
-    ccCfg.hotUrlGlobal     = 800;   // 全局热点 URL 阈值
+    ccCfg.maxReqPerWindow  = getenv("NOVA_CC_WINDOW") ? atoi(getenv("NOVA_CC_WINDOW")) : 300;   // 单 IP 10s 内（正常浏览远低于此）
+    // 单 URL 突刺/全局热点阈值同样可由环境变量覆盖，便于压测时区分“引擎裸吞吐基线”
+    // 与“CC 防护下性能”；不设置时保持生产安全默认 80/800。
+    ccCfg.burstPerUrl      = getenv("NOVA_CC_BURST_URL") ? atoi(getenv("NOVA_CC_BURST_URL")) : 80;    // 单 IP 刷同 URL 上限
+    ccCfg.hotUrlGlobal     = getenv("NOVA_CC_HOT_URL")   ? atoi(getenv("NOVA_CC_HOT_URL"))   : 800;   // 全局热点 URL 阈值
     CcGuard cc(ccCfg);
     BotGuard bot(BotGuard::Config{});
     DynamicShield shield(DynamicShield::Config{});
@@ -774,16 +1210,35 @@ int main(int argc, char** argv) {
     GeoFilter geo;
     const char* geoFile = getenv("NOVA_GEO_FILE");
     std::string geoPath = geoFile ? geoFile : "rules/geoip.txt";
+    std::string geoCksum;      // GeoIP 数据 cksum（初始加载与热加载共享，供 loadDataLines 判等）
+    bool geoFromRedis = false;
     {
-        std::string geoCksum;
-        bool fromRedis = false;
-        auto glines = loadDataLines("novawaf:geoip", "geoip_cksum", geoPath, geoCksum, fromRedis);
-        if (!glines.empty() || fromRedis) {
+        auto glines = loadDataLines("novawaf:geoip", "geoip_cksum", geoPath, geoCksum, geoFromRedis);
+        if (!glines.empty() || geoFromRedis) {
             size_t gn = geo.loadFromLines(glines);
             std::printf("  GeoIP: loaded %zu CIDR ranges from %s\n", gn,
-                        fromRedis ? "redis" : geoPath.c_str());
+                        geoFromRedis ? "redis" : geoPath.c_str());
         }
     }
+    // ---- GeoIP 数据热加载：novawaf:geoip cksum 变化时重建（配合 GeoIP 每周五定时更新，无需重启）----
+    auto loadGeoData = [&geo, &geoPath](std::string& ck) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        bool fromRedis = false;
+        auto glines = loadDataLines("novawaf:geoip", "geoip_cksum", geoPath, ck, fromRedis);
+        // 仅接受 Redis 来源（避免 Redis 短暂不可用时被本地旧文件覆盖）；内容未变时 loadDataLines 返回空
+        if (!glines.empty() && fromRedis) {
+            size_t gn = geo.loadFromLines(glines);
+            std::printf("  GeoIP: hot-reloaded %zu CIDR ranges\n", gn);
+        }
+    };
+    std::thread([loadGeoData, &geoCksum]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            if (!g_running) break;
+            loadGeoData(geoCksum);
+        }
+    }).detach();
     // 配置：NOVA_GEO_BLOCK=CN,RU  黑名单；NOVA_GEO_ALLOW=CN  白名单（仅放行）
     if (const char* e = getenv("NOVA_GEO_BLOCK")) {
         geo.setBlockedCountries(splitCsvStr(e));
@@ -795,6 +1250,59 @@ int main(int argc, char** argv) {
         geo.setEnabled(true);
         std::printf("  GeoIP: WHITELIST mode, allowed countries = %s\n", e);
     }
+    // ---- Geo 地域策略：从 Redis novawaf:geo:policy 热加载（管理后台保存即生效）----
+    // JSON: {"enabled":bool,"mode":"whitelist"|"blacklist","countries":["CN",...]}
+    // 版本键 novawaf:geo:policy:version 变化才重载；键缺失时保持上方环境变量配置（向后兼容）。
+    auto loadGeoPolicy = [&geo](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        static std::string s_ver = "-";
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        auto ver = r.get("novawaf:geo:policy:version");
+        std::string cur = ver.value_or("");
+        if (cur == s_ver && !initial) return;
+        auto blob = r.get("novawaf:geo:policy");
+        s_ver = cur;
+        if (!blob || blob->empty()) {
+            std::printf("  GeoPolicy: %s (no redis policy, env config kept)\n",
+                        initial ? "loaded" : "hot-reload checked");
+            return;
+        }
+        JsonValue root;
+        try { root = parseJson(*blob); } catch (...) { return; }
+        if (!root.isObject()) return;
+        bool enabled = false;
+        if (root.at("enabled").isBool()) enabled = root.at("enabled").b;
+        std::string mode = root.at("mode").isString() ? root.at("mode").str : "blacklist";
+        std::vector<std::string> ccs;
+        const JsonValue& cs = root.at("countries");
+        if (cs.isArray())
+            for (auto& c : cs.arr)
+                if (c.isString() && !c.str.empty()) ccs.push_back(c.str);
+        if (mode == "whitelist") {
+            geo.setMode(GeoMode::WHITELIST);
+            geo.setAllowedCountries(ccs);
+        } else {
+            geo.setMode(GeoMode::BLACKLIST);
+            geo.setBlockedCountries(ccs);
+        }
+        geo.setEnabled(enabled);
+        std::printf("  GeoPolicy: %s enabled=%d mode=%s countries=%zu (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", enabled ? 1 : 0, mode.c_str(),
+                    ccs.size(), cur.c_str());
+    };
+    loadGeoPolicy(true);
+    std::thread([loadGeoPolicy]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!g_running) break;
+            loadGeoPolicy(false);
+        }
+    }).detach();
     // 观察者：态势升级 → 收紧 CC 阈值
     shield.observe([&](ThreatLevel lvl) {
         cc.applyThreatLevel((int)lvl);
@@ -844,9 +1352,46 @@ int main(int argc, char** argv) {
     if (llmCfg.enabled)
         std::printf("  AI cache: ttl=%ds max=%d async threads=%d (non-blocking)\n",
                     cacheTtl, cacheMax, aiThreads);
+    // listen backlog 可配置(NOVA_BACKLOG)，默认 16384，承载高并发突发建连
+    int backlog = getenv("NOVA_BACKLOG") ? std::atoi(getenv("NOVA_BACKLOG")) : 16384;
+    std::printf("  listen backlog=%d\n", backlog);
+    // per-reactor 负载观测（NOVA_REACTOR_STATS=1）：每 2s 打印 各 reactor req/s 与 忙碌占比
+    if (g_reactorStats) {
+        std::thread([threads] {
+            uint64_t prevReq[64] = {0}, prevBusy[64] = {0};
+            while (g_running) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                std::string line = "[rstat] ";
+                uint64_t sumRps = 0; double sumBusy = 0;
+                for (int i = 0; i < threads; ++i) {
+                    uint64_t r = g_rReq[i].load();
+                    uint64_t b = g_rBusyNs[i].load();
+                    uint64_t rps = (r - prevReq[i]) / 2;
+                    double busyPct = (b - prevBusy[i]) * 100.0 / 2.0e9;
+                    prevReq[i] = r; prevBusy[i] = b;
+                    sumRps += rps; sumBusy += busyPct;
+                    line += "R" + std::to_string(i) + ":" + std::to_string(rps) + "rps/" +
+                            std::to_string((long long)busyPct) + "% ";
+                }
+                std::printf("%s | TOTAL %llurps busy=%.0f%%(of %d00)\n", line.c_str(),
+                            (unsigned long long)sumRps, sumBusy, threads);
+                static const char* sn[S__N]={"parse","guard","fp_ti","geo_cc_bot","pipeline","post","write"};
+                static uint64_t pn[S__N]={0}, pc[S__N]={0};
+                std::string sl="[stage-us] ";
+                for(int s=0;s<S__N;++s){
+                    uint64_t n=g_stNs[s].load(), c=g_stCnt[s].load();
+                    uint64_t dn=n-pn[s], dc=c-pc[s]; pn[s]=n; pc[s]=c;
+                    long us=dc?(long)(dn/1000.0/dc):0;
+                    sl+=std::string(sn[s])+":"+std::to_string(us)+" ";
+                }
+                std::printf("%s\n", sl.c_str());
+                std::fflush(stdout);
+            }
+        }).detach();
+    }
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
-        int lfd = createListenFd(port, 4096);
+        int lfd = createListenFd(port, backlog);
         if (lfd < 0) { std::perror("listen"); return 1; }
         reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
                               std::ref(limiter), std::ref(ddos), ai,

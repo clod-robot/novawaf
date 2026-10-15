@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -61,9 +62,11 @@ public:
         int rc = ::connect(fd_, (sockaddr*)&addr, sizeof(addr));
         if (rc < 0 && errno != EINPROGRESS) { disconnect(); return false; }
         if (rc < 0) {
-            fd_set wfds; FD_ZERO(&wfds); FD_SET(fd_, &wfds);
-            timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
-            if (::select(fd_ + 1, nullptr, &wfds, nullptr, &tv) <= 0) { disconnect(); return false; }
+            // poll 无 FD_SETSIZE 限制，支持 fd>=1024（select 在高 fd 会直接 abort）
+            struct pollfd pfd{};
+            pfd.fd = fd_;
+            pfd.events = POLLOUT;
+            if (::poll(&pfd, 1, timeoutMs) <= 0) { disconnect(); return false; }
             int err = 0; socklen_t el = sizeof(err);
             ::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &el);
             if (err != 0) { disconnect(); return false; }
@@ -212,9 +215,14 @@ private:
     }
 
     bool waitReadable() {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(fd_, &rfds);
-        timeval tv{ timeoutMs_ / 1000, (timeoutMs_ % 1000) * 1000 };
-        return ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv) > 0;
+        // 使用 poll：select 的 fd_set 上限 1024，后台重连时 fd 可能更高导致进程 abort
+        struct pollfd pfd{};
+        pfd.fd = fd_;
+        pfd.events = POLLIN;
+        int pr = ::poll(&pfd, 1, timeoutMs_);
+        if (pr <= 0) return false;
+        // 出错/挂断也返回，交由随后的 recv 得到 0/-1 走失败分支
+        return (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
     }
 
     std::optional<Reply> readReply() {

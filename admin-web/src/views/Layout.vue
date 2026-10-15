@@ -3,9 +3,25 @@
     <el-aside width="220px" class="aside mecha-panel">
       <div class="logo"><span class="glow-cyan">◈ NOVA</span>WAF</div>
       <el-menu :default-active="$route.path" router background-color="transparent" text-color="#9fc4e8" active-text-color="#00e5ff">
-        <el-menu-item v-for="m in menus" :key="m.path" :index="m.path">
-          <el-icon><component :is="m.icon" /></el-icon><span>{{ m.title }}</span>
-        </el-menu-item>
+        <template v-for="m in menus" :key="m.path || m.title">
+          <el-menu-item v-if="!m.children" :index="m.path">
+            <el-icon><component :is="m.icon" /></el-icon><span>{{ m.title }}</span>
+          </el-menu-item>
+          <el-sub-menu v-else :index="m.title">
+            <template #title><el-icon><component :is="m.icon" /></el-icon><span>{{ m.title }}</span></template>
+            <template v-for="s in m.children" :key="s.path || s.title">
+              <el-menu-item v-if="!s.children" :index="s.path">
+                <el-icon><component :is="s.icon" /></el-icon><span>{{ s.title }}</span>
+              </el-menu-item>
+              <el-sub-menu v-else :index="m.title + '/' + s.title">
+                <template #title><el-icon><component :is="s.icon" /></el-icon><span>{{ s.title }}</span></template>
+                <el-menu-item v-for="t in s.children" :key="t.path" :index="t.path">
+                  <el-icon><component :is="t.icon" /></el-icon><span>{{ t.title }}</span>
+                </el-menu-item>
+              </el-sub-menu>
+            </template>
+          </el-sub-menu>
+        </template>
       </el-menu>
     </el-aside>
     <el-container>
@@ -41,10 +57,29 @@ const all = [
   { path: '/waf/log', title: '日志管理', perm: 'waf:log:list', icon: 'Document' },
   { path: '/waf/rule', title: '规则管理', perm: 'waf:rule:list', icon: 'Setting' },
   { path: '/waf/ioc', title: '威胁情报', perm: 'waf:ioc:list', icon: 'Warning' },
+  { path: '/waf/iplist', title: '黑白名单', perm: 'waf:iplist:list', icon: 'Lock' },
+  { title: '通用设置', icon: 'Tools', children: [
+    { path: '/common/deploy', title: '部署方式', perm: 'system:deploy:view', icon: 'Monitor' },
+    { path: '/common/ipgroup', title: 'IP 组', perm: 'waf:ipgroup:list', icon: 'Location' },
+    { title: '防护策略', icon: 'Lock', children: [
+      { path: '/common/protect/api-policy', title: 'API防护策略', perm: 'waf:apipolicy:list', icon: 'Connection' }
+    ] }
+  ] },
   { path: '/system/user', title: '用户管理', perm: 'sys:user:list', icon: 'User' },
   { path: '/system/log', title: '审计日志', perm: 'sys:log:list', icon: 'Tickets' }
 ]
-const menus = computed(() => all.filter(m => has(m.perm)))
+// 目录节点按子项可见性过滤：无权限时整组隐藏
+function filterTree(items) {
+  const out = []
+  for (const it of items) {
+    if (it.children) {
+      const kids = filterTree(it.children)
+      if (kids.length) out.push({ ...it, children: kids })
+    } else if (has(it.perm)) out.push(it)
+  }
+  return out
+}
+const menus = computed(() => filterTree(all))
 async function onCmd(c) {
   if (c === 'logout') { await api.logout().catch(()=>{}); localStorage.clear(); router.replace('/login') }
 }

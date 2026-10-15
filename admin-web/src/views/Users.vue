@@ -14,7 +14,7 @@
       </el-table-column>
     </el-table>
     <el-pagination class="pg" background layout="total,prev,pager,next" :total="total" :page-size="size" :current-page="page" @current-change="(p)=>{page=p;load()}" />
-    <el-dialog v-model="dlg" title="新增用户" width="420">
+    <el-dialog v-model="dlg" title="新增用户" width="420" append-to-body>
       <el-form :model="f" label-width="80">
         <el-form-item label="账号"><el-input v-model="f.username" /></el-form-item>
         <el-form-item label="密码"><el-input v-model="f.password" show-password /></el-form-item>

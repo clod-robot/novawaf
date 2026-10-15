@@ -27,6 +27,13 @@ public:
         list->push_back(std::make_unique<XxeDetector>());
         list->push_back(std::make_unique<SsrfDetector>());
         list->push_back(std::make_unique<CrlfDetector>());
+        // 反序列化/代码注入/上传/CSRF（专项，置于通用泄露与扫描器之前）
+        list->push_back(std::make_unique<FileUploadDetector>());
+        list->push_back(std::make_unique<JavaCodeInjectionDetector>());
+        list->push_back(std::make_unique<JavaDeserializationDetector>());
+        list->push_back(std::make_unique<PhpDeserializationDetector>());
+        list->push_back(std::make_unique<AspCodeInjectionDetector>());
+        list->push_back(std::make_unique<CsrfDetector>());
         list->push_back(std::make_unique<InfoLeakDetector>());
         list->push_back(std::make_unique<ScannerDetector>());
         detectors_.store(list, std::memory_order_release);
