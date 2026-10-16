@@ -12,7 +12,7 @@
 ```
 
 - **检测引擎（C++20）**：多 Reactor（epoll + SO_REUSEPORT）、无锁 MPMC 队列、线程池、零拷贝 Buffer、Aho-Corasick 多模式匹配、递归解码器、责任链检测流水线、令牌桶限流。纯逻辑核心平台无关。
-- **硬件加速层（CPU SIMD + GPU/NPU）**：AVX2/AVX-512 Teddy 向量预筛（Intel/AMD CPU），OpenCL（Intel 核显/AMD/NVIDIA 通用）、CUDA（NVIDIA）、HIP/ROCm（AMD 与海光 DCU）、CANN（华为昇腾）多后端运行时探测、热开关与失败自动熔断降级；无 GPU 服务器零依赖、自动回退标量内核。详见[硬件加速设计文档](docs/design/2026-10-16-gpu-acceleration-design.md)。
+- **硬件加速层（CPU SIMD + GPU/NPU）**：AVX2/AVX-512 Teddy 向量预筛（Intel/AMD CPU），OpenCL（Intel 核显/AMD/NVIDIA 通用）、CUDA（NVIDIA）、HIP/ROCm（AMD 与海光 DCU）、CANN（华为昇腾）多后端运行时探测、热开关与失败自动熔断降级；无 GPU 服务器零依赖、自动回退标量内核（**总开关默认关闭**，管理台热开启）。详见[硬件加速设计文档](docs/design/2026-10-16-gpu-acceleration-design.md)与[实测/验收报告](docs/2026-10-16-hardware-acceleration-report.md)。
 - **异步反向代理**：上游连接池 + keep-alive 复用，支持普通响应、chunked 解码、以及 SSE/WebSocket 流式双向中继（边收边发，不缓冲断流）。
 - **前置过滤（XDP/eBPF）**：网卡驱动层丢弃黑名单 IP / 畸形包，线速处理。
 - **网关（Nginx）**：TLS 终结与反向代理，业务流量送检引擎。
@@ -128,6 +128,10 @@ cd deploy && docker compose up -d
 
 ## 性能
 实测经 WAF 转发较直连仅增加 **~2-3ms** 开销（chunked/普通/SSE 响应）。
+
+硬件加速（i5-6200U / AVX2，2026-10-16 实测，[详见报告](docs/2026-10-16-hardware-acceleration-report.md)）：
+- 模式匹配微基准：AVX2 Teddy 单核 **7.56×**、4 核聚合 **8.71×**（0.217→1.639 GB/s）；
+- 短报文代理端到端四组矩阵（约 162 万请求、约 113 万攻击）：开/关加速 RPS 差异 **−0.8%/−0.9%（不劣化）**、P99 持平、**攻击零漏报**；该负载下瓶颈在网络/转发而非匹配（Amdahl），加速收益主要体现在大报文/高规则数/IOC 重建场景。
 
 ## 安全合规
 - 管理面全接口认证 + RBAC + BCrypt + JWT
