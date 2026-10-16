@@ -1,0 +1,25 @@
+[Unit]
+Description=NovaWAF Admin Server (management API on :18081)
+After=network-online.target mysql.service mariadb.service redis.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+# 日志目录需预先存在：mkdir -p /home/mao/novawaf/logs
+User=mao
+Group=mao
+WorkingDirectory=/home/mao/novawaf/admin-server
+EnvironmentFile=/etc/novawaf/novawaf.env
+ExecStart=/usr/local/jdk/bin/java -jar target/novawaf-admin.jar --server.port=18081
+Restart=always
+RestartSec=3
+MemoryMax=1536M
+MemoryHigh=1280M
+LimitNOFILE=65536
+StandardOutput=append:/home/mao/novawaf/logs/admin.log
+StandardError=append:/home/mao/novawaf/logs/admin.log
+
+[Install]
+WantedBy=multi-user.target

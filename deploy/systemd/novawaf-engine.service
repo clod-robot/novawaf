@@ -7,6 +7,8 @@ Type=simple
 User=root
 # 可信反向代理(网关)IP/CIDR，逗号分隔；仅命中才采信 X-Forwarded-For/X-Real-IP。网关与引擎同机填 127.0.0.1
 Environment=NOVA_TRUSTED_PROXIES=127.0.0.1
+# 密钥（NOVA_REDIS_PASS 等）统一由环境文件注入（权限600，勿入库）
+EnvironmentFile=-/etc/novawaf/novawaf.env
 ExecStart=/opt/novawaf/novawaf-engine 8080
 Restart=always
 RestartSec=3
