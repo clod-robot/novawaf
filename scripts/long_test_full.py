@@ -343,36 +343,31 @@ def l4_remote():
             src_content = f.read()
     except FileNotFoundError:
         return True, ["l4_skipped:l4_stress.py missing on 100.2"]
+    remote_target = REMOTE_TARGET or WAF_HOST
     try:
         c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         c.connect(REMOTE_HOST, username=REMOTE_USER, password=REMOTE_PASS, timeout=8,
-                  allow_agent=False, look_for_keys=False, banner_timeout=5, auth_timeout=5)
-        sftp = c.open_sftp()
-        with sftp.file("/tmp/l4_stress.py", "w") as f: f.write(src_content)
-        sftp.close()
-        remote_target = REMOTE_TARGET or WAF_HOST
-        # 用 nohup + 写结果文件，避免 paramiko channel read 超时
-        c.exec_command(f"nohup python3 /tmp/l4_stress.py {remote_target} {ADMIN} {PASSWORD} >/dev/null 2>/dev/null &",
-                       timeout=5)
+                  allow_agent=False, look_for_keys=False, banner_timeout=10, auth_timeout=10)
+        # 负载机磁盘可能已满：脚本经 SSH stdin 内存执行，不在远端落盘
+        # python3 - <target> <admin> <password> <port>
+        cmd = f"python3 - {remote_target} {ADMIN} {PASSWORD} {WAF_PORT}"
+        stdin, stdout, stderr = c.exec_command(cmd, timeout=200)
+        stdin.write(src_content); stdin.flush(); stdin.channel.shutdown_write()
+        out = stdout.read().decode("utf-8", "replace")
+        err = stderr.read().decode("utf-8", "replace")
         c.close()
-        # 等脚本跑完（3 接口 × 15s ≈ 50s，留余量）
-        time.sleep(65)
-        # SFTP 拉结果文件回来
-        try:
-            c2 = paramiko.SSHClient(); c2.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            c2.connect(REMOTE_HOST, username=REMOTE_USER, password=REMOTE_PASS, timeout=8,
-                       allow_agent=False, look_for_keys=False, banner_timeout=5, auth_timeout=5)
-            sf2 = c2.open_sftp()
-            with sf2.file("/tmp/l4_result.json", "r") as f:
-                data = json.loads(f.read().decode())
-            sf2.close(); c2.close()
-            return True, [f"l4:{k}:{json.dumps(v)}" for k, v in data.items()]
-        except FileNotFoundError:
-            return False, ["l4_fail:result file not found (script may have crashed)"]
-        except Exception as ex2:
-            return False, [f"l4_fetch_fail:{ex2}"]
+        # l4_stress.py 会把结果 JSON 打到 stdout 末行
+        line = ""
+        for ln in out.strip().splitlines():
+            ln = ln.strip()
+            if ln.startswith("{"):
+                line = ln
+        if not line:
+            return False, [f"l4_fail:no_json out={out[-200:]!r} err={err[-200:]!r}"]
+        data = json.loads(line)
+        return True, [f"l4:{k}:{json.dumps(v, ensure_ascii=False)}" for k, v in data.items()]
     except Exception as ex:
-        return False, [f"l4_ssh_fail:{ex}"]
+        return False, [f"l4_ssh_fail:{type(ex).__name__}:{ex}"]
 
 # ============ 主入口 ============
 

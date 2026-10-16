@@ -1,6 +1,7 @@
-"""L4 远程压测脚本（在负载机 192.168.100.4 上执行，通过 long_test_full.py paramiko 推上去）。
-用法: python3 l4_stress.py <target_ip:port 或 host> <admin> <password>
-输出: /tmp/l4_result.json（避免 paramiko channel 读超时问题）
+"""L4 远程压测脚本（在负载机 192.168.100.4 上执行）。
+由 long_test_full.py 经 SSH stdin 内存投递（python3 - <target> <admin> <password> <port>），
+不落盘——负载机磁盘可能已满。结果 JSON 打到 stdout 末行由调用方解析；
+若磁盘可写，另存 /tmp/l4_result.json（仅为兜底）。
 """
 import json, sys, time, urllib.request, threading, queue, os
 
