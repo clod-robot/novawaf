@@ -12,6 +12,7 @@
 ```
 
 - **检测引擎（C++20）**：多 Reactor（epoll + SO_REUSEPORT）、无锁 MPMC 队列、线程池、零拷贝 Buffer、Aho-Corasick 多模式匹配、递归解码器、责任链检测流水线、令牌桶限流。纯逻辑核心平台无关。
+- **硬件加速层（CPU SIMD + GPU/NPU）**：AVX2/AVX-512 Teddy 向量预筛（Intel/AMD CPU），OpenCL（Intel 核显/AMD/NVIDIA 通用）、CUDA（NVIDIA）、HIP/ROCm（AMD 与海光 DCU）、CANN（华为昇腾）多后端运行时探测、热开关与失败自动熔断降级；无 GPU 服务器零依赖、自动回退标量内核。详见[硬件加速设计文档](docs/design/2026-10-16-gpu-acceleration-design.md)。
 - **异步反向代理**：上游连接池 + keep-alive 复用，支持普通响应、chunked 解码、以及 SSE/WebSocket 流式双向中继（边收边发，不缓冲断流）。
 - **前置过滤（XDP/eBPF）**：网卡驱动层丢弃黑名单 IP / 畸形包，线速处理。
 - **网关（Nginx）**：TLS 终结与反向代理，业务流量送检引擎。
@@ -28,6 +29,7 @@
 | 洪水 | DDoS/速率/并发限流、连接级防护、自动封禁联动 |
 | 内容/文件 | YARA 规则扫描、OLE/Office 宏检测、勒索软件熵检测、ClamAV 流式杀毒 |
 | 情报 | 威胁情报 IOC 匹配、外部情报富集 |
+| 硬件加速 | AVX2/AVX-512 Teddy 预筛、OpenCL/CUDA/HIP/昇腾CANN 批量匹配、运行时探测+热开关+熔断降级、管理台设备识别 |
 
 ### 代理与可用性
 - 反向代理 + 上游连接池 / keep-alive 复用
