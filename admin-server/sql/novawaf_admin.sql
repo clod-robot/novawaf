@@ -177,13 +177,15 @@ INSERT INTO sys_menu (id, parent_id, menu_name, perms, type, path, component, so
  (11,10,'防护策略', NULL,             1, '/common/protect',NULL,                   1),
  (12,11,'API防护策略','waf:apipolicy:list',2,'/common/protect/api-policy','common/ApiPolicy',1),
  (13,10,'部署方式','system:deploy:view',2,'/common/deploy','common/Deploy',2),
- (14,10,'IP 组','waf:ipgroup:list',2,'/common/ipgroup','common/IpGroup',3)
+ (14,10,'IP 组','waf:ipgroup:list',2,'/common/ipgroup','common/IpGroup',3),
+ (15,10,'硬件加速','system:accel:list',2,'/common/accel','common/Accel',4),
+ (16,15,'加速配置修改','system:accel:edit',3,NULL,NULL,1)
  ON DUPLICATE KEY UPDATE menu_name=VALUES(menu_name);
 
 -- admin 全部菜单; auditor 只读(1,3,5,9); operator 规则/ioc
--- 部署方式(13)/IP 组(14) 仅授予 admin：HA 编辑、地域拦截与名单变更均属高危运维操作
+-- 部署方式(13)/IP 组(14)/硬件加速(15,16) 仅授予 admin：HA 编辑、地域拦截与加速开关均属高危运维操作
 INSERT INTO sys_role_menu (role_id, menu_id) VALUES
- (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),(1,10),(1,11),(1,12),(1,13),(1,14),
+ (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),(1,10),(1,11),(1,12),(1,13),(1,14),(1,15),(1,16),
  (2,1),(2,3),(2,5),(2,9),
  (3,1),(3,4),(3,5)
  ON DUPLICATE KEY UPDATE menu_id=VALUES(menu_id);

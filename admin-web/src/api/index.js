@@ -102,6 +102,10 @@ export const api = {
   updUser: (id, d) => http.put('/system/users/' + id, d),
   delUser: (id) => http.delete('/system/users/' + id),
   resetPwd: (id, password) => http.post('/system/users/' + id + '/password', { password }),
-  operLogs: (p) => http.get('/system/logs', { params: p })
+  operLogs: (p) => http.get('/system/logs', { params: p }),
+  // 通用设置-硬件加速：CPU SIMD/GPU/NPU 设备与后端状态查询、配置下发、自检
+  accelGet: () => http.get('/system/accel'),
+  accelSave: (d) => http.put('/system/accel', d),
+  accelSelftest: () => http.post('/system/accel/selftest')
 }
 export default http

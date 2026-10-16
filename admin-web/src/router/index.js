@@ -16,6 +16,7 @@ const routes = [
       { path: 'common/protect/api-policy', component: () => import('../views/ApiPolicy.vue'), meta: { perm: 'waf:apipolicy:list', title: 'API防护策略' } },
       { path: 'common/deploy', component: () => import('../views/Deploy.vue'), meta: { perm: 'system:deploy:view', title: '部署方式' } },
       { path: 'common/ipgroup', component: () => import('../views/IpGroup.vue'), meta: { perm: 'waf:ipgroup:list', title: 'IP 组' } },
+      { path: 'common/accel', component: () => import('../views/Accel.vue'), meta: { perm: 'system:accel:list', title: '硬件加速' } },
       { path: 'system/user', component: () => import('../views/Users.vue'), meta: { perm: 'sys:user:list', title: '用户管理' } },
       { path: 'system/log', component: () => import('../views/AuditLog.vue'), meta: { perm: 'sys:log:list', title: '审计日志' } }
     ]

@@ -61,6 +61,7 @@ const all = [
   { title: '通用设置', icon: 'Tools', children: [
     { path: '/common/deploy', title: '部署方式', perm: 'system:deploy:view', icon: 'Monitor' },
     { path: '/common/ipgroup', title: 'IP 组', perm: 'waf:ipgroup:list', icon: 'Location' },
+    { path: '/common/accel', title: '硬件加速', perm: 'system:accel:list', icon: 'Cpu' },
     { title: '防护策略', icon: 'Lock', children: [
       { path: '/common/protect/api-policy', title: 'API防护策略', perm: 'waf:apipolicy:list', icon: 'Connection' }
     ] }

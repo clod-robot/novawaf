@@ -2,7 +2,10 @@
 // 用于关键词预筛：O(n) 扫描一次即可命中所有规则关键词，是检测流水线的第一道快速过滤。
 #pragma once
 
+#include "novawaf/accel/teddy.h"
+
 #include <cstdint>
+#include <memory>
 #include <queue>
 #include <string>
 #include <vector>
@@ -56,6 +59,10 @@ public:
             }
         }
         built_ = true;
+        // 同步构建 Teddy 锚点（硬件加速快路径）。不可用时 anchors_->usable=false，
+        // containsAny 自动回退下面的标量 AC，检测语义完全不变。
+        anchors_ = std::make_unique<accel::AnchorSet>();
+        anchors_->build(patterns_);
     }
 
     struct Hit {
@@ -81,6 +88,13 @@ public:
 
     bool containsAny(const std::string& text) const {
         if (!built_) return false;
+        // 硬件加速快路径：总开关开启且本自动机锚点可用时，走 Teddy（AVX2/SSSE3，运行时分发）。
+        // Teddy 仅做精确锚点预筛 + 整串确认，结果与 AC 完全等价（零漏报）；任一条件不满足回退 AC。
+        if (anchors_ && anchors_->usable && accel::teddyActive()) {
+            bool hit = accel::anchorContainsAny(std::string_view(text), *anchors_);
+            accel::countTeddy(hit);
+            return hit;
+        }
         int cur = 0;
         for (size_t i = 0; i < text.size(); ++i) {
             unsigned char c = static_cast<unsigned char>(text[i]);
@@ -94,6 +108,7 @@ public:
 
     size_t patternCount() const { return patterns_.size(); }
     const std::string& pattern(int id) const { return patterns_[id]; }
+    bool accelUsable() const { return anchors_ && anchors_->usable; }
 
 private:
     struct Node {
@@ -104,6 +119,7 @@ private:
 
     std::vector<Node> nodes_;
     std::vector<std::string> patterns_;
+    std::unique_ptr<accel::AnchorSet> anchors_;
     bool built_ = false;
 };
 

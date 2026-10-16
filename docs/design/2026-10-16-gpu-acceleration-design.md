@@ -1,7 +1,9 @@
 # NovaWAF 硬件加速层设计（CPU SIMD / OpenCL / CUDA / HIP / 昇腾 CANN）
 
 - 日期：2026-10-16
-- 状态：已评审，实施中
+- 状态：已上线（总开关默认关闭）。实测与验收结论见
+  [2026-10-16-hardware-acceleration-report.md](../2026-10-16-hardware-acceleration-report.md)；
+  §7.2 中“短报文 e2e ≥ +50%”的预测经本机实测修正为“匹配子系统 7.56×、短报文代理 e2e 中性不劣化”。
 - 适用模块：`engine/`（C++20 检测引擎）、`admin-server/`（Java 管理面）、`admin-web/`（Vue 管理台）
 
 ## 1. 背景与目标
@@ -257,6 +259,11 @@ nibble 表放 `__constant__`/constant memory，块内归约后跨块 `reduce_or`
 攻击拦截率（必须 100% 拦截测试 payload，零漏报）、错误率。
 验收：B/A 的 RPS 提升 ≥ 50%；D 组在 DDoS 洪水下吞吐与 P99 不劣于 C，
 攻击拦截率保持 100%。所有数据如实报告。
+
+> 实测结论（2026-10-16，i5-6200U / 100.4 发压）：B/A = −0.8%、D/C = −0.9%（短报文代理
+> 路径中性、不劣化，P99 持平），攻击零漏报；匹配微基准 AVX2 7.56×（4 核 8.71×）。
+> 即“≥50% 端到端”目标在本机短报文负载上**未达成**，根因为 Amdahl（瓶颈在网络/转发而非匹配），
+> 数据与分析见 [实测报告](../2026-10-16-hardware-acceleration-report.md)。
 
 ### 7.3 回归
 

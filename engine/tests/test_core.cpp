@@ -22,6 +22,8 @@
 #include "novawaf/ai/ai_detector.h"
 #include "novawaf/ai/ai_cache.h"
 #include "novawaf/core/thread_pool.h"
+#include "novawaf/accel/teddy.h"
+#include "novawaf/accel/accel_runtime.h"
 
 #include <atomic>
 #include <chrono>
@@ -107,7 +109,7 @@ static void test_detectors() {
 static void test_pipeline() {
     TEST("Pipeline");
     novawaf::DetectionPipeline pipe;
-    CHECK(pipe.detectorCount() == 10, "ten detectors loaded");
+    CHECK(pipe.detectorCount() == 16, "sixteen detectors loaded");
     novawaf::HttpRequest req;
     req.query = "id=1' or '1'='1";
     auto r = pipe.detect(req);
@@ -783,6 +785,166 @@ static void test_custom_rules() {
     CHECK(det.detect(evil2).action == Action::PASS, "bad json keeps passing");
 }
 
+// ===================== 硬件加速（Teddy / 熔断 / AC 接入） =====================
+namespace {
+struct AclRng {
+    uint64_t s = 0x9e3779b97f4a7c15ULL;
+    uint32_t next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (uint32_t)(s >> 32); }
+};
+std::string randText(AclRng& r, int maxLen, int alpha) {
+    int n = (int)(r.next() % (uint32_t)(maxLen + 1));
+    std::string t;
+    t.reserve(n);
+    for (int i = 0; i < n; ++i) t.push_back((char)('a' + r.next() % (uint32_t)alpha));
+    return t;
+}
+// 定长随机串（用于模式，保证长度>=2，避免空串这种现实中不会出现的输入）
+std::string fixedStr(AclRng& r, int n, int alpha) {
+    std::string t;
+    t.reserve(n);
+    for (int i = 0; i < n; ++i) t.push_back((char)('a' + r.next() % (uint32_t)alpha));
+    return t;
+}
+}  // namespace
+
+// 随机 fuzz：标量 Teddy / 运行时分发(AVX2,SSE,标量) / 暴力子串，三者必须完全一致（零漏报零误报）
+static void test_accel_teddy_fuzz() {
+    TEST("Accel-Teddy-Fuzz(zero-miss)");
+    using namespace novawaf::accel;
+    AclRng r;
+    long cases = 0;
+    // 主 fuzz：模式长度>=2、字母表 5（最多 25 个不同首字节对），锚点必然可用
+    for (int it = 0; it < 20000; ++it) {
+        std::vector<std::string> pats;
+        int np = 1 + r.next() % 10;
+        for (int i = 0; i < np; ++i) {
+            int L = 2 + r.next() % 4;  // 2..5
+            pats.push_back(fixedStr(r, L, 5));
+        }
+        AnchorSet A;
+        bool usable = A.build(pats);
+        if (!usable) continue;  // 理论上不会（<=25 对），保险
+        for (int q = 0; q < 4; ++q) {
+            std::string t = randText(r, 96, 5);
+            bool gold = bruteForceAny(pats, t);
+            bool sc = scalarContains(t, A);
+            bool disp = anchorContainsAny(t, A);  // x86 上为 AVX2/SSE
+            CHECK(sc == gold, "scalar teddy == brute");
+            CHECK(disp == gold, "dispatch(simd) teddy == brute");
+            ++cases;
+        }
+    }
+    // 边界长度扫描：覆盖 16/32 字节块边界与跨 lane 拼接，命中放在每个可能偏移
+    for (int L = 0; L <= 80; ++L) {
+        std::vector<std::string> pats = {"ab", "cde", "eebb"};
+        AnchorSet A; A.build(pats);
+        std::string t(L, 'c');
+        for (size_t pos = 0; pos + 2 <= t.size(); ++pos) {
+            std::string x = t;
+            x[pos] = 'a'; x[pos + 1] = 'b';
+            bool gold = bruteForceAny(pats, x);
+            CHECK(scalarContains(x, A) == gold, "boundary scalar");
+            CHECK(anchorContainsAny(x, A) == gold, "boundary dispatch");
+        }
+    }
+    // 含单字节模式时锚点必须判定不可用（回退 AC，语义不变）
+    {
+        AnchorSet A;
+        CHECK(A.build({"a", "bc"}) == false, "single-char pattern -> unusable");
+    }
+    // 超过 64 个不同首字节对 -> 不可用
+    {
+        std::vector<std::string> many;
+        for (int i = 0; i < 70; ++i) many.push_back(std::string(1, (char)('A' + i / 10)) +
+                                                  std::string(1, (char)('a' + i % 10)) + "z");
+        AnchorSet A;
+        CHECK(A.build(many) == false, ">64 anchors -> unusable");
+    }
+    std::printf("   (fuzz cases: %ld)\n", cases);
+}
+
+// AC 自动机在“加速关(AC) / 加速开(Teddy)”下结果必须一致且与暴力匹配一致
+static void test_accel_ac_integration() {
+    TEST("Accel-AcIntegration(on/off identical)");
+    using namespace novawaf::accel;
+    setEnabled(false);
+    setActiveBackend(BackendKind::Scalar);
+    AclRng r;
+    for (int it = 0; it < 6000; ++it) {
+        novawaf::AcAutomaton ac;
+        std::vector<std::string> pats;
+        int np = 1 + r.next() % 8;
+        for (int i = 0; i < np; ++i) pats.push_back(fixedStr(r, 2 + r.next() % 4, 5));
+        for (auto& p : pats) ac.addPattern(p);
+        ac.build();
+        std::string t = randText(r, 96, 5);
+        bool gold = bruteForceAny(pats, t);
+
+        setEnabled(false); setActiveBackend(BackendKind::Scalar);
+        bool off = ac.containsAny(t);
+
+        setEnabled(true); setActiveBackend(BackendKind::SimdAVX2);  // 非 SIMD 机器内部仍标量
+        bool on = ac.containsAny(t);
+
+        setEnabled(false); setActiveBackend(BackendKind::Scalar);
+
+        CHECK(off == gold, "AC baseline == brute");
+        CHECK(on == gold, "Teddy accel == brute");
+        CHECK(off == on, "accel on/off identical");
+    }
+    // 真实攻击/干净样本端到端
+    {
+        novawaf::SqlInjectionDetector sqli;
+        novawaf::HttpRequest req;
+        req.query = "id=1 union select password from users";
+        setEnabled(false);
+        CHECK(sqli.detect(req).isBlocked(), "sqli blocked (accel off)");
+        setEnabled(true); setActiveBackend(BackendKind::SimdAVX2);
+        CHECK(sqli.detect(req).isBlocked(), "sqli blocked (accel on)");
+        setEnabled(false); setActiveBackend(BackendKind::Scalar);
+    }
+}
+
+// 批量接口与逐文本一致
+static void test_accel_batch() {
+    TEST("Accel-Batch");
+    using namespace novawaf::accel;
+    std::vector<std::string> pats = {"abc", "xy"};
+    AnchorSet A; A.build(pats);
+    std::vector<std::string> store = {"---abc---", "no hit", "xy!!", "ab", "zxy"};
+    std::vector<std::string_view> views;
+    for (auto& s : store) views.push_back(s);
+    uint8_t out[8] = {0};
+    batchAnchorContainsAny(views, A, out);
+    bool expect[5] = {true, false, true, false, true};
+    for (int i = 0; i < 5; ++i) CHECK((out[i] == 1) == expect[i], "batch hit per text");
+}
+
+// 熔断器状态转换
+static void test_accel_circuit() {
+    TEST("Accel-CircuitBreaker");
+    using namespace novawaf::accel;
+    CircuitBreaker cb;
+    CHECK(cb.state() == BackendState::Closed, "initial closed");
+    CHECK(cb.allow(), "closed allows");
+    cb.failure(); cb.failure();
+    CHECK(cb.state() == BackendState::Closed, "under threshold closed");
+    cb.failure();
+    CHECK(cb.state() == BackendState::Open, "threshold trips open");
+    CHECK(!cb.allow(), "open blocks");
+    cb.success();
+    CHECK(cb.state() == BackendState::Closed, "success closes");
+    cb.setUnavailable();
+    CHECK(cb.state() == BackendState::Unavailable, "unavailable");
+}
+
+// 运行时自检（黄金样本）必须通过
+static void test_accel_runtime_selftest() {
+    TEST("Accel-Runtime-SelfTest");
+    using namespace novawaf::accel;
+    CHECK(AccelRuntime::instance().runSelfTest(), "golden selftest passes");
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -809,6 +971,12 @@ int main() {
     test_dynamic_shield();
     test_ti_fingerprint();
     test_geo_filter();
+
+    test_accel_teddy_fuzz();
+    test_accel_ac_integration();
+    test_accel_batch();
+    test_accel_circuit();
+    test_accel_runtime_selftest();
 
     std::printf("\n=======================\n");
     std::printf("PASS: %d  FAIL: %d\n", g_pass, g_fail);

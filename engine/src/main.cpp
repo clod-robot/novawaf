@@ -32,6 +32,7 @@
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
 #include "novawaf/ai/http_transport.h"
+#include "novawaf/accel/accel_runtime.h"
 
 #include <fstream>
 
@@ -1005,6 +1006,13 @@ int main(int argc, char** argv) {
     // 态势统计事件汇聚（异步写 Redis，可视化大屏数据源）
     EventSink::instance().start();
     TrafficSink::instance().start();
+
+    // 硬件加速运行时：探测 CPU SIMD / GPU-NPU，加载开关（默认关），周期上报设备与健康状态
+    accel::AccelRuntime::instance().start();
+    std::printf("  Accel: backend=%s simdHealthy=%d enabled=%d\n",
+                accel::backendName(accel::activeBackend()),
+                accel::AccelRuntime::instance().simdHealthy() ? 1 : 0,
+                accel::enabled() ? 1 : 0);
 
     DetectionPipeline pipeline;
     int rlBurst = getenv("NOVA_RL_BURST") ? atoi(getenv("NOVA_RL_BURST")) : 100;   // 每 IP 突发
