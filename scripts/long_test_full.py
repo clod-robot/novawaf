@@ -55,6 +55,7 @@ REMOTE_HOST   = os.environ.get("REMOTE_HOST", "")          # L4 远程负载机 
 REMOTE_USER   = os.environ.get("REMOTE_USER", "mao")
 REMOTE_PASS   = os.environ.get("REMOTE_PASS", "MAO5201314sm")
 REMOTE_TARGET = os.environ.get("REMOTE_TARGET", "")         # L4 从远程看到的被测 IP；空则用 WAF_HOST（注意 127.0.0.1 远程无效）
+LT_TAG        = os.environ.get("LT_TAG", "")                # 并发运行隔离标记：IP 组名后缀（双机同时跑时 A/B 各自隔离）
 
 BASE = f"http://{WAF_HOST}:{WAF_PORT}/api"
 
@@ -216,7 +217,7 @@ def l2_regress(cookie):
         s, b = req("GET", "/waf/ipgroup/list", cookie=cookie_to_use)
         data = b.get("data") if isinstance(b.get("data"), list) else (b.get("data") or {}).get("items", [])
         for item in data:
-            if "回归测试" in str(item.get("name", "")):
+            if ("回归测试" + LT_TAG) in str(item.get("name", "")):
                 gid_old = item.get("id")
                 if gid_old:
                     req("DELETE", f"/waf/ipgroup/{gid_old}", cookie=cookie_to_use)
@@ -243,12 +244,12 @@ def l2_regress(cookie):
 
     # IpGroup 基础
     t("ig_create", 200)
-    s, b = do("POST", "/waf/ipgroup", {"name": "回归测试组", "type": "custom", "action": "block", "enabled": True}, cookie=cookie_to_use)
+    s, b = do("POST", "/waf/ipgroup", {"name": "回归测试组" + LT_TAG, "type": "custom", "action": "block", "enabled": True}, cookie=cookie_to_use)
     gid = (b.get("data") or {}).get("id") if isinstance(b.get("data"), dict) else None
     results[-1]["ok"] = s == 200 and b.get("code") == 200 and gid is not None
 
     t("ig_create_dup_name", 400)
-    s, b = do("POST", "/waf/ipgroup", {"name": "回归测试组", "type": "custom", "action": "block"}, cookie=cookie_to_use)
+    s, b = do("POST", "/waf/ipgroup", {"name": "回归测试组" + LT_TAG, "type": "custom", "action": "block"}, cookie=cookie_to_use)
     results[-1]["ok"] = s in (400, 409) or b.get("code") not in (200,)
 
     t("ig_list", 200)
