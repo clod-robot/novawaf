@@ -106,6 +106,15 @@ export const api = {
   // 通用设置-硬件加速：CPU SIMD/GPU/NPU 设备与后端状态查询、配置下发、自检
   accelGet: () => http.get('/system/accel'),
   accelSave: (d) => http.put('/system/accel', d),
-  accelSelftest: () => http.post('/system/accel/selftest')
+  accelSelftest: () => http.post('/system/accel/selftest'),
+  // 网页防篡改：基线页面/配置下发/基线清除/引擎统计
+  tamperPages: () => http.get('/tamper/pages'),
+  tamperConfig: () => http.get('/tamper/config'),
+  tamperStats: () => http.get('/tamper/stats'),
+  tamperSaveConfig: (d) => http.post('/tamper/config', d),
+  tamperPurge: (id) => http.post('/tamper/purge', { id }),
+  // 攻击溯源分析：攻击源 IP 排行 + 单 IP 攻击链时间线
+  traceSummary: (limit) => http.get('/trace/summary', { params: { limit } }),
+  traceIp: (ip) => http.get('/trace/ip/' + encodeURIComponent(ip))
 }
 export default http

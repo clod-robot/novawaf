@@ -15,6 +15,7 @@
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
 #include "novawaf/protect/geo_filter.h"
+#include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -945,6 +946,120 @@ static void test_accel_runtime_selftest() {
     CHECK(AccelRuntime::instance().runSelfTest(), "golden selftest passes");
 }
 
+static void test_tamper_cache() {
+    TEST("TamperCache");
+    using novawaf::TamperCache;
+    auto& tc = TamperCache::instance();
+    tc.clear();
+    TamperCache::Config c;
+    c.enabled = true;
+    c.ttlSec = 3600;
+    c.maxBody = 64 * 1024;
+    c.maxPages = 2;
+    tc.configure(c);
+    int events = 0;
+    std::string evPath;
+    tc.setEventHook([&](const std::string&, const std::string&, const std::string& p) {
+        events++;
+        evPath = p;
+    });
+
+    auto mkResp = [](const std::string& body) {
+        return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    };
+    const std::string page1 = "<html><body>hello</body></html>";
+
+    // 1. 首次观测 → 学习并放行
+    CHECK(!tc.process("GET", "a.com", "/", mkResp(page1), "1.1.1.1").has_value(),
+          "learn pass-through");
+    CHECK(tc.size() == 1, "learned one page");
+    // 2. 与基线一致 → 放行
+    CHECK(!tc.process("GET", "a.com", "/", mkResp(page1), "1.1.1.2").has_value(),
+          "identical pass");
+    // 3. body 被篡改 → 返回基线 + 事件
+    auto r3 = tc.process("GET", "a.com", "/", mkResp("<html><body>HACKED</body></html>"),
+                         "2.2.2.2");
+    CHECK(r3.has_value(), "tamper restored");
+    CHECK(r3 && r3->find("hello") != std::string::npos, "restored baseline body");
+    CHECK(events == 1 && evPath == "/", "tamper event emitted");
+    // 4. 基线不被篡改页面投毒
+    auto r4 = tc.process("GET", "a.com", "/", mkResp("<html><body>HACKED-2</body></html>"),
+                         "2.2.2.3");
+    CHECK(r4 && r4->find("hello") != std::string::npos, "baseline not poisoned");
+    CHECK(events == 2, "second tamper event");
+    // 5. 非 GET 不参与
+    CHECK(!tc.process("POST", "a.com", "/p", mkResp("x"), "1.1.1.1").has_value(), "POST skip");
+    CHECK(tc.size() == 1, "POST not learned");
+    // 6. 非 200 不参与
+    std::string r404 = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n"
+                       "Content-Length: 3\r\n\r\nabc";
+    CHECK(!tc.process("GET", "a.com", "/404", r404, "1.1.1.1").has_value(), "404 skip");
+    CHECK(tc.size() == 1, "404 not learned");
+    // 7. 非 html 不参与
+    std::string js = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     "Content-Length: 2\r\n\r\n{}";
+    CHECK(!tc.process("GET", "a.com", "/api", js, "1.1.1.1").has_value(), "json skip");
+    CHECK(tc.size() == 1, "json not learned");
+    // 8. chunked 不参与（字节比较有歧义）
+    std::string ch = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                     "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    CHECK(!tc.process("GET", "a.com", "/ch", ch, "1.1.1.1").has_value(), "chunked skip");
+    CHECK(tc.size() == 1, "chunked not learned");
+    // 9. 压缩响应不参与
+    std::string gz = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\n"
+                     "Content-Length: 3\r\n\r\nabc";
+    CHECK(!tc.process("GET", "a.com", "/gz", gz, "1.1.1.1").has_value(), "gzip skip");
+    CHECK(tc.size() == 1, "gzip not learned");
+    // 10. 超大 body 不参与
+    std::string big = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 70000\r\n\r\n" +
+                      std::string(70000, 'x');
+    CHECK(!tc.process("GET", "a.com", "/big", big, "1.1.1.1").has_value(), "oversize skip");
+    CHECK(tc.size() == 1, "oversize not learned");
+    // 11. LRU 容量：maxPages=2，再学两页 → 最早的 / 被淘汰
+    tc.process("GET", "a.com", "/b", mkResp("b"), "1.1.1.1");
+    tc.process("GET", "a.com", "/c", mkResp("c"), "1.1.1.1");
+    CHECK(tc.size() == 2, "lru cap holds");
+    // / 已被淘汰 → 重新学习（放行而非恢复）
+    CHECK(!tc.process("GET", "a.com", "/", mkResp(page1 + "v2"), "1.1.1.1").has_value(),
+          "evicted page relearns");
+    // 12. 前缀限制
+    tc.clear();
+    c.prefixes = {"/static"};
+    tc.configure(c);
+    CHECK(!tc.process("GET", "a.com", "/other", mkResp("o"), "1.1.1.1").has_value(),
+          "prefix skip");
+    CHECK(tc.size() == 0, "prefix mismatch not learned");
+    tc.process("GET", "a.com", "/static/a", mkResp("s"), "1.1.1.1");
+    CHECK(tc.size() == 1, "prefix match learned");
+    // 13. TTL=0 → 每次过期重学，不触发恢复
+    c.prefixes.clear();
+    c.ttlSec = 0;
+    tc.configure(c);
+    CHECK(!tc.process("GET", "a.com", "/static/a", mkResp("s-changed"), "1.1.1.1").has_value(),
+          "ttl expired relearn");
+    // 14. 开关关闭 → 全量放行
+    c.enabled = false;
+    c.ttlSec = 3600;
+    tc.configure(c);
+    CHECK(!tc.process("GET", "a.com", "/static/a", mkResp("s-changed-2"), "1.1.1.1").has_value(),
+          "disabled skip");
+    // 15. base64 精确往返（含全字节域）
+    std::string bin;
+    for (int i = 0; i < 256; ++i) bin.push_back((char)i);
+    CHECK(TamperCache::b64Decode(TamperCache::b64Encode(bin)) == bin, "b64 binary roundtrip");
+    CHECK(TamperCache::b64Decode(TamperCache::b64Encode("")) == "", "b64 empty roundtrip");
+    CHECK(TamperCache::b64Decode(TamperCache::b64Encode("a")) == "a", "b64 1-byte roundtrip");
+    CHECK(TamperCache::b64Decode(TamperCache::b64Encode("ab")) == "ab", "b64 2-byte roundtrip");
+    // 16. pageId 稳定且区分路径
+    CHECK(TamperCache::pageId("a.com", "/") == TamperCache::pageId("a.com", "/"), "id stable");
+    CHECK(TamperCache::pageId("a.com", "/") != TamperCache::pageId("a.com", "/x"),
+          "id distinct");
+
+    tc.clear();
+    tc.setEventHook(nullptr);
+}
+
 int main() {
     std::printf("NovaWAF Core Unit Tests\n");
     std::printf("=======================\n\n");
@@ -971,6 +1086,7 @@ int main() {
     test_dynamic_shield();
     test_ti_fingerprint();
     test_geo_filter();
+    test_tamper_cache();
 
     test_accel_teddy_fuzz();
     test_accel_ac_integration();

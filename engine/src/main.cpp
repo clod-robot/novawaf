@@ -26,6 +26,7 @@
 #include "novawaf/protect/geo_filter.h"
 #include "novawaf/protect/iplist_filter.h"
 #include "novawaf/protect/path_policy.h"
+#include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
@@ -752,6 +753,12 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &re);
                         }
                         if (app && forwardToUpstream(app->upstreamHost, app->upstreamPort, data, outResp)) {
+                            // 网页防篡改：同步回退路径同样过基线校验
+                            if (data.compare(0, 4, "GET ") == 0) {
+                                if (auto restored = TamperCache::instance().process(
+                                        "GET", hdrCi(req, "Host"), req.path, outResp, req.clientIp))
+                                    outResp = std::move(*restored);
+                            }
                             setRespConnection(outResp, keepAlive);
                             return false;
                         }
@@ -1006,6 +1013,9 @@ int main(int argc, char** argv) {
     // 态势统计事件汇聚（异步写 Redis，可视化大屏数据源）
     EventSink::instance().start();
     TrafficSink::instance().start();
+
+    // 网页防篡改缓存（页面基线学习/恢复，后台同步 Redis 持久化与配置热加载）
+    TamperCache::instance().start();
 
     // 硬件加速运行时：探测 CPU SIMD / GPU-NPU，加载开关（默认关），周期上报设备与健康状态
     accel::AccelRuntime::instance().start();
@@ -1409,6 +1419,7 @@ int main(int argc, char** argv) {
     for (auto& t : reactors) t.join();
     if (g_upstream) g_upstream->stop();  // 排空异步转发任务（ddos 此时仍存活）
     shield.stop();
+    TamperCache::instance().stop();      // 停机前把脏基线落盘
     EventSink::instance().stop();
     TrafficSink::instance().stop();
     return 0;

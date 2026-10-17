@@ -35,7 +35,22 @@
 #define NOVA_ACCEL_X86_GNU 0
 #endif
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace novawaf::accel {
+
+// 可移植 count-trailing-zeros（v != 0）：GCC/Clang 用内建，MSVC 用 _BitScanForward
+inline int ctz32(unsigned v) noexcept {
+#if defined(_MSC_VER)
+    unsigned long idx = 0;
+    _BitScanForward(&idx, v);
+    return (int)idx;
+#else
+    return __builtin_ctz(v);
+#endif
+}
 
 constexpr int kLitPerBucket = 8;        // 每个 bucket 最多 8 个锚点（一个字节的 8 个 bit）
 constexpr int kMaxBuckets = 8;          // 最多 8 个 bucket => 64 个不同首字节对
@@ -170,7 +185,7 @@ inline uint64_t totalFallback()  { return totalStat(&StatShard::fallback); }
 inline bool confirmAt(const AnchorSet& A, const uint8_t* data, size_t len,
                       size_t s, int b, uint8_t mb) {
     while (mb) {
-        int k = __builtin_ctz((unsigned)mb);
+        int k = ctz32((unsigned)mb);
         mb &= (uint8_t)(mb - 1);
         for (int pid : A.slotPatterns[b * kLitPerBucket + k]) {
             const auto& p = A.patterns[(size_t)pid];

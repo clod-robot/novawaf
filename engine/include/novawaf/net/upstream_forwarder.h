@@ -7,6 +7,7 @@
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/core/traffic_sink.h"
 #include "novawaf/net/upstream_pool.h"
+#include "novawaf/protect/tamper_cache.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -180,6 +181,12 @@ private:
             if (ctx.statsEnabled) emitStat(ctx, respStatus(outResp), false);
             finishClient(ctx);
             return;
+        }
+        // 网页防篡改：仅 GET 的 HTML 响应参与；判定篡改则回退到缓存基线
+        if (ctx.data.compare(0, 4, "GET ") == 0) {
+            if (auto restored = TamperCache::instance().process("GET", ctx.host, ctx.path,
+                                                                outResp, ctx.clientIp))
+                outResp = std::move(*restored);
         }
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
         setResponseConnection(outResp, ctx.keepAlive);

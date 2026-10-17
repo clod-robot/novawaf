@@ -58,6 +58,8 @@ const all = [
   { path: '/waf/rule', title: '规则管理', perm: 'waf:rule:list', icon: 'Setting' },
   { path: '/waf/ioc', title: '威胁情报', perm: 'waf:ioc:list', icon: 'Warning' },
   { path: '/waf/iplist', title: '黑白名单', perm: 'waf:iplist:list', icon: 'Lock' },
+  { path: '/waf/tamper', title: '网页防篡改', perm: 'waf:tamper:list', icon: 'DocumentChecked' },
+  { path: '/waf/trace', title: '溯源分析', perm: 'waf:trace:list', icon: 'Aim' },
   { title: '通用设置', icon: 'Tools', children: [
     { path: '/common/deploy', title: '部署方式', perm: 'system:deploy:view', icon: 'Monitor' },
     { path: '/common/ipgroup', title: 'IP 组', perm: 'waf:ipgroup:list', icon: 'Location' },

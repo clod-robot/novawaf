@@ -102,6 +102,24 @@ class RedisLite:
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((REDIS_HOST, REDIS_PORT))
+        # Redis 已加固 requirepass：密码取 env REDIS_PASSWORD，缺省时尝试从引擎 env 文件读
+        pw = os.environ.get("REDIS_PASSWORD", "") or self._pw_from_envfile()
+        if pw:
+            self.send(["AUTH", "default", pw])
+            if self.recv() != "OK":
+                raise RuntimeError("redis AUTH failed")
+
+    @staticmethod
+    def _pw_from_envfile():
+        for p in ("/etc/novawaf/novawaf.env",):
+            try:
+                for line in open(p):
+                    line = line.strip()
+                    if line.startswith("NOVA_REDIS_PASS="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+        return ""
 
     def send(self, cmd):
         if isinstance(cmd, (list, tuple)):
