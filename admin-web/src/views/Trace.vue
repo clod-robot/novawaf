@@ -34,7 +34,9 @@
           <el-tag :type="levelType(row.level)" size="small" effect="dark">{{ row.level }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="count" label="攻击次数" width="90" align="right" sortable />
+      <el-table-column label="攻击次数" width="100" align="right" sortable>
+        <template #default="{ row }">{{ fmtBig(row.count) }}</template>
+      </el-table-column>
       <el-table-column label="攻击类型画像" min-width="220">
         <template #default="{ row }">
           <el-tag v-for="t in row.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
@@ -75,7 +77,7 @@
           <el-tag v-for="t in detail.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
         </div>
         <el-descriptions :column="4" border size="small" class="meta">
-          <el-descriptions-item label="攻击次数">{{ detail.count }}</el-descriptions-item>
+          <el-descriptions-item label="攻击次数">{{ fmtBig(detail.count) }}</el-descriptions-item>
           <el-descriptions-item label="首次攻击">{{ fmtTs(detail.firstSeen) }}</el-descriptions-item>
           <el-descriptions-item label="最近攻击">{{ fmtTs(detail.lastSeen) }}</el-descriptions-item>
           <el-descriptions-item label="拦截动作">
@@ -94,7 +96,9 @@
         <div class="hud-title" style="margin-top:16px">// 高频命中规则</div>
         <el-table :data="detail.topRules || []" border size="small" class="tbl">
           <el-table-column prop="ruleId" label="规则 ID" width="180"><template #default="{ row }"><span class="mono">{{ row.ruleId }}</span></template></el-table-column>
-          <el-table-column prop="count" label="命中次数" width="100" align="right" />
+          <el-table-column prop="count" label="命中次数" width="100" align="right">
+            <template #default="{ row }">{{ fmtBig(row.count) }}</template>
+          </el-table-column>
           <el-table-column label="占比">
             <template #default="{ row }">
               <el-progress :percentage="Math.round(row.count * 100 / detail.count)" :stroke-width="8" color="#00e5ff" />
@@ -103,7 +107,7 @@
         </el-table>
 
         <!-- 攻击时间线 -->
-        <div class="hud-title" style="margin-top:16px">// 攻击时间线（最近 {{ (detail.timeline || []).length }} / {{ detail.timelineTotal }} 条）</div>
+        <div class="hud-title" style="margin-top:16px">// 攻击时间线（最近 {{ fmtBig((detail.timeline || []).length) }} / {{ fmtBig(detail.timelineTotal) }} 条）</div>
         <el-table :data="detail.timeline || []" border size="small" height="340" class="tbl">
           <el-table-column label="时间" width="165">
             <template #default="{ row }"><span class="mono">{{ fmtTs(row.ts) }}</span></template>
@@ -130,6 +134,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
+import { fmtBig } from '../utils/format'
 
 const rows = ref([]), limit = ref(50), loading = ref(false)
 const drawer = ref(false), detail = ref({})

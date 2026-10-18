@@ -46,3 +46,19 @@ export function sumHits(rows) {
   if (!Array.isArray(rows)) return 0
   return rows.reduce((acc, r) => acc + (Number(r && r.hits) || 0), 0)
 }
+
+const SUP = { 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹' }
+
+/** 大数科学计数法：|n| >= 1e8 显示为 a.b×10^n（Unicode 上标），否则千分位。
+ *  防止大屏数字卡片/表格位宽溢出；尾随零压缩（1.50→1.5、2.00→2）。 */
+export function fmtBig(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return '0'
+  if (Math.abs(v) < 1e8) return v.toLocaleString('en-US')
+  let exp = Math.floor(Math.log10(Math.abs(v)))
+  let mant = (v / 10 ** exp).toFixed(2)
+  if (Number(mant) >= 10) { exp += 1; mant = (v / 10 ** exp).toFixed(2) } // 尾数进位规格化
+  const m = mant.replace(/\.?0+$/, '')
+  const eStr = String(exp).split('').map(c => SUP[c] || c).join('')
+  return m + '×10' + eStr
+}

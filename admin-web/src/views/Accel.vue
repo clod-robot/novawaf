@@ -122,6 +122,7 @@
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+import { fmtBig } from '../utils/format'
 
 const live = ref({ reachable: false, activeBackend: 'Scalar', cpu: {}, devices: [], backends: [], stats: {} })
 const stats = computed(() => live.value.stats || {})
@@ -184,7 +185,7 @@ function stateType(s) {
 function stateText(s) {
   return ({ healthy: '健康可用', unavailable: '不可用', open: '熔断打开', half_open: '半开探测', closed: '已关闭' })[s] || s || '未知'
 }
-function nfmt(v) { return (v === null || v === undefined) ? '0' : Number(v).toLocaleString('en-US') }
+function nfmt(v) { return (v === null || v === undefined) ? '0' : fmtBig(v) }
 function markDirty() { formDirty.value = true }
 
 function syncForm(d) {

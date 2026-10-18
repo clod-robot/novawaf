@@ -4,7 +4,7 @@
     <div class="kpis">
       <div v-for="k in kpis" :key="k.label" class="mecha-panel kpi">
         <div class="kpi-top"><span class="hud-title">{{ k.label }}</span><el-icon class="ic"><component :is="k.icon" /></el-icon></div>
-        <div class="kpi-num" :style="{ color: k.color }">{{ k.val }}</div>
+        <div class="kpi-num" :style="{ color: k.color }">{{ fmtBig(k.val) }}</div>
       </div>
     </div>
 
@@ -12,12 +12,12 @@
     <div class="row2">
       <div class="mecha-panel mini" v-for="e in errCards" :key="e.label">
         <div class="hud-title">{{ e.label }}</div>
-        <div class="mini-big" :style="{color:e.color}">{{ e.val }}</div>
+        <div class="mini-big" :style="{color:e.color}">{{ fmtBig(e.val) }}</div>
         <div class="mini-sub">{{ e.sub }}</div>
       </div>
       <div class="mecha-panel mini qps">
         <div class="hud-title">实时 QPS</div>
-        <div class="mini-big glow-cyan">{{ d.traffic?.qps ?? 0 }}</div>
+        <div class="mini-big glow-cyan">{{ fmtBig(d.traffic?.qps ?? 0) }}</div>
         <div ref="qpsEl" class="qps-chart"></div>
       </div>
     </div>
@@ -40,7 +40,7 @@
             <span class="rk" :class="'rk'+(i+1)">{{ i+1 }}</span>
             <span class="rname">{{ r.name }}</span>
             <div class="rbar"><div class="rfill" :style="{width: pct(r.value, maxIp)+'%'}"></div></div>
-            <span class="rval">{{ r.value }}</span>
+            <span class="rval">{{ fmtBig(r.value) }}</span>
           </div>
           <div v-if="!d.topIps || !d.topIps.length" class="empty">暂无数据</div>
         </div>
@@ -71,7 +71,7 @@
           <div v-for="r in ruleList" :key="r.name" class="rank-row">
             <span class="rname">{{ r.name }}</span>
             <div class="rbar"><div class="rfill rule" :style="{width: pct(r.value, maxRule)+'%'}"></div></div>
-            <span class="rval">{{ r.value }}</span>
+            <span class="rval">{{ fmtBig(r.value) }}</span>
           </div>
           <div v-if="!ruleList.length" class="empty">暂无数据</div>
         </div>
@@ -99,7 +99,7 @@
           <div v-for="(r,i) in d.byCountry" :key="r.name" class="rank-row">
             <span class="rname wide">{{ r.name }}</span>
             <div class="rbar"><div class="rfill geo" :style="{width: pct(r.value, maxCountry)+'%'}"></div></div>
-            <span class="rval">{{ r.value }}</span>
+            <span class="rval">{{ fmtBig(r.value) }}</span>
           </div>
           <div v-if="!arr(d.byCountry)" class="empty">暂无数据</div>
         </div>
@@ -110,7 +110,7 @@
           <div v-for="r in d.byReferer" :key="r.name" class="rank-row">
             <span class="rname wide">{{ r.name }}</span>
             <div class="rbar"><div class="rfill ref" :style="{width: pct(r.value, maxRef)+'%'}"></div></div>
-            <span class="rval">{{ r.value }}</span>
+            <span class="rval">{{ fmtBig(r.value) }}</span>
           </div>
           <div v-if="!arr(d.byReferer)" class="empty">暂无数据</div>
         </div>
@@ -121,7 +121,7 @@
           <div v-for="r in d.byHost" :key="r.name" class="rank-row">
             <span class="rname wide">{{ r.name }}</span>
             <div class="rbar"><div class="rfill host" :style="{width: pct(r.value, maxHost)+'%'}"></div></div>
-            <span class="rval">{{ r.value }}</span>
+            <span class="rval">{{ fmtBig(r.value) }}</span>
           </div>
           <div v-if="!arr(d.byHost)" class="empty">暂无数据</div>
         </div>
@@ -135,7 +135,7 @@
         <div v-for="r in d.topPages" :key="r.name" class="rank-row">
           <span class="rname page">{{ r.name }}</span>
           <div class="rbar"><div class="rfill page" :style="{width: pct(r.value, maxPage)+'%'}"></div></div>
-          <span class="rval">{{ r.value }}</span>
+          <span class="rval">{{ fmtBig(r.value) }}</span>
         </div>
         <div v-if="!arr(d.topPages)" class="empty">暂无数据</div>
       </div>
@@ -147,6 +147,7 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import * as echarts from 'echarts'
 import { api } from '../api'
+import { fmtBig } from '../utils/format'
 
 const d = ref({ traffic: {}, byCategory: {}, topIps: [], trend: [], events: [], byAction: {}, byRule: {}, byStatus: [], byCountry: [], byBrowser: [], byOs: [], byHost: [], byReferer: [], topPages: [] })
 const trendEl = ref(), catEl = ref(), actEl = ref(), qpsEl = ref()

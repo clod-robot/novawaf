@@ -1,5 +1,31 @@
 import { describe, it, expect } from 'vitest'
-import { fmtTime, geoType, isValidIpOrCidr, paginate, sumHits } from './format'
+import { fmtTime, geoType, isValidIpOrCidr, paginate, sumHits, fmtBig } from './format'
+
+describe('fmtBig 大数科学计数法', () => {
+  it('阈值以下保持千分位', () => {
+    expect(fmtBig(0)).toBe('0')
+    expect(fmtBig(99999999)).toBe('99,999,999')
+    expect(fmtBig(1234)).toBe('1,234')
+  })
+  it('阈值以上转科学计数法(×10^n 上标)', () => {
+    expect(fmtBig(1e8)).toBe('1×10⁸')
+    expect(fmtBig(123456789)).toBe('1.23×10⁸')
+    expect(fmtBig(999999999999)).toBe('1×10¹²')
+    expect(fmtBig(5.2e9)).toBe('5.2×10⁹')
+  })
+  it('尾随零压缩', () => {
+    expect(fmtBig(200000000)).toBe('2×10⁸')
+    expect(fmtBig(1500000000)).toBe('1.5×10⁹')
+  })
+  it('负数与非有限值', () => {
+    expect(fmtBig(-250000000)).toBe('-2.5×10⁸')
+    expect(fmtBig(null)).toBe('0')
+    expect(fmtBig(undefined)).toBe('0')
+    expect(fmtBig(NaN)).toBe('0')
+    expect(fmtBig('abc')).toBe('0')
+  })
+})
+
 
 describe('fmtTime', () => {
   it('空值返回占位符', () => {

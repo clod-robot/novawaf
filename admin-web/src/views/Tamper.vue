@@ -91,12 +91,13 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+import { fmtBig } from '../utils/format'
 
 const pages = ref([]), stats = ref({}), cfg = ref({})
 const form = ref({ enabled: false, ttl: 3600, maxBody: 262144, maxPages: 256, prefixes: [] })
 const saving = ref(false)
 
-function nfmt(n) { return (n ?? 0).toLocaleString() }
+function nfmt(n) { return fmtBig(n ?? 0) }
 function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '-' }
 function fmtSize(n) {
   if (!n) return '0'
