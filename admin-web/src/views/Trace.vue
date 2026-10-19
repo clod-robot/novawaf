@@ -2,7 +2,7 @@
   <div class="mecha-panel p">
     <!-- 状态栏 -->
     <div class="bar">
-      <span class="hud-inline">// 攻击源 IP 排行（基于最近 {{ rows.length ? '最多 1000' : 0 }} 条攻击事件聚合）</span>
+      <span class="hud-inline">// 攻击源 IP 排行（{{ scope }}）</span>
       <span style="flex:1"></span>
       <el-select v-model="limit" size="small" style="width:130px;margin-right:10px" @change="load">
         <el-option :value="20" label="Top 20" />
@@ -64,6 +64,8 @@
       <template #empty><span>暂无攻击事件 —— 引擎检测到攻击后自动汇聚溯源</span></template>
     </el-table>
     <p class="footnote">
+      攻击次数 = 当日真实累计（引擎按天分桶持久计数，不封顶、不被洪水挤占、封禁解除后不清零，跨天自动重置）。
+      攻击类型画像来自最近 1000 条明细样本。
       风险分 = 严重度加权（critical 10 / high 5 / medium 2 / low 1）+ 攻击类别多样性 + 频率加成，上限 100。
       攻击链：侦察(recon) → 渗透(exploit) → 入侵(intrusion) → 破坏(impact)，阶段越靠后威胁越大。
     </p>
@@ -137,6 +139,7 @@ import { api } from '../api'
 import { fmtBig } from '../utils/format'
 
 const rows = ref([]), limit = ref(50), loading = ref(false)
+const scope = ref('加载中…')
 const drawer = ref(false), detail = ref({})
 
 function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '-' }
@@ -156,7 +159,11 @@ function actText(a) { return a === 'block' ? '拦截' : a === 'challenge' ? '挑
 
 async function load() {
   loading.value = true
-  try { rows.value = await api.traceSummary(limit.value) || [] }
+  try {
+    const resp = await api.traceSummary(limit.value) || {}
+    rows.value = resp.rows || []
+    if (resp.date) scope.value = resp.date + ' ' + (resp.scope || '今日真实累计')
+  }
   finally { loading.value = false }
 }
 async function openDetail(ip) {

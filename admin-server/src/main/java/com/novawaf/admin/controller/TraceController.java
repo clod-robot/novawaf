@@ -6,7 +6,6 @@ import com.novawaf.admin.service.TraceService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.List;
 import java.util.Map;
 
 /** 攻击溯源分析: 攻击源 IP 排行 + 单 IP 攻击链时间线 */
@@ -18,7 +17,7 @@ public class TraceController {
 
     @RequirePerms("waf:trace:list")
     @GetMapping("/summary")
-    public Result<List<Map<String, Object>>> summary(@RequestParam(defaultValue = "50") int limit) {
+    public Result<Map<String, Object>> summary(@RequestParam(defaultValue = "50") int limit) {
         return Result.ok(trace.summary(limit));
     }
 

@@ -6,14 +6,18 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.*;
 
 /**
- * 攻击溯源分析: 基于 novawaf:events(List, 引擎滚动保留最近 ~1000 条)做 IP 维度聚合。
- *   - summary: 攻击源 IP 排行(次数/类别/首末次/风险分/攻击链阶段)
- *   - ipDetail: 单 IP 攻击链时间线 + 类型分布 + 行为画像
+ * 攻击溯源分析:
+ *   - summary: 攻击源 IP 排行——count 读引擎按天分桶的真实计数(novawaf:trace:cnt:YYYYMMDD,
+ *     HINCRBY 持久累计, 不封顶/不被洪水挤占/引擎重启不丢), 画像(categories/时间/动作)从
+ *     novawaf:events 近期明细窗口提取作补充; 跨天自然开新桶(每日重置), 桶保留 48h。
+ *   - ipDetail: 单 IP 攻击链时间线 + 类型分布 + 行为画像(明细窗口样本) + 真实累计数。
  * 攻击链阶段(kill chain 简化): recon(侦察) → exploit(渗透) → intrusion(入侵) → impact(破坏)
- * 风险分 = Σseverity 权重(critical10/high5/medium2/low1) + 类别多样性 3/类 + 频率加分, 上限 100。
+ * 风险分 = 频率分(真实count) + severity 加权(样本) + 类别多样性 3/类, 上限 100。
  */
 @Service
 @RequiredArgsConstructor
@@ -22,26 +26,51 @@ public class TraceService {
     private final ObjectMapper om = new ObjectMapper();
 
     static final String K_EVENTS = "novawaf:events";
+    static final String K_TRACE_CNT = "novawaf:trace:cnt:";
+    static final String K_TRACE_CAT = "novawaf:trace:cat:";
+    private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai"); // 与引擎 localtime 桶一致
     private static final int MAX_SCAN = 1000;    // 与引擎 eventsCap 对齐
     private static final int MAX_TIMELINE = 200; // 单 IP 时间线上限(防大响应)
 
     // ---------------- 攻击源 IP 排行 ----------------
 
-    public List<Map<String, Object>> summary(int limit) {
+    public Map<String, Object> summary(int limit) {
         if (limit <= 0) limit = 50;
         if (limit > 200) limit = 200;
+        // 1) 分桶真实计数(今天+昨天合并)
+        Map<String, Long> realByIp = new HashMap<>();
+        Map<String, Long> realByCat = new HashMap<>();
+        readBuckets(realByIp, realByCat);
+        // 2) 明细窗口样本(画像补充)
         Map<String, Agg> byIp = aggregate(readEvents());
-        List<Agg> all = new ArrayList<>(byIp.values());
-        all.sort((a, b) -> {
-            int c = Integer.compare(b.riskScore(), a.riskScore());
-            return c != 0 ? c : Long.compare(b.count, a.count);
+        // 3) 合并输出: 真实计数为主, 样本画像为辅
+        Set<String> ips = new LinkedHashSet<>(realByIp.keySet());
+        ips.addAll(byIp.keySet());
+        List<Agg> rows = new ArrayList<>();
+        for (String ip : ips) {
+            Agg a = byIp.getOrDefault(ip, new Agg(ip));
+            long real = realByIp.getOrDefault(ip, 0L);
+            a.realCount = Math.max(a.count, real); // 样本数与桶计数取大(桶可能滞后一个 flush 周期)
+            rows.add(a);
+        }
+        rows.sort((a, b) -> {
+            int c = Long.compare(b.realCount, a.realCount);
+            return c != 0 ? c : Integer.compare(b.riskScore(), a.riskScore());
         });
         List<Map<String, Object>> out = new ArrayList<>();
-        for (Agg a : all) {
+        for (Agg a : rows) {
             if (out.size() >= limit) break;
-            out.add(a.toSummary());
+            Map<String, Object> m = a.toSummary();
+            m.put("count", a.realCount);            // 展示真实累计
+            m.put("riskScore", a.riskScore(a.realCount));
+            m.put("level", a.level(a.realCount));
+            out.add(m);
         }
-        return out;
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("date", LocalDate.now(ZONE).toString());
+        resp.put("scope", "今日累计(跨天自动重置, 分桶保留48h); 类型画像来自近期明细样本");
+        resp.put("rows", out);
+        return resp;
     }
 
     // ---------------- 单 IP 攻击链详情 ----------------
@@ -54,7 +83,12 @@ public class TraceService {
         for (Map<String, Object> e : events) {
             if (ip.equals(str(e.get("ip")))) mine.add(e);
         }
-        if (mine.isEmpty()) throw new BusinessException(404, "未观察到该 IP 的攻击事件: " + ip);
+        Map<String, Long> realByIp = new HashMap<>();
+        Map<String, Long> realByCat = new HashMap<>();
+        readBuckets(realByIp, realByCat);
+        long real = realByIp.getOrDefault(ip, 0L);
+        if (mine.isEmpty() && real == 0)
+            throw new BusinessException(404, "未观察到该 IP 的攻击事件: " + ip);
         // 时间线按 ts 升序
         mine.sort(Comparator.comparingLong(e -> toLong(e.get("ts"))));
 
@@ -65,6 +99,7 @@ public class TraceService {
             String rid = str(e.get("ruleId"));
             if (!rid.isEmpty()) rules.merge(rid, 1L, Long::sum);
         }
+        long shown = Math.max(agg.count, real);
 
         // 阶段迁移流(时间线上各阶段首次出现顺序)
         List<String> stageFlow = new ArrayList<>();
@@ -89,11 +124,31 @@ public class TraceService {
         }
 
         Map<String, Object> out = agg.toSummary();
+        out.put("count", shown);
+        out.put("realCount", real);
+        out.put("sampleCount", agg.count);
+        out.put("riskScore", agg.riskScore(shown));
+        out.put("level", agg.level(shown));
         out.put("topRules", topN(rules, 5));
         out.put("stageFlow", stageFlow);
         out.put("timeline", timeline);
         out.put("timelineTotal", mine.size());
         return out;
+    }
+
+    // ---------------- 分桶真实计数(今天+昨天) ----------------
+
+    private void readBuckets(Map<String, Long> byIp, Map<String, Long> byCat) {
+        LocalDate today = LocalDate.now(ZONE);
+        for (LocalDate d : new LocalDate[]{today, today.minusDays(1)}) {
+            String day = d.toString().replace("-", "");
+            Map<Object, Object> cnt = redis.opsForHash().entries(K_TRACE_CNT + day);
+            for (Map.Entry<Object, Object> en : cnt.entrySet())
+                byIp.merge(String.valueOf(en.getKey()), toLong(en.getValue()), Long::sum);
+            Map<Object, Object> cat = redis.opsForHash().entries(K_TRACE_CAT + day);
+            for (Map.Entry<Object, Object> en : cat.entrySet())
+                byCat.merge(String.valueOf(en.getKey()), toLong(en.getValue()), Long::sum);
+        }
     }
 
     // ---------------- 聚合内核 ----------------
@@ -128,6 +183,7 @@ public class TraceService {
     static final class Agg {
         final String ip;
         long count = 0;
+        long realCount = 0;   // 分桶真实累计(与窗口无关)
         long firstSeen = Long.MAX_VALUE;
         long lastSeen = 0;
         long weighted = 0;
@@ -154,16 +210,20 @@ public class TraceService {
             if (!act.isEmpty()) actions.merge(act, 1L, Long::sum);
         }
 
-        int riskScore() {
+        int riskScore() { return riskScore(count); }
+
+        int riskScore(long effectiveCount) {
             long score = weighted + 3L * categories.size();
-            if (count >= 100) score += 20;
-            else if (count >= 50) score += 10;
-            else if (count >= 20) score += 5;
+            if (effectiveCount >= 100) score += 20;
+            else if (effectiveCount >= 50) score += 10;
+            else if (effectiveCount >= 20) score += 5;
             return (int) Math.min(100, score);
         }
 
-        String level() {
-            int s = riskScore();
+        String level() { return level(count); }
+
+        String level(long effectiveCount) {
+            int s = riskScore(effectiveCount);
             return s >= 70 ? "严重" : s >= 40 ? "高危" : s >= 20 ? "中危" : "低危";
         }
 

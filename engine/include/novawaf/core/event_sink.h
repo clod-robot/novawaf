@@ -110,6 +110,8 @@ private:
             byCategory_[e.category]++;
             if (!e.severity.empty()) bySeverity_[e.severity]++;
             if (!e.ip.empty()) byIp_[e.ip]++;
+            if (!e.ip.empty()) perIpDelta_[e.ip]++;      // 溯源分桶增量(写失败保留重试)
+            if (!e.category.empty()) perCatDelta_[e.category]++;
             int64_t bucket = e.ts > 0 ? e.ts / 60 : (int64_t)(std::time(nullptr) / 60);
             tsBuckets_[bucket]++;
             pendingEvents_.push_back(e);
@@ -131,10 +133,10 @@ private:
         const char* pass = std::getenv("NOVA_REDIS_PASS");
         int db = std::getenv("NOVA_REDIS_DB") ? std::atoi(std::getenv("NOVA_REDIS_DB")) : 0;
         if (!r.connect(h ? h : "", port, pass ? pass : "", db)) {
-            // 连接失败：保留事件到下次重试，不崩溃
+            // 连接失败：保留事件与增量到下次重试，不崩溃
             return;
         }
-        // 1) 原始事件批量 RPUSH + LTRIM
+        // 1) 原始事件批量 RPUSH + LTRIM（近期明细窗口，供时间线展示）
         if (!pendingEvents_.empty()) {
             std::vector<std::string> jsons;
             jsons.reserve(pendingEvents_.size());
@@ -143,7 +145,24 @@ private:
             r.ltrim("novawaf:events", -(int64_t)eventsCap_, -1);
             pendingEvents_.clear();
         }
-        // 2) 统计快照
+        // 2) 溯源真实计数（按天分桶 Hash，与明细窗口无关：不封顶、不被洪水挤占、
+        //    引擎重启不丢；跨天自然开新桶，EXPIRE 48h 自动回收）
+        if (!perIpDelta_.empty() || !perCatDelta_.empty()) {
+            char day[16];
+            std::time_t t = std::time(nullptr);
+            std::tm lt{};
+            localtime_r(&t, &lt);
+            std::strftime(day, sizeof(day), "%Y%m%d", &lt);
+            std::string cntKey = std::string("novawaf:trace:cnt:") + day;
+            std::string catKey = std::string("novawaf:trace:cat:") + day;
+            for (auto& kv : perIpDelta_) r.hincrby(cntKey, kv.first, (int64_t)kv.second);
+            for (auto& kv : perCatDelta_) r.hincrby(catKey, kv.first, (int64_t)kv.second);
+            r.expire(cntKey, 172800);
+            r.expire(catKey, 172800);
+            perIpDelta_.clear();
+            perCatDelta_.clear();
+        }
+        // 3) 统计快照
         r.set("novawaf:stats", snapshotJson());
     }
 
@@ -252,6 +271,9 @@ private:
     std::unordered_map<std::string, uint64_t> byIp_;
     std::map<int64_t, uint64_t> tsBuckets_;
     std::vector<AttackEvent> pendingEvents_;
+    // 溯源分桶增量（自上次成功写入 Redis 的累计；写失败保留，成功后清零）
+    std::unordered_map<std::string, uint64_t> perIpDelta_;
+    std::unordered_map<std::string, uint64_t> perCatDelta_;
 };
 
 }  // namespace novawaf

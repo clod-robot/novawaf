@@ -153,6 +153,23 @@ public:
         if (!r || r->kind != Reply::ARRAY) return std::nullopt;
         return r->arr;
     }
+    // HINCRBY key field delta -> 自增后的值（溯源按 IP 分桶真实计数用）
+    std::optional<int64_t> hincrby(const std::string& key, const std::string& field, int64_t delta) {
+        auto r = command({"HINCRBY", key, field, std::to_string(delta)});
+        if (!r || r->kind != Reply::INTEGER) return std::nullopt;
+        return r->integer;
+    }
+    // HGETALL key -> [field1, value1, field2, value2, ...]（失败 nullopt）
+    std::optional<std::vector<std::string>> hgetall(const std::string& key) {
+        auto r = command({"HGETALL", key});
+        if (!r || r->kind != Reply::ARRAY) return std::nullopt;
+        return r->arr;
+    }
+    // EXPIRE key seconds（成功返回 true）
+    bool expire(const std::string& key, int64_t seconds) {
+        auto r = command({"EXPIRE", key, std::to_string(seconds)});
+        return r && r->kind == Reply::INTEGER && r->integer == 1;
+    }
 
 private:
     struct Reply {
