@@ -192,15 +192,43 @@ function tagType(a) { return a === 'block' ? 'danger' : (a === 'pass' ? 'success
 function baseGrid() { return { left: 44, right: 16, top: 24, bottom: 28 } }
 function axisStyle() { return { axisLabel: { color: '#6f8bb0' }, axisLine: { lineStyle: { color: '#2a4a6a' } }, splitLine: { lineStyle: { color: 'rgba(0,229,255,0.08)' } } } }
 
-function drawTrend() {
-  const data = d.value.trend || []
-  const xs = data.map(p => fmt(p.t)), ys = data.map(p => p.count)
-  const c = echarts.init(trendEl.value); charts.push(c)
-  c.setOption({ grid: baseGrid(), tooltip: { trigger: 'axis' },
+// ===== 攻击拦截趋势：以本机系统当前分钟为锚，固定展示最近10个分钟桶，每分钟自动往后滚 =====
+const trendWin = ref([])   // [{t, count}]，t 为分钟起始秒
+let trendChart = null
+function curMin() { return Math.floor(Date.now() / 60000) * 60 }
+function updateTrendChart() {
+  if (!trendChart) return
+  const xs = trendWin.value.map(p => fmt(p.t)), ys = trendWin.value.map(p => p.count)
+  trendChart.setOption({ grid: baseGrid(), tooltip: { trigger: 'axis' },
     xAxis: { type: 'category', data: xs, ...axisStyle() },
     yAxis: { type: 'value', ...axisStyle() },
     series: [{ type: 'line', smooth: true, data: ys, symbol: 'none', lineStyle: { color: '#00e5ff', width: 2 },
       areaStyle: { color: new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(0,229,255,0.45)'},{offset:1,color:'rgba(0,229,255,0)'}]) } }] })
+}
+function rollTrend() {
+  // 分钟跨界时窗口后滚：丢弃最老分钟，末尾补当前分钟(0)
+  const end = curMin(), m = new Map(trendWin.value.map(p => [p.t, p.count])), win = []
+  for (let i = 9; i >= 0; i--) { const t = end - i * 60; win.push({ t, count: m.get(t) || 0 }) }
+  trendWin.value = win
+  updateTrendChart()
+}
+function syncTrend(serverTrend) {
+  // 快照对齐：窗口锚定本机当前分钟，服务器计数与本地累计取大(单调不减)
+  const sm = new Map((serverTrend || []).map(p => [p.t, p.count]))
+  const lm = new Map(trendWin.value.map(p => [p.t, p.count]))
+  const end = curMin(), win = []
+  for (let i = 9; i >= 0; i--) { const t = end - i * 60; win.push({ t, count: Math.max(sm.get(t) ?? 0, lm.get(t) ?? 0) }) }
+  trendWin.value = win
+  updateTrendChart()
+}
+function bumpTrend(ts) {
+  const t = Math.floor((ts || Date.now() / 1000) / 60) * 60
+  const p = trendWin.value.find(x => x.t === t)
+  if (p) { p.count++; updateTrendChart() }
+}
+function drawTrend() {
+  if (!trendChart) trendChart = echarts.init(trendEl.value)
+  updateTrendChart()
 }
 function drawDonut(el, data, colors) {
   const c = echarts.init(el.value); charts.push(c)
@@ -218,6 +246,7 @@ function drawQps() {
 
 async function load() {
   try { d.value = await api.dashboard() } catch (e) { d.value = { traffic: {}, byCategory: {}, topIps: [], trend: [], events: [], byAction: {}, byRule: {}, byStatus: [], byCountry: [], byBrowser: [], byOs: [], byHost: [], byReferer: [], topPages: [] } }
+  syncTrend(d.value.trend)
   await next()
   charts.forEach(c => c.dispose()); charts = []
   redraw()
@@ -236,7 +265,7 @@ function next() { return new Promise(r => requestAnimationFrame(() => requestAni
 // ===== SSE 实时推送：替代轮询，事件秒级到达，快照每 3s 全量刷新 =====
 let es = null, reconn = null
 function applySnapshot(snap) {
-  if (snap && typeof snap === 'object') { d.value = snap; next().then(redraw) }
+  if (snap && typeof snap === 'object') { d.value = snap; syncTrend(snap.trend); next().then(redraw) }
 }
 function applyEvent(ev) {
   if (!ev || typeof ev !== 'object') return
@@ -244,6 +273,7 @@ function applyEvent(ev) {
   evs.unshift(ev)
   d.value.events = evs.slice(0, 60)
   if (ev.action === 'block' && d.value.traffic) d.value.traffic.blk = (d.value.traffic.blk || 0) + 1
+  bumpTrend(ev.ts)
 }
 function openStream() {
   try { es = new EventSource(api.streamUrl()) } catch (e) { return }
@@ -254,9 +284,10 @@ function openStream() {
     reconn = setTimeout(openStream, 3000)   // 断线自动重连
   }
 }
-onMounted(() => { load(); openStream() })
-onBeforeUnmount(() => { if (reconn) clearTimeout(reconn); if (es) es.close(); charts.forEach(c => c.dispose()) })
-window.addEventListener('resize', () => charts.forEach(c => c.resize()))
+let ticker = null
+onMounted(() => { load(); openStream(); ticker = setInterval(rollTrend, 3000) })
+onBeforeUnmount(() => { if (ticker) clearInterval(ticker); if (reconn) clearTimeout(reconn); if (es) es.close(); charts.forEach(c => c.dispose()); if (trendChart) { trendChart.dispose(); trendChart = null } })
+window.addEventListener('resize', () => { charts.forEach(c => c.resize()); if (trendChart) trendChart.resize() })
 </script>
 
 <style scoped>

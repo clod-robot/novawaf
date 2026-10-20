@@ -386,12 +386,14 @@ public class WafRedisService {
         out.put("byRule", byRule);
         out.put("byAction", byAction);
         out.put("topIps", topN(ipCnt, 10));
-        // 趋势转数组
+        // 趋势转数组：固定展示最近10分钟，按分钟桶补零，避免只出现有事件的分钟点
         List<Map<String, Object>> trendArr = new ArrayList<>();
-        trend.forEach((k, v) -> {
+        long curMin = (System.currentTimeMillis() / 1000 / 60) * 60;
+        for (int i = 9; i >= 0; i--) {
+            long t = curMin - i * 60L;
             Map<String, Object> p = new LinkedHashMap<>();
-            p.put("t", k); p.put("count", v); trendArr.add(p);
-        });
+            p.put("t", t); p.put("count", trend.getOrDefault(t, 0L)); trendArr.add(p);
+        }
         out.put("trend", trendArr);
         out.put("events", evs.size() > 30 ? evs.subList(0, 30) : evs);
 
