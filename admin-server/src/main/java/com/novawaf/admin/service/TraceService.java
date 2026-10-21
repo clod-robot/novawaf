@@ -27,6 +27,7 @@ public class TraceService {
 
     static final String K_EVENTS = "novawaf:events";
     static final String K_TRACE_CNT = "novawaf:trace:cnt:";
+    static final String K_EV_IP = "novawaf:ev:";   // 引擎按 IP 保留的攻击明细分桶
     static final String K_TRACE_CAT = "novawaf:trace:cat:";
     private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai"); // 与引擎 localtime 桶一致
     private static final int MAX_SCAN = 1000;    // 与引擎 eventsCap 对齐
@@ -78,10 +79,14 @@ public class TraceService {
     public Map<String, Object> ipDetail(String ip) {
         if (ip == null || !ip.matches("[0-9a-fA-F.:]{2,45}"))
             throw new BusinessException(400, "非法 IP 格式");
-        List<Map<String, Object>> events = readEvents();
-        List<Map<String, Object>> mine = new ArrayList<>();
-        for (Map<String, Object> e : events) {
-            if (ip.equals(str(e.get("ip")))) mine.add(e);
+        // 优先读引擎按 IP 分桶保留的明细（novawaf:ev:{ip}，每 IP 最近 200 条、TTL 24h），
+        // 避免全局环形缓冲被高频流量冲刷后低频 IP 明细完全缺失
+        List<Map<String, Object>> mine = readIpBucket(ip);
+        if (mine.isEmpty()) {
+            List<Map<String, Object>> events = readEvents();
+            for (Map<String, Object> e : events) {
+                if (ip.equals(str(e.get("ip")))) mine.add(e);
+            }
         }
         Map<String, Long> realByIp = new HashMap<>();
         Map<String, Long> realByCat = new HashMap<>();
@@ -152,6 +157,20 @@ public class TraceService {
     }
 
     // ---------------- 聚合内核 ----------------
+
+    // 读取引擎按 IP 分桶保留的攻击明细（novawaf:ev:{ip}）
+    private List<Map<String, Object>> readIpBucket(String ip) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        List<String> raw = redis.opsForList().range(K_EV_IP + ip, 0, -1);
+        if (raw == null) return out;
+        for (String s : raw) {
+            try {
+                Object o = om.readValue(s, Object.class);
+                if (o instanceof Map) out.add((Map<String, Object>) o);
+            } catch (Exception ignore) { /* 跳过坏行 */ }
+        }
+        return out;
+    }
 
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> readEvents() {

@@ -139,10 +139,16 @@ private:
         // 1) 原始事件批量 RPUSH + LTRIM（近期明细窗口，供时间线展示）
         if (!pendingEvents_.empty()) {
             std::vector<std::string> jsons;
+            std::unordered_map<std::string, std::vector<std::string>> byIp;
             jsons.reserve(pendingEvents_.size());
-            for (auto& e : pendingEvents_) jsons.push_back(eventJson(e));
+            for (auto& e : pendingEvents_) {
+                std::string j = eventJson(e);
+                if (!e.ip.empty()) byIp[e.ip].push_back(j);  // 按 IP 分桶（引用同一条 JSON）
+                jsons.push_back(std::move(j));
+            }
             r.rpushMulti("novawaf:events", jsons);
             r.ltrim("novawaf:events", -(int64_t)eventsCap_, -1);
+            flushPerIp(r, byIp);
             pendingEvents_.clear();
         }
         // 2) 溯源真实计数（按天分桶 Hash，与明细窗口无关：不封顶、不被洪水挤占、
@@ -164,6 +170,32 @@ private:
         }
         // 3) 统计快照
         r.set("novawaf:stats", snapshotJson());
+    }
+
+    // 按 IP 分桶保留攻击明细：novawaf:ev:{ip}，每 IP 最近 PER_IP_CAP 条、TTL 24h。
+    // 全局 novawaf:events 是固定长度环形窗口，高频源会在秒级把低频源的明细挤掉；
+    // 分桶后任何 IP 都能回看自己的完整攻击链（溯源抽屉/攻击日志用）。
+    void flushPerIp(RedisClient& r, const std::unordered_map<std::string, std::vector<std::string>>& byIp) {
+        if (byIp.empty()) return;
+        int64_t now = (int64_t)std::time(nullptr);
+        for (auto& kv : byIp) {
+            bool known = ttlMark_.count(kv.first) > 0;
+            // 分桶数量上限保护：避免海量离散源 IP 撑爆 Redis 内存
+            if (!known && ttlMark_.size() >= MAX_IP_BUCKETS) continue;
+            const std::string key = "novawaf:ev:" + kv.first;
+            r.rpushMulti(key, kv.second);
+            r.ltrim(key, -(int64_t)PER_IP_CAP, -1);
+            auto it = ttlMark_.find(kv.first);
+            if (it == ttlMark_.end() || now - it->second >= 60) {  // 每 60s 刷一次 TTL，省命令
+                r.expire(key, 86400);
+                ttlMark_[kv.first] = now;
+            }
+        }
+        if (ttlMark_.size() > MAX_IP_BUCKETS) {
+            for (auto it = ttlMark_.begin(); it != ttlMark_.end();) {
+                if (now - it->second > 3600) it = ttlMark_.erase(it); else ++it;
+            }
+        }
     }
 
     // ---- JSON 序列化（手写，零依赖）----
@@ -274,6 +306,9 @@ private:
     // 溯源分桶增量（自上次成功写入 Redis 的累计；写失败保留，成功后清零）
     std::unordered_map<std::string, uint64_t> perIpDelta_;
     std::unordered_map<std::string, uint64_t> perCatDelta_;
+    std::unordered_map<std::string, int64_t> ttlMark_;  // ip -> 最近刷 TTL 的秒
+    static constexpr int64_t PER_IP_CAP = 200;       // 每 IP 保留的攻击明细条数
+    static constexpr size_t MAX_IP_BUCKETS = 20000;  // 分桶数量上限（内存保护）
 };
 
 }  // namespace novawaf
