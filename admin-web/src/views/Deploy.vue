@@ -41,25 +41,16 @@
       </el-form-item>
       <el-form-item label="节点列表">
         <el-button size="small" type="primary" @click="openAddNode">+ 新增节点</el-button>
-        <el-table :data="nodeList" border size="small" style="margin-top:8px">
-          <el-table-column prop="name" label="名称" min-width="120" />
-          <el-table-column prop="role" label="角色" width="90">
-            <template #default="{ row }">{{ ROLE_TEXT[row.role] || row.role }}</template>
-          </el-table-column>
-          <el-table-column prop="priority" label="优先级" width="90" />
-          <el-table-column prop="ip" label="IP" min-width="140" />
-          <el-table-column label="启用" width="90">
-            <template #default="{ row }">
-              <el-switch v-model="row.enabled" @change="onToggleNode(row)" />
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="120" fixed="right">
-            <template #default="{ row, $index }">
-              <el-button size="small" type="primary" link @click="openEditNode(row, $index)">编辑</el-button>
-              <el-button size="small" type="danger" link @click="delNode($index)">删除</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+        <DataTable :data="nodeList" :columns="nodeColumns" height="240px" style="margin-top:8px">
+          <template #cell-role="{ row }">{{ ROLE_TEXT[row.role] || row.role }}</template>
+          <template #cell-enabled="{ row }">
+            <el-switch v-model="row.enabled" @change="onToggleNode(row)" />
+          </template>
+          <template #cell-op="{ row, index }">
+            <el-button size="small" type="primary" link @click="openEditNode(row, index)">编辑</el-button>
+            <el-button size="small" type="danger" link @click="delNode(index)">删除</el-button>
+          </template>
+        </DataTable>
       </el-form-item>
       <el-form-item label="备注">
         <el-input v-model="ha.remark" type="textarea" :rows="3" maxlength="255" show-word-limit />
@@ -101,6 +92,16 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
+
+const nodeColumns = [
+  { prop: 'name', label: '名称', minWidth: 120 },
+  { prop: 'role', label: '角色', width: 90, slot: 'role' },
+  { prop: 'priority', label: '优先级', width: 90 },
+  { prop: 'ip', label: 'IP', minWidth: 140 },
+  { label: '启用', width: 90, slot: 'enabled', noSearch: true },
+  { label: '操作', width: 120, fixed: 'right', slot: 'op', noSearch: true }
+]
 
 const nat = ref(null)
 const detecting = ref(false)

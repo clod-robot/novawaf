@@ -40,60 +40,40 @@
     </div>
 
     <!-- 表格视图 -->
-    <el-table v-if="!showJson" :data="filtered" size="small" stripe height="480" border>
-      <el-table-column type="expand" width="28">
-        <template #default="{ row }">
-          <div class="detail">
-            <div v-if="row.vulnName"><b>漏洞：</b>{{ row.vulnName }}</div>
-            <div v-if="row.desc"><b>说明：</b>{{ row.desc }}</div>
-            <div v-if="row.cvss"><b>CVSS：</b>{{ row.cvss }} <span v-if="row.year">· {{ row.year }}</span></div>
-            <div v-if="row.ref"><b>参考：</b><a :href="row.ref" target="_blank" class="reflink">{{ row.ref }}</a></div>
-          </div>
-        </template>
-      </el-table-column>
-      <el-table-column prop="id" label="ID" width="60" sortable />
-      <el-table-column label="CVE/CNVD" width="140">
-        <template #default="{ row }">
-          <span v-if="row.cve" class="cve mono">{{ row.cve }}</span>
-          <span v-else class="nocve">-</span>
-        </template>
-      </el-table-column>
-      <el-table-column prop="name" label="规则名称" min-width="200" show-overflow-tooltip />
-      <el-table-column label="影响组件" width="150">
-        <template #default="{ row }"><span v-if="row.component">{{ row.component }}</span><span v-else class="nocve">-</span></template>
-      </el-table-column>
-      <el-table-column label="分组" width="110">
-        <template #default="{ row }">
-          <el-tag size="small" :class="groupCls(row.group)">{{ row.group || '通用攻击特征' }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="严重度" width="90">
-        <template #default="{ row }">
-          <el-tag v-if="row.severity" size="small" :type="sevType(row.severity)" effect="dark">{{ row.severity }}</el-tag>
-          <span v-else class="nocve">-</span>
-        </template>
-      </el-table-column>
-      <el-table-column prop="category" label="类型" width="118">
-        <template #default="{ row }">
-          <el-tag size="small" :type="tagType(row.category)">{{ row.category }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="pattern" label="匹配特征" min-width="210">
-        <template #default="{ row }"><code class="mono">{{ row.pattern }}</code></template>
-      </el-table-column>
-      <el-table-column prop="action" label="动作" width="80">
-        <template #default="{ row }">
-          <el-tag size="small" :type="row.action === 'block' ? 'danger' : row.action === 'pass' ? 'success' : 'info'">
-            {{ row.action }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="启用" width="60">
-        <template #default="{ row }">
-          <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '是' : '否' }}</el-tag>
-        </template>
-      </el-table-column>
-    </el-table>
+    <DataTable v-if="!showJson" :data="filtered" :columns="ruleColumns" height="calc(100vh - 260px)">
+      <template #expand="{ row }">
+        <div class="detail">
+          <div v-if="row.vulnName"><b>漏洞：</b>{{ row.vulnName }}</div>
+          <div v-if="row.desc"><b>说明：</b>{{ row.desc }}</div>
+          <div v-if="row.cvss"><b>CVSS：</b>{{ row.cvss }} <span v-if="row.year">· {{ row.year }}</span></div>
+          <div v-if="row.ref"><b>参考：</b><a :href="row.ref" target="_blank" class="reflink">{{ row.ref }}</a></div>
+        </div>
+      </template>
+      <template #cell-cve="{ row }">
+        <span v-if="row.cve" class="cve mono">{{ row.cve }}</span>
+        <span v-else class="nocve">-</span>
+      </template>
+      <template #cell-component="{ row }"><span v-if="row.component">{{ row.component }}</span><span v-else class="nocve">-</span></template>
+      <template #cell-group="{ row }">
+        <el-tag size="small" :class="groupCls(row.group)">{{ row.group || '通用攻击特征' }}</el-tag>
+      </template>
+      <template #cell-severity="{ row }">
+        <el-tag v-if="row.severity" size="small" :type="sevType(row.severity)" effect="dark">{{ row.severity }}</el-tag>
+        <span v-else class="nocve">-</span>
+      </template>
+      <template #cell-category="{ row }">
+        <el-tag size="small" :type="tagType(row.category)">{{ row.category }}</el-tag>
+      </template>
+      <template #cell-pattern="{ row }"><code class="mono">{{ row.pattern }}</code></template>
+      <template #cell-action="{ row }">
+        <el-tag size="small" :type="row.action === 'block' ? 'danger' : row.action === 'pass' ? 'success' : 'info'">
+          {{ row.action }}
+        </el-tag>
+      </template>
+      <template #cell-enabled="{ row }">
+        <el-tag size="small" :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '是' : '否' }}</el-tag>
+      </template>
+    </DataTable>
     <div v-if="!showJson" class="hint">
       共 {{ rows.length }} 条规则（{{ cveCount }} 个 CVE/CNVD）。点行首箭头查看漏洞详情与参考链接；
       「近5年高危TOP」= 年份≥2021 且 CVSS≥9.0。点「JSON 编辑」可新增/修改后下发，引擎将在 60s 内热加载生效。
@@ -108,6 +88,21 @@
 import { onMounted, ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
+
+const ruleColumns = [
+  { type: 'expand', width: 28 },
+  { prop: 'id', label: 'ID', width: 60, sortable: true },
+  { label: 'CVE/CNVD', width: 140, slot: 'cve' },
+  { prop: 'name', label: '规则名称', minWidth: 200 },
+  { label: '影响组件', width: 150, slot: 'component' },
+  { label: '分组', width: 110, slot: 'group' },
+  { label: '严重度', width: 90, slot: 'severity' },
+  { prop: 'category', label: '类型', width: 118, slot: 'category' },
+  { prop: 'pattern', label: '匹配特征', minWidth: 210, slot: 'pattern' },
+  { prop: 'action', label: '动作', width: 80, slot: 'action' },
+  { label: '启用', width: 60, slot: 'enabled', noSearch: true }
+]
 const json = ref('')
 const showJson = ref(false)
 const kw = ref('')

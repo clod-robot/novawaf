@@ -38,31 +38,24 @@
 
     <!-- 区块二：IP 组列表 -->
     <div class="hud-title" style="margin-top:18px">// IP 组（共 {{ groups.length }} 个组）</div>
-    <el-table :data="groups" border size="small">
-      <el-table-column prop="name" label="名称" min-width="160">
-        <template #default="{ row }">
-          <span>{{ row.name }}</span>
-          <el-tag v-if="row.type === 'threat'" size="small" type="warning" style="margin-left:6px">威胁情报</el-tag>
-          <el-tag v-else size="small" :type="row.action === 'allow' ? 'success' : 'danger'" style="margin-left:6px">
-            {{ row.action === 'allow' ? '放行' : '拦截' }}
-          </el-tag>
-          <el-tag v-if="!row.enabled" size="small" type="info" style="margin-left:6px">已禁用</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="summary" label="内容" min-width="280" show-overflow-tooltip />
-      <el-table-column label="更新时间" width="170">
-        <template #default="{ row }">{{ fmt(row.updateTime) }}</template>
-      </el-table-column>
-      <el-table-column label="操作" width="230" fixed="right">
-        <template #default="{ row }">
-          <el-button size="small" type="primary" link @click="openEntries(row)">条目</el-button>
-          <el-button v-if="row.type === 'threat' || row.sourceUrl" size="small" type="warning" link
-                     :loading="updatingId === row.id" @click="runUpdate(row)">更新</el-button>
-          <el-button size="small" type="primary" link @click="openEditGroup(row)">编辑</el-button>
-          <el-button size="small" type="danger" link @click="delGroup(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+    <DataTable :data="groups" :columns="groupColumns" height="300px">
+      <template #cell-name="{ row }">
+        <span>{{ row.name }}</span>
+        <el-tag v-if="row.type === 'threat'" size="small" type="warning" style="margin-left:6px">威胁情报</el-tag>
+        <el-tag v-else size="small" :type="row.action === 'allow' ? 'success' : 'danger'" style="margin-left:6px">
+          {{ row.action === 'allow' ? '放行' : '拦截' }}
+        </el-tag>
+        <el-tag v-if="!row.enabled" size="small" type="info" style="margin-left:6px">已禁用</el-tag>
+      </template>
+      <template #cell-updateTime="{ row }">{{ fmt(row.updateTime) }}</template>
+      <template #cell-op="{ row }">
+        <el-button size="small" type="primary" link @click="openEntries(row)">条目</el-button>
+        <el-button v-if="row.type === 'threat' || row.sourceUrl" size="small" type="warning" link
+                   :loading="updatingId === row.id" @click="runUpdate(row)">更新</el-button>
+        <el-button size="small" type="primary" link @click="openEditGroup(row)">编辑</el-button>
+        <el-button size="small" type="danger" link @click="delGroup(row)">删除</el-button>
+      </template>
+    </DataTable>
 
     <!-- 组编辑对话框 -->
     <el-dialog v-model="groupDlg" :title="groupForm.id === null ? '添加 IP 组' : '编辑 IP 组'" width="520px" append-to-body>
@@ -107,18 +100,11 @@
         <el-button size="small" type="danger" @click="clearEntries">清空</el-button>
         <span class="sub" style="margin-left:8px">共 {{ entryTotal }} 个</span>
       </div>
-      <el-table :data="entries" border size="small" v-loading="entryLoading">
-        <el-table-column prop="value" label="IP / CIDR" min-width="200" show-overflow-tooltip />
-        <el-table-column label="操作" width="90" fixed="right">
-          <template #default="{ row }">
-            <el-button size="small" type="danger" link @click="delEntry(row.value)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-      <el-pagination v-if="entryTotal > entrySize" style="margin-top:10px;justify-content:flex-end"
-                     layout="prev, pager, next" :total="entryTotal"
-                     :page-size="entrySize" :current-page="entryPage"
-                     @current-change="onEntryPage" />
+      <DataTable :data="entries" :columns="entryColumns" height="360px" v-loading="entryLoading">
+        <template #cell-op="{ row }">
+          <el-button size="small" type="danger" link @click="delEntry(row.value)">删除</el-button>
+        </template>
+      </DataTable>
       <div class="sub" style="margin-top:8px">条目顺序为无序存储（Redis SET），已自动去重。</div>
     </el-drawer>
 
@@ -149,6 +135,14 @@
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
+
+const groupColumns = [
+  { prop: 'name', label: '名称', minWidth: 160, slot: 'name' },
+  { prop: 'summary', label: '内容', minWidth: 280 },
+  { prop: 'updateTime', label: '更新时间', width: 170, slot: 'updateTime', noSearch: true },
+  { label: '操作', width: 230, fixed: 'right', slot: 'op', noSearch: true }
+]
 
 const stats = reactive({ totalRanges: 0, countries: [] })
 const geo = reactive({ mode: 'off', countries: [] })
@@ -159,12 +153,15 @@ const saving = ref(false)
 const groupDlg = ref(false)
 const groupForm = reactive({ id: null, name: '', type: 'custom', action: 'block', sourceUrl: '', remark: '', enabled: true })
 
+const entryColumns = [
+  { prop: 'value', label: 'IP / CIDR', minWidth: 200 },
+  { label: '操作', width: 90, fixed: 'right', slot: 'op', noSearch: true }
+]
+
 const entryDrawer = ref(false)
 const currentGroup = ref(null)
 const entries = ref([])
 const entryTotal = ref(0)
-const entryPage = ref(1)
-const entrySize = 20
 const entryLoading = ref(false)
 const entrySaving = ref(false)
 const addEntryDlg = ref(false)
@@ -262,7 +259,6 @@ async function delGroup(row) {
 // ---------- 条目 ----------
 function openEntries(row) {
   currentGroup.value = row
-  entryPage.value = 1
   entryDrawer.value = true
   loadEntries()
 }
@@ -270,12 +266,11 @@ async function loadEntries() {
   if (!currentGroup.value) return
   entryLoading.value = true
   try {
-    const d = await api.ipGroupEntries(currentGroup.value.id, { page: entryPage.value, size: entrySize })
+    const d = await api.ipGroupEntries(currentGroup.value.id, { page: 1, size: 10000 })
     entries.value = (d && d.items) || []
     entryTotal.value = (d && d.total) || 0
   } catch (e) { /* 错误提示已由响应拦截器统一处理 */ } finally { entryLoading.value = false }
 }
-function onEntryPage(p) { entryPage.value = p; loadEntries() }
 async function addEntry() {
   if (!newEntry.value.trim()) { ElMessage.warning('请输入 IP/CIDR'); return }
   entrySaving.value = true

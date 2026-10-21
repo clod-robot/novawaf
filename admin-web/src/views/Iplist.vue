@@ -26,56 +26,32 @@
     </div>
 
     <!-- 表格 -->
-    <el-table :data="paged" size="small" stripe height="460" border style="margin-top:8px">
-      <el-table-column label="源 IP" min-width="150">
-        <template #default="{ row }">
-          <span class="ip mono">{{ row.ip }}</span>
-          <el-tag size="small" effect="dark" class="geo-tag" :type="geoType(row.geo)">{{ row.geo }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="访问应用" min-width="150">
-        <template #default="{ row }">
-          <span v-if="row.lastHost" class="host mono" :title="row.lastHost">{{ row.lastHost }}</span>
-          <span v-else class="muted">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="动作" width="90">
-        <template #default="{ row }">
-          <el-tag size="small" :type="type === 'black' ? 'danger' : 'success'">
-            {{ type === 'black' ? '拦截' : '放行' }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="来源" width="90">
-        <template #default="{ row }">{{ row.source === 'auto' ? '自动' : '手动' }}</template>
-      </el-table-column>
-      <el-table-column label="命中次数" width="100" sortable :sort-method="(a,b)=>a.hits-b.hits">
-        <template #default="{ row }"><b :class="{ hot: row.hits > 0 }">{{ row.hits || 0 }}</b></template>
-      </el-table-column>
-      <el-table-column label="最近命中" width="170">
-        <template #default="{ row }">{{ row.lastHit ? fmt(row.lastHit) : '—' }}</template>
-      </el-table-column>
-      <el-table-column label="加入时间" width="170">
-        <template #default="{ row }">{{ fmt(row.createdAt) }} · {{ row.createdBy || 'system' }}</template>
-      </el-table-column>
-      <el-table-column label="备注" min-width="140" show-overflow-tooltip>
-        <template #default="{ row }">{{ row.note || '—' }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="80">
-        <template #default="{ row }">
-          <el-switch :model-value="row.enabled !== false" size="small" @change="toggle(row)" />
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="80" fixed="right">
-        <template #default="{ row }">
-          <el-button size="small" type="danger" link @click="del(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
-    <div class="pager">
-      <el-pagination layout="prev, pager, next" :total="filtered.length" :page-size="pageSize"
-        v-model:current-page="page" small />
-    </div>
+    <DataTable :data="filtered" :columns="columns" height="calc(100vh - 230px)">
+      <template #cell-ip="{ row }">
+        <span class="ip mono">{{ row.ip }}</span>
+        <el-tag size="small" effect="dark" class="geo-tag" :type="geoType(row.geo)">{{ row.geo }}</el-tag>
+      </template>
+      <template #cell-lastHost="{ row }">
+        <span v-if="row.lastHost" class="host mono" :title="row.lastHost">{{ row.lastHost }}</span>
+        <span v-else class="muted">—</span>
+      </template>
+      <template #cell-actionType="{ row }">
+        <el-tag size="small" :type="type === 'black' ? 'danger' : 'success'">
+          {{ type === 'black' ? '拦截' : '放行' }}
+        </el-tag>
+      </template>
+      <template #cell-source="{ row }">{{ row.source === 'auto' ? '自动' : '手动' }}</template>
+      <template #cell-hits="{ row }"><b :class="{ hot: row.hits > 0 }">{{ row.hits || 0 }}</b></template>
+      <template #cell-lastHit="{ row }">{{ row.lastHit ? fmt(row.lastHit) : '—' }}</template>
+      <template #cell-createdAt="{ row }">{{ fmt(row.createdAt) }} · {{ row.createdBy || 'system' }}</template>
+      <template #cell-note="{ row }">{{ row.note || '—' }}</template>
+      <template #cell-enabled="{ row }">
+        <el-switch :model-value="row.enabled !== false" size="small" @change="toggle(row)" />
+      </template>
+      <template #cell-op="{ row }">
+        <el-button size="small" type="danger" link @click="del(row)">删除</el-button>
+      </template>
+    </DataTable>
 
     <!-- 新增弹窗 -->
     <el-dialog v-model="showAdd" :title="type==='black'?'新增黑名单 IP':'新增白名单 IP'" width="460px" append-to-body>
@@ -95,24 +71,36 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
 
 const type = ref('black')
 const rows = ref([])
 const q = ref('')
 const sourceFilter = ref('')
 const autoRefresh = ref(true)
-const page = ref(1); const pageSize = 10
 const showAdd = ref(false)
 const form = ref({ ip: '', note: '' })
 let es = null
 
+const columns = [
+  { prop: 'ip', label: '源 IP', minWidth: 150, slot: 'ip' },
+  { prop: 'lastHost', label: '访问应用', minWidth: 150, slot: 'lastHost' },
+  { label: '动作', width: 90, slot: 'actionType', noSearch: true },
+  { prop: 'source', label: '来源', width: 90, slot: 'source' },
+  { prop: 'hits', label: '命中次数', width: 100, sortable: true, slot: 'hits' },
+  { prop: 'lastHit', label: '最近命中', width: 170, slot: 'lastHit', noSearch: true },
+  { prop: 'createdAt', label: '加入时间', width: 170, slot: 'createdAt', noSearch: true },
+  { prop: 'note', label: '备注', minWidth: 140, slot: 'note' },
+  { prop: 'enabled', label: '状态', width: 80, slot: 'enabled', noSearch: true },
+  { label: '操作', width: 80, fixed: 'right', slot: 'op', noSearch: true }
+]
+
 const filtered = computed(() => rows.value.filter(r =>
   (!sourceFilter.value || r.source === sourceFilter.value)))
-const paged = computed(() => filtered.value.slice((page.value - 1) * pageSize, page.value * pageSize))
 const totalHits = computed(() => rows.value.reduce((s, r) => s + (r.hits || 0), 0))
 
 async function load() { rows.value = await api.ipList(type.value, q.value) || [] }
-function switchTo(t) { type.value = t; q.value = ''; sourceFilter.value = ''; page.value = 1; load() }
+function switchTo(t) { type.value = t; q.value = ''; sourceFilter.value = ''; load() }
 
 function geoType(g) {
   if (g === '内网') return 'info'; if (g === '未知') return 'info'

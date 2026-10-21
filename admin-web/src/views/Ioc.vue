@@ -4,16 +4,20 @@
     <el-descriptions :column="3" border size="small" class="meta">
       <el-descriptions-item v-for="(v,k) in meta" :key="k" :label="k">{{ typeof v==='object'?JSON.stringify(v):v }}</el-descriptions-item>
     </el-descriptions>
-    <el-table :data="rows" border size="small" height="460">
-      <el-table-column type="index" width="50" />
-      <el-table-column label="IOC 条目"><template #default="{row}">{{ pretty(row) }}</template></el-table-column>
-    </el-table>
+    <DataTable :data="rows" :columns="iocColumns" height="calc(100vh - 220px)">
+      <template #cell-item="{ row }">{{ pretty(row) }}</template>
+    </DataTable>
   </div>
 </template>
 <script setup>
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
 const rows = ref([]), meta = ref({})
+const iocColumns = [
+  { type: 'index', label: '#', width: 50 },
+  { prop: 'item', label: 'IOC 条目', slot: 'item' }
+]
 function pretty(r){ try{return JSON.stringify(r)}catch{return String(r)} }
 onMounted(async () => { const d = await api.wafIoc(); const ioc = d.ioc; rows.value = Array.isArray(ioc)?ioc.slice(0,500):[]; meta.value = d.meta||{} })
 </script>

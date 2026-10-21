@@ -320,7 +320,7 @@ window.addEventListener('resize', () => { charts.forEach(c => c.resize()); if (t
 .rfill.host { background: linear-gradient(90deg, #00ff9d, #00e5ff); }
 .rfill.page { background: linear-gradient(90deg, #ff4d6d, #ffb020); }
 .rname.wide { width: 160px; }
-.rname.page { width: 240px; font-family: monospace; }
+.rname.page { width: 160px; font-family: monospace; }
 .rval { width: 34px; text-align: right; color: var(--cyan); font-weight: 700; }
 .live .feed { max-height: 250px; overflow: auto; margin-top: 6px; }
 .feed-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(0,229,255,0.12); font-size: 12px; }

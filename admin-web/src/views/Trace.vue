@@ -10,64 +10,48 @@
         <el-option :value="100" label="Top 100" />
         <el-option :value="200" label="Top 200" />
       </el-select>
+      <el-button size="small" type="success" plain @click="exportSummary">导出 CSV</el-button>
       <el-button size="small" @click="load">刷新</el-button>
     </div>
 
     <!-- 攻击源 IP 排行 -->
-    <el-table :data="rows" border size="small" height="560" class="tbl" v-loading="loading">
-      <el-table-column type="index" width="50" />
-      <el-table-column label="攻击源 IP" width="150">
-        <template #default="{ row }">
-          <el-link type="primary" class="mono" @click="openDetail(row.ip)">{{ row.ip }}</el-link>
-        </template>
-      </el-table-column>
-      <el-table-column label="风险分" width="170">
-        <template #default="{ row }">
-          <div class="risk">
-            <el-progress :percentage="row.riskScore" :stroke-width="10" :color="riskColor(row.riskScore)" :show-text="false" style="flex:1" />
-            <span class="score mono" :style="{ color: riskColor(row.riskScore) }">{{ row.riskScore }}</span>
-          </div>
-        </template>
-      </el-table-column>
-      <el-table-column label="等级" width="80" align="center">
-        <template #default="{ row }">
-          <el-tag :type="levelType(row.level)" size="small" effect="dark">{{ row.level }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="攻击次数" width="100" align="right" sortable>
-        <template #default="{ row }">{{ fmtBig(row.count) }}</template>
-      </el-table-column>
-      <el-table-column label="攻击类型画像" min-width="220">
-        <template #default="{ row }">
-          <el-tag v-for="t in row.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="攻击链" width="200">
-        <template #default="{ row }">
-          <span v-for="(s, i) in row.chain" :key="s" class="chain">
-            <span class="stage" :class="'st-' + s">{{ stageText(s) }}</span>
-            <span v-if="i < row.chain.length - 1" class="arrow">→</span>
-          </span>
-        </template>
-      </el-table-column>
-      <el-table-column label="首次 / 最近攻击" width="180">
-        <template #default="{ row }">
-          <div class="ts">{{ fmtTs(row.firstSeen) }}</div>
-          <div class="ts">{{ fmtTs(row.lastSeen) }}</div>
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="110" fixed="right">
-        <template #default="{ row }">
-          <el-button size="small" type="primary" plain @click="openDetail(row.ip)">攻击链</el-button>
-        </template>
-      </el-table-column>
-      <template #empty><span>暂无攻击事件 —— 引擎检测到攻击后自动汇聚溯源</span></template>
-    </el-table>
+    <DataTable :data="rows" :columns="summaryColumns" height="calc(100vh - 220px)" class="tbl" v-loading="loading">
+      <template #cell-ip="{ row }">
+        <el-link type="primary" class="mono" @click="openDetail(row.ip)">{{ row.ip }}</el-link>
+      </template>
+      <template #cell-riskScore="{ row }">
+        <div class="risk">
+          <el-progress :percentage="row.riskScore" :stroke-width="10" :color="riskColor(row.riskScore)" :show-text="false" style="flex:1" />
+          <span class="score mono" :style="{ color: riskColor(row.riskScore) }">{{ row.riskScore }}</span>
+        </div>
+      </template>
+      <template #cell-level="{ row }">
+        <el-tag :type="levelType(row.level)" size="small" effect="dark">{{ row.level }}</el-tag>
+      </template>
+      <template #cell-count="{ row }">{{ fmtBig(row.count) }}</template>
+      <template #cell-tags="{ row }">
+        <el-tag v-for="t in row.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
+      </template>
+      <template #cell-chain="{ row }">
+        <span v-for="(s, i) in row.chain" :key="s" class="chain">
+          <span class="stage" :class="'st-' + s">{{ stageText(s) }}</span>
+          <span v-if="i < row.chain.length - 1" class="arrow">→</span>
+        </span>
+      </template>
+      <template #cell-seen="{ row }">
+        <div class="ts">{{ fmtTs(row.firstSeen) }}</div>
+        <div class="ts">{{ fmtTs(row.lastSeen) }}</div>
+      </template>
+      <template #cell-op="{ row }">
+        <el-button size="small" type="primary" plain @click="openDetail(row.ip)">攻击链</el-button>
+      </template>
+    </DataTable>
     <p class="footnote">
       攻击次数 = 当日真实累计（引擎按天分桶持久计数，不封顶、不被洪水挤占、封禁解除后不清零，跨天自动重置）。
       攻击类型画像来自最近 1000 条明细样本。
       风险分 = 严重度加权（critical 10 / high 5 / medium 2 / low 1）+ 攻击类别多样性 + 频率加成，上限 100。
       攻击链：侦察(recon) → 渗透(exploit) → 入侵(intrusion) → 破坏(impact)，阶段越靠后威胁越大。
+      「导出 CSV」可作为公安电子证据留存。
     </p>
 
     <!-- 单 IP 攻击链详情抽屉 -->
@@ -77,6 +61,8 @@
         <div class="headline">
           <el-tag :type="levelType(detail.level)" effect="dark">{{ detail.level }} · {{ detail.riskScore }} 分</el-tag>
           <el-tag v-for="t in detail.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
+          <span style="flex:1"></span>
+          <el-button size="small" type="success" plain @click="exportIpDetail">导出本 IP 明细</el-button>
         </div>
         <el-descriptions :column="4" border size="small" class="meta">
           <el-descriptions-item label="攻击次数">{{ fmtBig(detail.count) }}</el-descriptions-item>
@@ -96,38 +82,24 @@
 
         <!-- 命中规则 Top -->
         <div class="hud-title" style="margin-top:16px">// 高频命中规则</div>
-        <el-table :data="detail.topRules || []" border size="small" class="tbl">
-          <el-table-column prop="ruleId" label="规则 ID" width="180"><template #default="{ row }"><span class="mono">{{ row.ruleId }}</span></template></el-table-column>
-          <el-table-column prop="count" label="命中次数" width="100" align="right">
-            <template #default="{ row }">{{ fmtBig(row.count) }}</template>
-          </el-table-column>
-          <el-table-column label="占比">
-            <template #default="{ row }">
-              <el-progress :percentage="Math.round(row.count * 100 / detail.count)" :stroke-width="8" color="#00e5ff" />
-            </template>
-          </el-table-column>
-        </el-table>
+        <DataTable :data="detail.topRules || []" :columns="ruleColumns" height="220px" class="tbl">
+          <template #cell-ruleId="{ row }"><span class="mono">{{ row.ruleId }}</span></template>
+          <template #cell-count="{ row }">{{ fmtBig(row.count) }}</template>
+          <template #cell-ratio="{ row }">
+            <el-progress :percentage="Math.round(row.count * 100 / detail.count)" :stroke-width="8" color="#00e5ff" />
+          </template>
+        </DataTable>
 
         <!-- 攻击时间线 -->
         <div class="hud-title" style="margin-top:16px">// 攻击时间线（最近 {{ fmtBig((detail.timeline || []).length) }} / {{ fmtBig(detail.timelineTotal) }} 条）</div>
-        <el-table :data="detail.timeline || []" border size="small" height="340" class="tbl">
-          <el-table-column label="时间" width="165">
-            <template #default="{ row }"><span class="mono">{{ fmtTs(row.ts) }}</span></template>
-          </el-table-column>
-          <el-table-column label="阶段" width="80" align="center">
-            <template #default="{ row }"><span class="stage" :class="'st-' + row.stage">{{ stageText(row.stage) }}</span></template>
-          </el-table-column>
-          <el-table-column prop="category" label="攻击类型" width="120" />
-          <el-table-column prop="ruleId" label="规则" width="130">
-            <template #default="{ row }"><span class="mono">{{ row.ruleId || '-' }}</span></template>
-          </el-table-column>
-          <el-table-column label="动作" width="80" align="center">
-            <template #default="{ row }">
-              <el-tag :type="row.action === 'block' ? 'danger' : 'info'" size="small" effect="dark">{{ actText(row.action) }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="matched" label="命中内容" min-width="200" show-overflow-tooltip />
-        </el-table>
+        <DataTable :data="detail.timeline || []" :columns="tlColumns" height="calc(100vh - 520px)" class="tbl">
+          <template #cell-ts="{ row }"><span class="mono">{{ fmtTs(row.ts) }}</span></template>
+          <template #cell-stage="{ row }"><span class="stage" :class="'st-' + row.stage">{{ stageText(row.stage) }}</span></template>
+          <template #cell-ruleId="{ row }"><span class="mono">{{ row.ruleId || '-' }}</span></template>
+          <template #cell-action="{ row }">
+            <el-tag :type="row.action === 'block' ? 'danger' : 'info'" size="small" effect="dark">{{ actText(row.action) }}</el-tag>
+          </template>
+        </DataTable>
       </div>
     </el-drawer>
   </div>
@@ -137,6 +109,32 @@
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
 import { fmtBig } from '../utils/format'
+import DataTable from '../components/DataTable.vue'
+
+const summaryColumns = [
+  { type: 'index', label: '#', width: 50 },
+  { label: '攻击源 IP', width: 150, slot: 'ip' },
+  { label: '风险分', width: 170, slot: 'riskScore', noSearch: true },
+  { label: '等级', width: 80, align: 'center', slot: 'level' },
+  { label: '攻击次数', width: 100, align: 'right', sortable: true, slot: 'count', noSearch: true },
+  { label: '攻击类型画像', minWidth: 220, slot: 'tags' },
+  { label: '攻击链', width: 200, slot: 'chain' },
+  { label: '首次 / 最近攻击', width: 180, slot: 'seen', noSearch: true },
+  { label: '操作', width: 110, fixed: 'right', slot: 'op', noSearch: true }
+]
+const ruleColumns = [
+  { prop: 'ruleId', label: '规则 ID', width: 180, slot: 'ruleId' },
+  { prop: 'count', label: '命中次数', width: 100, align: 'right', slot: 'count', noSearch: true },
+  { label: '占比', slot: 'ratio', noSearch: true }
+]
+const tlColumns = [
+  { label: '时间', width: 165, slot: 'ts', noSearch: true },
+  { label: '阶段', width: 80, align: 'center', slot: 'stage' },
+  { prop: 'category', label: '攻击类型', width: 120 },
+  { prop: 'ruleId', label: '规则', width: 130, slot: 'ruleId' },
+  { label: '动作', width: 80, align: 'center', slot: 'action', noSearch: true },
+  { prop: 'matched', label: '命中内容', minWidth: 200 }
+]
 
 const rows = ref([]), limit = ref(50), loading = ref(false)
 const scope = ref('加载中…')
@@ -156,6 +154,46 @@ function stageDesc(s) {
 }
 function stepStatus(s) { return s === 'impact' || s === 'intrusion' ? 'error' : 'finish' }
 function actText(a) { return a === 'block' ? '拦截' : a === 'challenge' ? '挑战' : a === 'restore' ? '恢复' : '记录' }
+
+// ---------- CSV 导出（电子证据留存） ----------
+function csvEscape(v) {
+  if (v === null || v === undefined) return ''
+  const s = Array.isArray(v) ? v.join(' | ') : String(v)
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s
+}
+function downloadCsv(filename, header, dataRows) {
+  const bom = '\uFEFF'
+  const csv = [header.join(','), ...dataRows.map(r => r.map(csvEscape).join(','))].join('\r\n')
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = filename; a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+function nowStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+function exportSummary() {
+  if (!rows.value.length) return
+  const header = ['攻击源IP', '风险分', '等级', '攻击次数', '攻击类型画像', '攻击链', '首次攻击', '最近攻击', '导出时间']
+  const ts = nowStamp()
+  const data = rows.value.map(r => [
+    r.ip, r.riskScore, r.level, r.count, (r.tags || []).join('|'), (r.chain || []).map(stageText).join('→'),
+    fmtTs(r.firstSeen), fmtTs(r.lastSeen), ts
+  ])
+  downloadCsv(`溯源_攻击源Top${limit.value}_${ts}.csv`, header, data)
+}
+function exportIpDetail() {
+  const d = detail.value
+  if (!d || !d.ip) return
+  const ts = nowStamp()
+  const header = ['攻击源IP', '时间', '阶段', '攻击类型', '规则', '动作', '命中内容', '导出时间']
+  const data = (d.timeline || []).map(r => [
+    d.ip, fmtTs(r.ts), stageText(r.stage), r.category || '', r.ruleId || '', actText(r.action), r.matched || '', ts
+  ])
+  downloadCsv(`溯源_IP_${d.ip}_${ts}.csv`, header, data)
+}
 
 async function load() {
   loading.value = true

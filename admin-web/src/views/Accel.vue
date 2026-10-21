@@ -32,36 +32,23 @@
 
     <!-- 后端健康 -->
     <div class="hud-title" style="margin-top:18px">// 计算后端健康状态</div>
-    <el-table :data="backendRows" border size="small" class="tbl">
-      <el-table-column prop="name" label="后端" width="140" />
-      <el-table-column label="状态" width="120">
-        <template #default="{ row }">
-          <el-tag :type="stateType(row.state)" size="small" effect="dark">{{ stateText(row.state) }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="detail" label="说明" min-width="200">
-        <template #default="{ row }">{{ row.detail || '—' }}</template>
-      </el-table-column>
-    </el-table>
+    <DataTable :data="backendRows" :columns="backendColumns" height="180px" class="tbl">
+      <template #cell-state="{ row }">
+        <el-tag :type="stateType(row.state)" size="small" effect="dark">{{ stateText(row.state) }}</el-tag>
+      </template>
+      <template #cell-detail="{ row }">{{ row.detail || '—' }}</template>
+    </DataTable>
 
     <!-- 设备清单 -->
     <div class="hud-title" style="margin-top:18px">// 已识别设备</div>
-    <el-table :data="live.devices || []" border size="small" class="tbl">
-      <el-table-column prop="type" label="类型" width="90" />
-      <el-table-column prop="vendor" label="厂商" width="130">
-        <template #default="{ row }">{{ row.vendor || '—' }}</template>
-      </el-table-column>
-      <el-table-column prop="name" label="型号" min-width="240" />
-      <el-table-column prop="backend" label="对应后端" width="110" />
-      <el-table-column prop="computeUnits" label="计算单元" width="90" />
-      <el-table-column label="健康" width="80">
-        <template #default="{ row }">
-          <el-tag :type="row.healthy ? 'success' : 'danger'" size="small" effect="dark">
-            {{ row.healthy ? '正常' : '异常' }}
-          </el-tag>
-        </template>
-      </el-table-column>
-    </el-table>
+    <DataTable :data="live.devices || []" :columns="deviceColumns" height="220px" class="tbl">
+      <template #cell-vendor="{ row }">{{ row.vendor || '—' }}</template>
+      <template #cell-healthy="{ row }">
+        <el-tag :type="row.healthy ? 'success' : 'danger'" size="small" effect="dark">
+          {{ row.healthy ? '正常' : '异常' }}
+        </el-tag>
+      </template>
+    </DataTable>
 
     <!-- 配置下发 -->
     <div class="hud-title" style="margin-top:18px">// 加速配置</div>
@@ -123,6 +110,21 @@ import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 import { fmtBig } from '../utils/format'
+import DataTable from '../components/DataTable.vue'
+
+const backendColumns = [
+  { prop: 'name', label: '后端', width: 140 },
+  { label: '状态', width: 120, slot: 'state' },
+  { prop: 'detail', label: '说明', minWidth: 200, slot: 'detail' }
+]
+const deviceColumns = [
+  { prop: 'type', label: '类型', width: 90 },
+  { label: '厂商', width: 130, slot: 'vendor' },
+  { prop: 'name', label: '型号', minWidth: 240 },
+  { prop: 'backend', label: '对应后端', width: 110 },
+  { prop: 'computeUnits', label: '计算单元', width: 90 },
+  { label: '健康', width: 80, slot: 'healthy', noSearch: true }
+]
 
 const live = ref({ reachable: false, activeBackend: 'Scalar', cpu: {}, devices: [], backends: [], stats: {} })
 const stats = computed(() => live.value.stats || {})

@@ -7,17 +7,13 @@
           <el-button type="primary" @click="loadEvents">刷新</el-button>
           <span class="tip">经 SSE 实时增量，此处为最近 {{ events.length }} 条历史</span>
         </div>
-        <el-table :data="events" border size="small" height="520">
-          <el-table-column type="index" label="#" width="50" />
-          <el-table-column label="时间" width="160"><template #default="{ row }">{{ fmt(row.ts) }}</template></el-table-column>
-          <el-table-column label="动作" width="80"><template #default="{ row }">
+        <DataTable :data="events" :columns="eventColumns" height="calc(100vh - 240px)">
+          <template #cell-ts="{ row }">{{ fmt(row.ts) }}</template>
+          <template #cell-action="{ row }">
             <el-tag size="small" :type="row.action==='block'?'danger':'success'" effect="dark">{{ row.action || 'block' }}</el-tag>
-          </template></el-table-column>
-          <el-table-column prop="category" label="类型" width="110" />
-          <el-table-column prop="ruleId" label="规则" width="120" />
-          <el-table-column prop="ip" label="源 IP" width="150" />
-          <el-table-column label="匹配内容"><template #default="{ row }"><span class="mono">{{ row.matched }}</span></template></el-table-column>
-        </el-table>
+          </template>
+          <template #cell-matched="{ row }"><span class="mono">{{ row.matched }}</span></template>
+        </DataTable>
       </el-tab-pane>
 
       <!-- 运行日志 -->
@@ -26,11 +22,9 @@
           <el-input v-model="kw" placeholder="搜索日志..." style="width:260px" clearable @keyup.enter="loadLogs" />
           <el-button type="primary" @click="loadLogs">检索</el-button>
         </div>
-        <el-table :data="rows" border size="small" height="460">
-          <el-table-column type="index" label="#" width="50" />
-          <el-table-column label="日志内容"><template #default="{ row }"><span class="mono">{{ pretty(row) }}</span></template></el-table-column>
-        </el-table>
-        <el-pagination class="pg" background layout="total, prev, pager, next" :total="total" :page-size="size" :current-page="page" @current-change="(p)=>{page=p;loadLogs()}" />
+        <DataTable :data="rows" :columns="logColumns" height="calc(100vh - 240px)">
+          <template #cell-content="{ row }"><span class="mono">{{ pretty(row) }}</span></template>
+        </DataTable>
       </el-tab-pane>
 
       <!-- Syslog 外发 -->
@@ -84,6 +78,21 @@
 import { onMounted, ref, reactive } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
+
+const eventColumns = [
+  { type: 'index', label: '#', width: 50 },
+  { label: '时间', width: 160, slot: 'ts', noSearch: true },
+  { label: '动作', width: 80, slot: 'action' },
+  { prop: 'category', label: '类型', width: 110 },
+  { prop: 'ruleId', label: '规则', width: 120 },
+  { prop: 'ip', label: '源 IP', width: 150 },
+  { prop: 'matched', label: '匹配内容', slot: 'matched' }
+]
+const logColumns = [
+  { type: 'index', label: '#', width: 50 },
+  { prop: 'content', label: '日志内容', slot: 'content' }
+]
 
 const tab = ref('alert')
 const facs = ['local0','local1','local2','local3','local4','local5','local6','local7','user','daemon','auth','authpriv']
@@ -94,11 +103,11 @@ const events = ref([])
 async function loadEvents() { try { events.value = (await api.wafEvents({ limit: 200 })) || [] } catch {} }
 
 // 运行日志
-const rows = ref([]), total = ref(0), page = ref(1), size = 20, kw = ref('')
+const rows = ref([]), kw = ref('')
 function pretty(r) { try { return JSON.stringify(r) } catch { return String(r) } }
 async function loadLogs() {
-  const d = await api.wafLogs({ page: page.value, size, keyword: kw.value || undefined })
-  rows.value = d.rows || []; total.value = d.total || 0
+  const d = await api.wafLogs({ page: 1, size: 5000, keyword: kw.value || undefined })
+  rows.value = d.rows || []
 }
 
 // Syslog

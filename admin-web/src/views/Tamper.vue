@@ -57,28 +57,14 @@
       <el-button type="danger" size="small" plain style="margin-left:12px"
                  :disabled="!pages.length" @click="onPurgeAll">清除全部基线</el-button>
     </div>
-    <el-table :data="pages" border size="small" height="380" class="tbl">
-      <el-table-column type="index" width="50" />
-      <el-table-column prop="host" label="站点" min-width="140" show-overflow-tooltip />
-      <el-table-column prop="path" label="页面路径" min-width="220" show-overflow-tooltip />
-      <el-table-column label="基线建立时间" width="170">
-        <template #default="{ row }">{{ fmtTs(row.ts) }}</template>
-      </el-table-column>
-      <el-table-column label="大小" width="100" align="right">
-        <template #default="{ row }">{{ fmtSize(row.size) }}</template>
-      </el-table-column>
-      <el-table-column prop="id" label="页面 ID" width="150">
-        <template #default="{ row }"><span class="mono">{{ row.id }}</span></template>
-      </el-table-column>
-      <el-table-column label="操作" width="130" fixed="right">
-        <template #default="{ row }">
-          <el-button type="danger" size="small" plain @click="onPurge(row)">清除重学</el-button>
-        </template>
-      </el-table-column>
-      <template #empty>
-        <span>暂无基线页面 —— 开启总开关并访问受保护页面后自动学习</span>
+    <DataTable :data="pages" :columns="pageColumns" height="calc(100vh - 520px)" class="tbl">
+      <template #cell-ts="{ row }">{{ fmtTs(row.ts) }}</template>
+      <template #cell-size="{ row }">{{ fmtSize(row.size) }}</template>
+      <template #cell-id="{ row }"><span class="mono">{{ row.id }}</span></template>
+      <template #cell-op="{ row }">
+        <el-button type="danger" size="small" plain @click="onPurge(row)">清除重学</el-button>
       </template>
-    </el-table>
+    </DataTable>
     <p class="footnote">
       原理：引擎对 GET + 200 + text/html 的响应建立字节级基线；之后源站页面一旦被篡改，
       引擎立即返回正常缓存内容保障对外展示合规，同时上报告警事件（可在溯源分析中追踪攻击源）。
@@ -92,6 +78,17 @@ import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 import { fmtBig } from '../utils/format'
+import DataTable from '../components/DataTable.vue'
+
+const pageColumns = [
+  { type: 'index', label: '#', width: 50 },
+  { prop: 'host', label: '站点', minWidth: 140 },
+  { prop: 'path', label: '页面路径', minWidth: 220 },
+  { label: '基线建立时间', width: 170, slot: 'ts', noSearch: true },
+  { label: '大小', width: 100, align: 'right', slot: 'size', noSearch: true },
+  { prop: 'id', label: '页面 ID', width: 150, slot: 'id' },
+  { label: '操作', width: 130, fixed: 'right', slot: 'op', noSearch: true }
+]
 
 const pages = ref([]), stats = ref({}), cfg = ref({})
 const form = ref({ enabled: false, ttl: 3600, maxBody: 262144, maxPages: 256, prefixes: [] })

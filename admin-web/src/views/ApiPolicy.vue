@@ -7,39 +7,26 @@
     <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px"
       title="按 URL 路径前缀设置 WAF 处置动作，保存后自动即时发布、引擎约 3 秒内热生效。"
       description="拦截(block)=命中攻击返回 403；仅记录(log)=观察期，命中攻击只记录日志/事件并正常转发，不拦截、不联动封禁；放行(pass)=该路径跳过 WAF 检测（DDoS/限流等体积防护仍生效）。支持末尾 * 通配，如 /api/portal/*，最具体前缀优先。" />
-    <el-table v-loading="loading" :data="list" border size="small">
-      <el-table-column prop="name" label="策略名称" min-width="140" />
-      <el-table-column prop="prefix" label="路径" min-width="200">
-        <template #default="{ row }"><code>{{ row.prefix }}</code></template>
-      </el-table-column>
-      <el-table-column label="动作" width="110">
-        <template #default="{ row }">
-          <el-tag :type="actionTag(row.action)" size="small">{{ actionText(row.action) }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column prop="remark" label="备注" min-width="160" show-overflow-tooltip>
-        <template #default="{ row }">{{ row.remark || '-' }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="90">
-        <template #default="{ row }">
-          <el-tag :type="row.enabled === true ? 'success' : 'info'" size="small">
-            {{ row.enabled === true ? '启用' : '禁用' }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="更新时间" width="170">
-        <template #default="{ row }">{{ fmt(row.updateTime || row.createTime) }}</template>
-      </el-table-column>
-      <el-table-column label="操作" width="200" fixed="right">
-        <template #default="{ row }">
-          <el-button size="small" type="primary" link @click="openEdit(row)">编辑</el-button>
-          <el-button size="small" :type="row.enabled === true ? 'warning' : 'success'" link @click="toggle(row)">
-            {{ row.enabled === true ? '禁用' : '启用' }}
-          </el-button>
-          <el-button size="small" type="danger" link @click="onDelete(row)">删除</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+    <DataTable v-loading="loading" :data="list" :columns="columns" height="calc(100vh - 260px)">
+      <template #cell-prefix="{ row }"><code>{{ row.prefix }}</code></template>
+      <template #cell-action="{ row }">
+        <el-tag :type="actionTag(row.action)" size="small">{{ actionText(row.action) }}</el-tag>
+      </template>
+      <template #cell-remark="{ row }">{{ row.remark || '-' }}</template>
+      <template #cell-enabled="{ row }">
+        <el-tag :type="row.enabled === true ? 'success' : 'info'" size="small">
+          {{ row.enabled === true ? '启用' : '禁用' }}
+        </el-tag>
+      </template>
+      <template #cell-updateTime="{ row }">{{ fmt(row.updateTime || row.createTime) }}</template>
+      <template #cell-op="{ row }">
+        <el-button size="small" type="primary" link @click="openEdit(row)">编辑</el-button>
+        <el-button size="small" :type="row.enabled === true ? 'warning' : 'success'" link @click="toggle(row)">
+          {{ row.enabled === true ? '禁用' : '启用' }}
+        </el-button>
+        <el-button size="small" type="danger" link @click="onDelete(row)">删除</el-button>
+      </template>
+    </DataTable>
 
     <el-dialog v-model="dlg" :title="form.id ? '编辑策略' : '新增策略'" width="480px" append-to-body>
       <el-form label-width="90px">
@@ -75,6 +62,17 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
+import DataTable from '../components/DataTable.vue'
+
+const columns = [
+  { prop: 'name', label: '策略名称', minWidth: 140 },
+  { prop: 'prefix', label: '路径', minWidth: 200, slot: 'prefix' },
+  { label: '动作', width: 110, slot: 'action', noSearch: true },
+  { prop: 'remark', label: '备注', minWidth: 160, slot: 'remark' },
+  { label: '状态', width: 90, slot: 'enabled', noSearch: true },
+  { prop: 'updateTime', label: '更新时间', width: 170, slot: 'updateTime', noSearch: true },
+  { label: '操作', width: 200, fixed: 'right', slot: 'op', noSearch: true }
+]
 
 const loading = ref(false)
 const list = ref([])
