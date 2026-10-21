@@ -129,7 +129,7 @@
     </div>
 
     <!-- 受访页面 TOP -->
-    <div class="mecha-panel">
+    <div class="mecha-panel page-panel">
       <div class="hud-title">受访页面 · TOP</div>
       <div class="rank">
         <div v-for="r in d.topPages" :key="r.name" class="rank-row">
@@ -304,6 +304,8 @@ window.addEventListener('resize', () => { charts.forEach(c => c.resize()); if (t
 .qps-chart { height: 36px; margin-top: 2px; }
 .main-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
 .main-grid .mecha-panel { padding: 14px; }
+/* 受访页面面板直接挂在 .dash 下，需单独补内边距，否则标题贴左边缘、与其他面板标题不齐 */
+.page-panel { padding: 14px; }
 .span2 { grid-column: span 2; }
 .chart { height: 230px; }
 .chart.big { height: 250px; }

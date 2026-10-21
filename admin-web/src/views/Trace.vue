@@ -10,7 +10,7 @@
         <el-option :value="100" label="Top 100" />
         <el-option :value="200" label="Top 200" />
       </el-select>
-      <el-button size="small" type="success" plain @click="exportSummary">导出 CSV</el-button>
+      <el-button size="small" type="success" plain :loading="exporting" @click="exportSummary">导出证据包</el-button>
       <el-button size="small" @click="load">刷新</el-button>
     </div>
 
@@ -51,7 +51,7 @@
       攻击类型画像来自最近 1000 条明细样本。
       风险分 = 严重度加权（critical 10 / high 5 / medium 2 / low 1）+ 攻击类别多样性 + 频率加成，上限 100。
       攻击链：侦察(recon) → 渗透(exploit) → 入侵(intrusion) → 破坏(impact)，阶段越靠后威胁越大。
-      「导出 CSV」可作为公安电子证据留存。
+      「导出证据包」会同时生成明文 CSV 与 AES-256-GCM 加密包（32 位随机密码仅显示一次、不做任何保存），可用于公安电子证据留存与防篡改校验。
     </p>
 
     <!-- 单 IP 攻击链详情抽屉 -->
@@ -62,7 +62,7 @@
           <el-tag :type="levelType(detail.level)" effect="dark">{{ detail.level }} · {{ detail.riskScore }} 分</el-tag>
           <el-tag v-for="t in detail.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
           <span style="flex:1"></span>
-          <el-button size="small" type="success" plain @click="exportIpDetail">导出本 IP 明细</el-button>
+          <el-button size="small" type="success" plain :loading="exporting" @click="exportIpDetail">导出本 IP 证据包</el-button>
         </div>
         <el-descriptions :column="4" border size="small" class="meta">
           <el-descriptions-item label="攻击次数">{{ fmtBig(detail.count) }}</el-descriptions-item>
@@ -102,14 +102,48 @@
         </DataTable>
       </div>
     </el-drawer>
+
+    <!-- 一次性密码弹窗：密码不保存，关闭即销毁 -->
+    <el-dialog v-model="pwdOpen" title="加密证据包已生成 · 密码仅显示一次" width="660px" :close-on-click-modal="false"
+               @closed="closePwd">
+      <el-alert type="error" :closable="false" show-icon
+                title="密码不保存在任何位置（不写本地存储、不上传后端），关闭本窗口后无法找回。请立即抄录或复制，并与证据文件分开保管。" />
+      <div class="pwd-block">
+        <div class="pwd-label">文件</div>
+        <div class="pwd-files">
+          <div><span class="mono">{{ pwdInfo.csvFile }}</span> <span class="muted">— 明文 CSV（可阅卷，改动会与下方摘要不一致）</span></div>
+          <div><span class="mono">{{ pwdInfo.encFile }}</span> <span class="muted">— AES-256 加密包（无密码不可查看/修改，{{ pwdInfo.bytes }} 字节明文）</span></div>
+        </div>
+        <div class="pwd-label">加密密码（32 位强密码）</div>
+        <div class="pwd-row">
+          <el-input :model-value="pwdInfo.password" readonly class="mono pwd-input" />
+          <el-button type="primary" @click="copyPwd">复制密码</el-button>
+        </div>
+        <div class="pwd-label">明文 SHA-256 摘要</div>
+        <div class="pwd-row">
+          <el-input :model-value="pwdInfo.digest" readonly class="mono pwd-input" />
+          <el-button @click="copyDigest">复制摘要</el-button>
+        </div>
+        <p class="pwd-note">
+          校验方法：对明文 CSV 计算 SHA-256，结果须与上方摘要完全一致；不一致说明文件已被篡改。
+          加密包采用 PBKDF2-HMAC-SHA256 派生密钥 + AES-256-CBC 加密，并对密文做 HMAC-SHA256 认证，
+          密文被改动 1 字节即校验失败、无法解密。
+        </p>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="closePwd">我已记录密码，关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import { fmtBig } from '../utils/format'
 import DataTable from '../components/DataTable.vue'
+import { genPassword, encryptEvidence, download, copyText, operatorName, nowStamp, buildCsv } from '../utils/evidence'
 
 const summaryColumns = [
   { type: 'index', label: '#', width: 50 },
@@ -155,45 +189,65 @@ function stageDesc(s) {
 function stepStatus(s) { return s === 'impact' || s === 'intrusion' ? 'error' : 'finish' }
 function actText(a) { return a === 'block' ? '拦截' : a === 'challenge' ? '挑战' : a === 'restore' ? '恢复' : '记录' }
 
-// ---------- CSV 导出（电子证据留存） ----------
-function csvEscape(v) {
-  if (v === null || v === undefined) return ''
-  const s = Array.isArray(v) ? v.join(' | ') : String(v)
-  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s
+// ---------- 证据导出（明文 CSV + AES-256 加密证据包，密码一次性显示不保存） ----------
+const exporting = ref(false)
+const pwdOpen = ref(false)
+const pwdInfo = ref({ password: '', digest: '', encFile: '', csvFile: '', bytes: 0 })
+
+async function doExport(filenameBase, header, dataRows) {
+  if (!dataRows.length) { ElMessage.warning('当前没有可导出的数据'); return }
+  exporting.value = true
+  try {
+    const ts = nowStamp()
+    const csvFile = `${filenameBase}_${ts}.csv`
+    const csv = buildCsv(header, dataRows)
+    // 1) 明文 CSV（UTF-8 BOM，Excel 可直接打开；内容任何改动都会与 SHA-256 摘要不一致）
+    download(csvFile, '\uFEFF' + csv, 'text/csv;charset=utf-8')
+    // 2) AES-256 加密证据包：无密码无法查看/修改，密文改动 1 字节即 MAC 校验失败
+    const password = genPassword(32)
+    const enc = await encryptEvidence(csv, password, { filename: csvFile, operator: operatorName() })
+    download(csvFile + '.enc', enc.text)
+    // 3) 密码仅在此处一次性展示，不写 localStorage / 不上送后端
+    pwdInfo.value = { password, digest: enc.digest, encFile: csvFile + '.enc', csvFile, bytes: enc.bytes }
+    pwdOpen.value = true
+  } catch (e) {
+    ElMessage.error('加密证据包生成失败：' + (e && e.message ? e.message : e))
+  } finally { exporting.value = false }
 }
-function downloadCsv(filename, header, dataRows) {
-  const bom = '\uFEFF'
-  const csv = [header.join(','), ...dataRows.map(r => r.map(csvEscape).join(','))].join('\r\n')
-  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url; a.download = filename; a.click()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-function nowStamp() {
-  const d = new Date(), p = n => String(n).padStart(2, '0')
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-}
-function exportSummary() {
-  if (!rows.value.length) return
-  const header = ['攻击源IP', '风险分', '等级', '攻击次数', '攻击类型画像', '攻击链', '首次攻击', '最近攻击', '导出时间']
-  const ts = nowStamp()
+
+async function exportSummary() {
+  const header = ['攻击源IP', '风险分', '等级', '攻击次数', '攻击类型画像', '攻击链', '首次攻击', '最近攻击', '导出操作人', '导出时间']
+  const ts = new Date().toLocaleString('zh-CN', { hour12: false })
+  const op = operatorName()
   const data = rows.value.map(r => [
     r.ip, r.riskScore, r.level, r.count, (r.tags || []).join('|'), (r.chain || []).map(stageText).join('→'),
-    fmtTs(r.firstSeen), fmtTs(r.lastSeen), ts
+    fmtTs(r.firstSeen), fmtTs(r.lastSeen), op, ts
   ])
-  downloadCsv(`溯源_攻击源Top${limit.value}_${ts}.csv`, header, data)
+  await doExport(`溯源_攻击源Top${limit.value}`, header, data)
 }
-function exportIpDetail() {
+
+async function exportIpDetail() {
   const d = detail.value
   if (!d || !d.ip) return
-  const ts = nowStamp()
-  const header = ['攻击源IP', '时间', '阶段', '攻击类型', '规则', '动作', '命中内容', '导出时间']
+  const header = ['攻击源IP', '时间', '阶段', '攻击类型', '规则', '动作', '命中内容', '风险分', '等级', '导出操作人', '导出时间']
+  const ts = new Date().toLocaleString('zh-CN', { hour12: false })
+  const op = operatorName()
   const data = (d.timeline || []).map(r => [
-    d.ip, fmtTs(r.ts), stageText(r.stage), r.category || '', r.ruleId || '', actText(r.action), r.matched || '', ts
+    d.ip, fmtTs(r.ts), stageText(r.stage), r.category || '', r.ruleId || '', actText(r.action),
+    r.matched || '', d.riskScore, d.level, op, ts
   ])
-  downloadCsv(`溯源_IP_${d.ip}_${ts}.csv`, header, data)
+  await doExport(`溯源_IP_${d.ip}`, header, data)
 }
+
+async function copyPwd() {
+  const ok = await copyText(pwdInfo.value.password)
+  ElMessage[ok ? 'success' : 'error'](ok ? '密码已复制' : '复制失败，请手动选中复制')
+}
+async function copyDigest() {
+  const ok = await copyText(pwdInfo.value.digest)
+  ElMessage[ok ? 'success' : 'error'](ok ? 'SHA-256 已复制' : '复制失败，请手动选中复制')
+}
+function closePwd() { pwdOpen.value = false; pwdInfo.value = { password: '', digest: '', encFile: '', csvFile: '', bytes: 0 } }
 
 async function load() {
   loading.value = true
@@ -230,6 +284,14 @@ onMounted(load)
 .st-other { color: var(--muted); border-color: var(--line); }
 .footnote { margin-top: 12px; font-size: 12px; color: var(--muted); line-height: 1.8; }
 .drawer-body { padding: 0 4px 20px; }
+.pwd-block { margin-top: 14px; }
+.pwd-label { font-size: 12px; color: var(--muted); margin: 14px 0 6px; letter-spacing: 1px; }
+.pwd-files { font-size: 12px; line-height: 1.9; color: #cfe9ff; }
+.pwd-row { display: flex; gap: 10px; align-items: center; }
+.pwd-input { flex: 1; }
+.pwd-input :deep(.el-input__inner) { font-family: monospace; letter-spacing: 1px; }
+.pwd-note { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.8; }
+.muted { color: var(--muted); }
 .headline { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .meta { margin-bottom: 4px; }
 .steps { margin-top: 12px; }
