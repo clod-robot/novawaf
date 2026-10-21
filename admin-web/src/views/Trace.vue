@@ -62,6 +62,9 @@
           <el-tag :type="levelType(detail.level)" effect="dark">{{ detail.level }} · {{ detail.riskScore }} 分</el-tag>
           <el-tag v-for="t in detail.tags" :key="t" size="small" effect="plain" class="tag">{{ t }}</el-tag>
           <span style="flex:1"></span>
+          <el-date-picker v-model="range" type="datetimerange" size="small" range-separator="至"
+                          start-placeholder="开始时间" end-placeholder="结束时间" value-format="X"
+                          style="width:330px;margin-right:8px" @change="reloadDetail" />
           <el-button size="small" type="success" plain :loading="exporting" @click="exportIpDetail">导出本 IP 证据包</el-button>
         </div>
         <el-descriptions :column="4" border size="small" class="meta">
@@ -173,6 +176,8 @@ const tlColumns = [
 const rows = ref([]), limit = ref(50), loading = ref(false)
 const scope = ref('加载中…')
 const drawer = ref(false), detail = ref({})
+const range = ref(null)   // [from_epoch_sec, to_epoch_sec]
+const currentIp = ref('')
 
 function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '-' }
 function riskColor(s) { return s >= 70 ? '#f56c6c' : s >= 40 ? '#e6a23c' : s >= 20 ? '#c8b73c' : '#67c23a' }
@@ -259,8 +264,16 @@ async function load() {
   finally { loading.value = false }
 }
 async function openDetail(ip) {
+  currentIp.value = ip
+  range.value = null
   detail.value = await api.traceIp(ip)
   drawer.value = true
+}
+async function reloadDetail() {
+  if (!currentIp.value) return
+  const from = range.value && range.value[0] ? Number(range.value[0]) : undefined
+  const to = range.value && range.value[1] ? Number(range.value[1]) : undefined
+  detail.value = await api.traceIp(currentIp.value, from, to)
 }
 onMounted(load)
 </script>

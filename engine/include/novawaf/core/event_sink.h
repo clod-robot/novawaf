@@ -148,6 +148,10 @@ private:
             }
             r.rpushMulti("novawaf:events", jsons);
             r.ltrim("novawaf:events", -(int64_t)eventsCap_, -1);
+            // 归档消费队列：admin-server 定时消费落 MySQL（任意 IP 任意时段完整溯源）。
+            // 容量 50000 兜底：admin 宕机期间不丢事件，恢复后追平。
+            r.rpushMulti("novawaf:ev:archive", jsons);
+            r.ltrim("novawaf:ev:archive", -50000, -1);
             flushPerIp(r, byIp);
             pendingEvents_.clear();
         }

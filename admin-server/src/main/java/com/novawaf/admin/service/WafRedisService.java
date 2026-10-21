@@ -334,6 +334,33 @@ public class WafRedisService {
         return out;
     }
 
+    /** 攻击源真实计数(今天+昨天分桶合并): 与 TraceService 同源, 供仪表盘攻击源 TOP 使用 */
+    private Map<String, Long> traceCntByIp() {
+        Map<String, Long> byIp = new HashMap<>();
+        java.time.LocalDate today = java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai"));
+        for (java.time.LocalDate d : new java.time.LocalDate[]{today, today.minusDays(1)}) {
+            String day = d.toString().replace("-", "");
+            Map<Object, Object> cnt = redis.opsForHash().entries("novawaf:trace:cnt:" + day);
+            for (Map.Entry<Object, Object> en : cnt.entrySet())
+                byIp.merge(String.valueOf(en.getKey()), toLong(en.getValue()), Long::sum);
+        }
+        return byIp;
+    }
+
+    /** 实时 QPS 采样环形序列(novawaf:qps:ring, 每次 dashboard 调用采 1 点, 保留 120 点) */
+    private List<Long> sampleQpsRing(long qps) {
+        try {
+            redis.opsForList().rightPush("novawaf:qps:ring", String.valueOf(qps));
+            redis.opsForList().trim("novawaf:qps:ring", -120, -1);
+            List<String> raw = redis.opsForList().range("novawaf:qps:ring", 0, -1);
+            List<Long> out = new ArrayList<>();
+            if (raw != null) for (String s : raw) out.add(toLong(s));
+            return out;
+        } catch (Exception e) {
+            return List.of(qps);
+        }
+    }
+
     /** 仪表盘聚合: 真实对接流量统计 + 攻击事件 */
     @SuppressWarnings("unchecked")
     public Map<String, Object> dashboard() {
@@ -362,15 +389,16 @@ public class WafRedisService {
         traffic.put("ip", ips.size()); traffic.put("blk", blk); traffic.put("a4", a4);
         traffic.put("a5", a5); traffic.put("atk", atk.size()); traffic.put("qps", qps);
         out.put("traffic", traffic);
+        // QPS 采样序列(环形 120 点): 供实时 QPS 走势图, 页面刷新后立即可见历史曲线
+        out.put("qpsSeries", sampleQpsRing(qps));
 
         // 2) 全局统计
         Object stats = getJson("novawaf:stats");
         out.put("stats", stats == null ? Map.of() : stats);
 
-        // 3) 基于 events 的聚合(趋势/类型/规则/动作/TopIP)
+        // 3) 基于 events 的聚合(趋势/类型/规则/动作)
         List<Object> evs = events(500);
         Map<String, Long> byCat = new HashMap<>(), byRule = new HashMap<>(), byAction = new HashMap<>();
-        Map<String, Long> ipCnt = new HashMap<>();
         TreeMap<Long, Long> trend = new TreeMap<>();
         for (Object e : evs) {
             if (!(e instanceof Map)) continue;
@@ -378,14 +406,15 @@ public class WafRedisService {
             inc(byCat, str(ev.get("category")));
             inc(byRule, str(ev.get("ruleId")));
             inc(byAction, str(ev.get("action")));
-            inc(ipCnt, str(ev.get("ip")));
             long ts = toLong(ev.get("ts"));
             if (ts > 0) inc(trend, (ts / 60) * 60); // 按分钟桶
         }
         out.put("byCategory", byCat);
         out.put("byRule", byRule);
         out.put("byAction", byAction);
-        out.put("topIps", topN(ipCnt, 10));
+        // 攻击源 TOP 改读引擎按天分桶的真实累计(novawaf:trace:cnt:YYYYMMDD, HINCRBY 持久计数,
+        // 不封顶/不被高频源从明细窗口挤占): 修复 events 环形窗口被高频攻击源刷满后只剩单一 IP 的问题
+        out.put("topIps", topN(traceCntByIp(), 10));
         // 趋势转数组：固定展示最近10分钟，按分钟桶补零，避免只出现有事件的分钟点
         List<Map<String, Object>> trendArr = new ArrayList<>();
         long curMin = (System.currentTimeMillis() / 1000 / 60) * 60;

@@ -23,6 +23,7 @@ import java.util.*;
 @RequiredArgsConstructor
 public class TraceService {
     private final StringRedisTemplate redis;
+    private final com.novawaf.admin.mapper.WafAttackEventMapper archiveMapper;
     private final ObjectMapper om = new ObjectMapper();
 
     static final String K_EVENTS = "novawaf:events";
@@ -76,18 +77,35 @@ public class TraceService {
 
     // ---------------- 单 IP 攻击链详情 ----------------
 
-    public Map<String, Object> ipDetail(String ip) {
+    public Map<String, Object> ipDetail(String ip) { return ipDetail(ip, null, null); }
+
+    /**
+     * 单 IP 攻击链时间线。数据源三层合并去重：
+     *   1) MySQL 归档(waf_attack_event): 任意时段完整历史(AttackArchiveService 每 10s 从引擎归档队列落库)
+     *   2) Redis 按 IP 分桶(novawaf:ev:{ip}): 最近 24h 热数据, 补齐归档消费延迟(≤10s)内的最新事件
+     *   3) Redis 全局窗口(novawaf:events): 分桶为空时的兜底
+     * from/to 为 epoch 秒, 均可空(空=不限); 指定时段时以归档为主, 实现任意时段完整回看。
+     */
+    public Map<String, Object> ipDetail(String ip, Long from, Long to) {
         if (ip == null || !ip.matches("[0-9a-fA-F.:]{2,45}"))
             throw new BusinessException(400, "非法 IP 格式");
-        // 优先读引擎按 IP 分桶保留的明细（novawaf:ev:{ip}，每 IP 最近 200 条、TTL 24h），
-        // 避免全局环形缓冲被高频流量冲刷后低频 IP 明细完全缺失
-        List<Map<String, Object>> mine = readIpBucket(ip);
+        // 1) MySQL 归档(任意时段完整历史, 上限 5000 条防大响应)
+        List<Map<String, Object>> mine = new ArrayList<>(readArchive(ip, from, to, 5000));
+        // 2) Redis 分桶热数据合并(去重)
+        Set<String> seen = new HashSet<>();
+        for (Map<String, Object> e : mine) seen.add(dedupKey(e));
+        for (Map<String, Object> e : readIpBucket(ip)) {
+            if (!inRange(e, from, to)) continue;
+            if (seen.add(dedupKey(e))) mine.add(e);
+        }
+        // 3) 分桶为空时回退全局明细窗口
         if (mine.isEmpty()) {
-            List<Map<String, Object>> events = readEvents();
-            for (Map<String, Object> e : events) {
-                if (ip.equals(str(e.get("ip")))) mine.add(e);
+            for (Map<String, Object> e : readEvents()) {
+                if (ip.equals(str(e.get("ip"))) && inRange(e, from, to)) mine.add(e);
             }
         }
+        long archived = 0;
+        try { archived = archiveMapper.countByIp(ip); } catch (Exception ignore) { /* 表初始化中 */ }
         Map<String, Long> realByIp = new HashMap<>();
         Map<String, Long> realByCat = new HashMap<>();
         readBuckets(realByIp, realByCat);
@@ -114,8 +132,8 @@ public class TraceService {
         }
 
         List<Map<String, Object>> timeline = new ArrayList<>();
-        int from = Math.max(0, mine.size() - MAX_TIMELINE);
-        for (int i = from; i < mine.size(); i++) {
+        int startIdx = Math.max(0, mine.size() - MAX_TIMELINE);
+        for (int i = startIdx; i < mine.size(); i++) {
             Map<String, Object> e = mine.get(i);
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("ts", toLong(e.get("ts")));
@@ -132,6 +150,7 @@ public class TraceService {
         out.put("count", shown);
         out.put("realCount", real);
         out.put("sampleCount", agg.count);
+        out.put("archivedCount", archived);   // MySQL 归档总条数(该 IP 全量历史规模)
         out.put("riskScore", agg.riskScore(shown));
         out.put("level", agg.level(shown));
         out.put("topRules", topN(rules, 5));
@@ -139,6 +158,28 @@ public class TraceService {
         out.put("timeline", timeline);
         out.put("timelineTotal", mine.size());
         return out;
+    }
+
+    // ---------------- MySQL 归档读取(任意时段完整历史) ----------------
+
+    private List<Map<String, Object>> readArchive(String ip, Long from, Long to, int limit) {
+        try {
+            return archiveMapper.selectByIp(ip, from, to, limit);
+        } catch (Exception e) {
+            return new ArrayList<>(); // 表初始化中/库异常时降级, 不阻断热数据路径
+        }
+    }
+
+    /** 事件去重键(与归档表 dedup 同规则: ip|ts|ruleId|matched) */
+    private static String dedupKey(Map<String, Object> e) {
+        return str(e.get("ip")) + "|" + toLong(e.get("ts")) + "|" + str(e.get("ruleId")) + "|" + str(e.get("matched"));
+    }
+
+    /** 事件是否落在 [from, to] 时段内(epoch 秒, null 不限) */
+    private static boolean inRange(Map<String, Object> e, Long from, Long to) {
+        long ts = toLong(e.get("ts"));
+        if (from != null && ts < from) return false;
+        return to == null || ts <= to;
     }
 
     // ---------------- 分桶真实计数(今天+昨天) ----------------

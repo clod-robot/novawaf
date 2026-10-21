@@ -34,13 +34,21 @@
       </div>
 
       <div class="mecha-panel">
-        <div class="hud-title">攻击源 IP · TOP</div>
+        <div class="hud-title">
+          攻击源 IP · TOP
+          <el-tooltip placement="top" effect="dark" :show-after="80"
+                      content="该 IP 当日累计触发的攻击/拦截次数。数据来自引擎按天分桶的持久计数（不封顶、不会被高频攻击源挤占），跨天自动清零。低频攻击源也会真实呈现。">
+            <el-icon class="tip-ic"><QuestionFilled /></el-icon>
+          </el-tooltip>
+        </div>
         <div class="rank">
           <div v-for="(r,i) in d.topIps" :key="r.name" class="rank-row">
             <span class="rk" :class="'rk'+(i+1)">{{ i+1 }}</span>
             <span class="rname">{{ r.name }}</span>
             <div class="rbar"><div class="rfill" :style="{width: pct(r.value, maxIp)+'%'}"></div></div>
-            <span class="rval">{{ fmtBig(r.value) }}</span>
+            <el-tooltip placement="left" effect="dark" :content="r.name + ' 当日累计攻击/拦截 ' + fmtBig(r.value) + ' 次'">
+              <span class="rval">{{ fmtBig(r.value) }}</span>
+            </el-tooltip>
           </div>
           <div v-if="!d.topIps || !d.topIps.length" class="empty">暂无数据</div>
         </div>
@@ -239,9 +247,22 @@ function drawDonut(el, data, colors) {
 }
 function drawQps() {
   const c = echarts.init(qpsEl.value); charts.push(c)
-  const data = Array.from({ length: 20 }, () => Math.round(Math.random() * (d.value.traffic?.qps || 1) * 3))
-  c.setOption({ grid: { left: 0, right: 0, top: 4, bottom: 0 }, xAxis: { show: false }, yAxis: { show: false },
-    series: [{ type: 'bar', data, barWidth: '55%', itemStyle: { color: '#00e5ff', borderRadius: [2,2,0,0] } }] })
+  // 真实采样序列(后端环形 120 点): 平滑面积图 + 末端辉光点, 数据多时也清晰
+  const raw = Array.isArray(d.value.qpsSeries) && d.value.qpsSeries.length ? d.value.qpsSeries : [0]
+  const data = raw.map(v => Math.max(0, Number(v) || 0))
+  c.setOption({
+    grid: { left: 0, right: 6, top: 6, bottom: 0 }, xAxis: { show: false, type: 'category', boundaryGap: false },
+    yAxis: { show: false, type: 'value', min: 0 },
+    tooltip: { trigger: 'axis', formatter: p => 'QPS ' + fmtBig(p[0].data),
+      backgroundColor: 'rgba(7,11,18,0.92)', borderColor: '#2a4a6a', textStyle: { color: '#cfe9ff', fontSize: 11 } },
+    series: [{ type: 'line', data, smooth: 0.6, symbol: 'none', sampling: 'lttb',
+      lineStyle: { color: '#00e5ff', width: 2, shadowColor: 'rgba(0,229,255,0.8)', shadowBlur: 8 },
+      areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+        { offset: 0, color: 'rgba(0,229,255,0.55)' }, { offset: 0.7, color: 'rgba(0,229,255,0.10)' },
+        { offset: 1, color: 'rgba(0,229,255,0)' }]) },
+      markPoint: { symbol: 'circle', symbolSize: 7, label: { show: false },
+        itemStyle: { color: '#00ff9d', shadowColor: '#00ff9d', shadowBlur: 10 },
+        data: [{ coord: [data.length - 1, data[data.length - 1]] }] } }] })
 }
 
 async function load() {
@@ -324,6 +345,7 @@ window.addEventListener('resize', () => { charts.forEach(c => c.resize()); if (t
 .rname.wide { width: 160px; }
 .rname.page { width: 160px; font-family: monospace; }
 .rval { width: 34px; text-align: right; color: var(--cyan); font-weight: 700; }
+.tip-ic { font-size: 12px; color: var(--muted); margin-left: 4px; vertical-align: -1px; cursor: help; }
 .live .feed { max-height: 250px; overflow: auto; margin-top: 6px; }
 .feed-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(0,229,255,0.12); font-size: 12px; }
 .fcat { color: #ffb020; width: 90px; }

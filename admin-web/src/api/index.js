@@ -115,6 +115,6 @@ export const api = {
   tamperPurge: (id) => http.post('/tamper/purge', { id }),
   // 攻击溯源分析：攻击源 IP 排行 + 单 IP 攻击链时间线
   traceSummary: (limit) => http.get('/trace/summary', { params: { limit } }),
-  traceIp: (ip) => http.get('/trace/ip/' + encodeURIComponent(ip))
+  traceIp: (ip, from, to) => http.get('/trace/ip/' + encodeURIComponent(ip), { params: { from, to } })
 }
 export default http

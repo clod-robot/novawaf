@@ -23,7 +23,9 @@ public class TraceController {
 
     @RequirePerms("waf:trace:list")
     @GetMapping("/ip/{ip}")
-    public Result<Map<String, Object>> ipDetail(@PathVariable String ip) {
-        return Result.ok(trace.ipDetail(ip));
+    public Result<Map<String, Object>> ipDetail(@PathVariable String ip,
+                                                @RequestParam(required = false) Long from,
+                                                @RequestParam(required = false) Long to) {
+        return Result.ok(trace.ipDetail(ip, from, to));
     }
 }
