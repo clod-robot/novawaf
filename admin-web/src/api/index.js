@@ -16,25 +16,33 @@ http.interceptors.request.use((cfg) => {
   return cfg
 })
 
+// 401 全局锁：多个并发请求同时 401 时只弹一次提示、只跳一次登录
+let _401_lock = false
+function handle401(msg) {
+  if (_401_lock) return Promise.reject(new Error('401 suppressed'))
+  _401_lock = true
+  localStorage.removeItem('nova_authed')
+  ElMessage.warning(msg || '登录已过期, 请重新登录')
+  setTimeout(() => {
+    _401_lock = false
+    router.replace('/login')
+  }, 600)
+  return Promise.reject(new Error('401 redirect'))
+}
+
 http.interceptors.response.use(
   (resp) => {
     const body = resp.data
     if (body && typeof body === 'object' && 'code' in body) {
       if (body.code === 200) return body.data
-      if (body.code === 401) {
-        localStorage.removeItem('nova_authed')
-        router.replace('/login')
-      }
+      if (body.code === 401) return handle401(body.msg)
       ElMessage.error(body.msg || '请求失败')
       return Promise.reject(body)
     }
     return body
   },
   (err) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem('nova_authed')
-      router.replace('/login')
-    }
+    if (err.response?.status === 401) return handle401(err.response?.data?.msg)
     ElMessage.error(err.response?.data?.msg || err.message || '网络错误')
     return Promise.reject(err)
   }
