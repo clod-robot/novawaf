@@ -47,6 +47,7 @@ public:
         std::string path;
         std::string referer;
         std::string country;
+        std::string policyId;      // 命中的 API 防护策略 ID（按策略统计访问/拦截/放行次数）
         bool        keepAlive = false;   // 客户端连接是否复用(keep-alive)
         // 转发完成回调（在 IO 线程执行）：keepAlive=true 时由回调把客户端 fd 重新挂回 epoll；
         // keepAlive=false 时回调负责关闭 fd。为空则沿用旧行为(直接关闭)。
@@ -178,7 +179,7 @@ private:
             writeAll(ctx.clientFd, outResp);
             relay(ctx.clientFd, ufd);
             connPool_.discard(ufd);
-            if (ctx.statsEnabled) emitStat(ctx, respStatus(outResp), false);
+            if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
             finishClient(ctx);
             return;
         }
@@ -190,7 +191,7 @@ private:
         }
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
         setResponseConnection(outResp, ctx.keepAlive);
-        if (ctx.statsEnabled) emitStat(ctx, respStatus(outResp), false);
+        if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
         finishClient(ctx);
     }
@@ -201,6 +202,7 @@ private:
         tr.appId = ctx.appId; tr.status = status; tr.blocked = blocked; tr.attack = false;
         tr.ip = ctx.clientIp; tr.sid = ctx.sid; tr.ua = ctx.ua; tr.host = ctx.host;
         tr.path = ctx.path; tr.referer = ctx.referer; tr.country = ctx.country;
+        tr.policyId = ctx.policyId;
         TrafficSink::instance().emit(std::move(tr));
     }
 

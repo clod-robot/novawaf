@@ -1,8 +1,9 @@
 // NovaWAF - API 路径级防护策略（联动管理控制台 novawaf:pathpolicy）
 // 数据来源：Redis JSON 数组，元素：
-//   {"id":1,"name":"portal-observe","prefix":"/api/portal/*","action":"log","enabled":true}
+//   {"id":1,"appId":"1","name":"portal-observe","prefix":"/api/portal/*","action":"log","enabled":true}
 //   action: "block"=拦截(默认)  "log"=仅记录/观察(命中攻击只记事件不拦截、不联动封禁)
 //            "pass"=跳过 WAF 检测直接放行(等同该路径白名单；DDoS/限流等体积防护仍生效)
+//   appId: 所属应用 ID；为空表示全部应用(全局策略)。按 Host 选中的应用不同则互不干扰。
 // 匹配：prefix 支持末尾 '*' 通配；否则按目录前缀匹配(/a 命中 /a 与 /a/...)；最长(最具体)前缀优先。
 // 热加载：版本号 novawaf:pathpolicy:version 变化时整体原子替换，热路径 match 无锁。
 #pragma once
@@ -21,6 +22,12 @@ namespace novawaf {
 class PathPolicy {
 public:
     enum class Verdict { NONE, BLOCK, LOG, PASS };
+
+    /** 匹配结果：命中策略的处置动作 + 策略 ID（策略 ID 用于按策略累计访问/拦截/放行次数）。 */
+    struct Match {
+        Verdict verdict = Verdict::NONE;
+        std::string id;
+    };
 
     static PathPolicy& instance() { static PathPolicy inst; return inst; }
 
@@ -53,6 +60,12 @@ public:
                         else if (act.str == "pass") m.verdict = Verdict::PASS;
                         else                        m.verdict = Verdict::BLOCK;
                     }
+                    const JsonValue& idv = it.at("id");
+                    if (idv.isNumber())      m.id = std::to_string((long long)idv.num);
+                    else if (idv.isString()) m.id = idv.str;
+                    const JsonValue& appv = it.at("appId");
+                    if (appv.isString())      m.appId = trim(appv.str);
+                    else if (appv.isNumber()) m.appId = std::to_string((long long)appv.num);
                     next->items.push_back(std::move(m));
                 }
             }
@@ -65,26 +78,30 @@ public:
         return n;
     }
 
-    // 返回路径命中的策略动作；未命中返回 NONE。
-    Verdict match(const std::string& path) const {
+    // 返回路径命中的策略；未命中返回 verdict=NONE。appId 为当前请求归属应用（空=未匹配到应用）。
+    // 应用隔离：策略配置了 appId 时仅对其所属应用生效；appId 为空的策略对所有应用生效。
+    Match match(const std::string& path, const std::string& appId) const {
         auto s = snap_.load(std::memory_order_acquire);
-        if (!s || s->items.empty() || path.empty()) return Verdict::NONE;
+        if (!s || s->items.empty() || path.empty()) return {};
         for (const auto& m : s->items) {
+            if (!m.appId.empty() && m.appId != appId) continue;
             if (m.wildcard) {
                 if (path.size() >= m.matchBase.size() &&
-                    path.compare(0, m.matchBase.size(), m.matchBase) == 0) return m.verdict;
+                    path.compare(0, m.matchBase.size(), m.matchBase) == 0) return {m.verdict, m.id};
             } else {
-                if (path == m.matchBase) return m.verdict;
+                if (path == m.matchBase) return {m.verdict, m.id};
                 if (path.size() > m.matchBase.size() &&
                     path.compare(0, m.matchBase.size(), m.matchBase) == 0 &&
-                    path[m.matchBase.size()] == '/') return m.verdict;
+                    path[m.matchBase.size()] == '/') return {m.verdict, m.id};
             }
         }
-        return Verdict::NONE;
+        return {};
     }
 
 private:
     struct Item {
+        std::string id;         // 策略 ID（计数用）
+        std::string appId;      // 所属应用 ID；空=全部应用
         std::string prefix;     // 原始(归一化)前缀
         std::string matchBase;  // 去掉末尾 '*' 后的匹配基串
         bool wildcard = false;
@@ -93,11 +110,16 @@ private:
     struct Snapshot { std::vector<Item> items; };
     std::atomic<std::shared_ptr<Snapshot>> snap_{std::make_shared<Snapshot>()};
 
-    static std::string normalize(std::string p) {
-        // 去空白；统一不以 '/' 开头时补 '/'；不允许包含空格等畸形输入
+    static std::string trim(std::string p) {
         while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(p.begin());
         while (!p.empty() && (p.back() == ' ' || p.back() == '\t' || p.back() == '\r' || p.back() == '\n'))
             p.pop_back();
+        return p;
+    }
+
+    static std::string normalize(std::string p) {
+        // 去空白；统一不以 '/' 开头时补 '/'；不允许包含空格等畸形输入
+        p = trim(std::move(p));
         if (p.empty()) return p;
         if (p[0] != '/') p.insert(p.begin(), '/');
         return p;

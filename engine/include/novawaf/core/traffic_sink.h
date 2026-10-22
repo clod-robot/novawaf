@@ -3,6 +3,7 @@
 // 存储：
 //   novawaf:traffic:{appId}      LIST，每完成分钟一个桶 JSON（保留 44640 ≈ 31 天）
 //   novawaf:traffic:stat:{appId} STRING，每秒覆写：实时 QPS + 当前进行中分钟桶
+//   novawaf:pathpolicy:stat      HASH，按 API 防护策略累计：{id}|hit 命中次数、{id}|blk 拦截次数、{id}|pass 放行次数
 // 桶 JSON：{"t":分钟epoch,"req":N,"pv":N,"blk":N,"a4":N,"a5":N,"sess":[..],"ip":[..],"atk":[..]}
 #pragma once
 #include "novawaf/core/mpmc_queue.h"
@@ -38,6 +39,7 @@ struct TrafficReq {
     std::string path;     // 受访页面 path（含 query）
     std::string referer;  // 来源域名（Referer 头）
     std::string country;  // GeoIP 国家代码
+    std::string policyId; // 命中的 API 防护策略 ID（空=未命中；用于策略访问/拦截/放行计数）
 };
 
 class TrafficSink {
@@ -70,6 +72,10 @@ private:
         uint64_t req = 0, blk = 0, a4 = 0, a5 = 0;
         std::unordered_set<std::string> sess, ip, atk;
     };
+    /** 单条策略自上次落库以来的增量 */
+    struct PolicyStat {
+        uint64_t hit = 0, blk = 0, pass = 0;
+    };
 
     void loop() {
         auto lastSnap = std::chrono::steady_clock::now();
@@ -89,6 +95,12 @@ private:
         TrafficReq e; int n = 0;
         while (queue_.dequeue(e) && n < 20000) {
             ++n;
+            // 策略计数：与是否开启应用统计无关，命中策略即累计（拦截 vs 放行由最终处置决定）
+            if (!e.policyId.empty()) {
+                auto& ps = policyStat_[e.policyId];
+                ps.hit++;
+                if (e.blocked) ps.blk++; else ps.pass++;
+            }
             if (e.appId.empty()) continue;
             int64_t minute = e.ts / 60;
             auto& b = cur_[e.appId];
@@ -139,6 +151,15 @@ private:
         }
         // 访问明细批量落库（环形上限，避免无限增长）
         flushAccess(r);
+        // API 防护策略计数：每秒把增量累加到 Hash（跨重启不丢失，策略删除后由管理端清理）
+        if (!policyStat_.empty()) {
+            for (auto& kv : policyStat_) {
+                if (kv.second.hit)  r.hincrby("novawaf:pathpolicy:stat", kv.first + "|hit",  (int64_t)kv.second.hit);
+                if (kv.second.blk)  r.hincrby("novawaf:pathpolicy:stat", kv.first + "|blk",  (int64_t)kv.second.blk);
+                if (kv.second.pass) r.hincrby("novawaf:pathpolicy:stat", kv.first + "|pass", (int64_t)kv.second.pass);
+            }
+            policyStat_.clear();
+        }
     }
 
     void flushAccess(RedisClient& r) {
@@ -207,6 +228,7 @@ private:
     std::unordered_map<std::string, MinBucket> cur_;
     std::unordered_map<std::string, std::deque<std::pair<int64_t,uint64_t>>> qps_;
     std::vector<std::string> accessBuf_;  // 访问明细攒批
+    std::unordered_map<std::string, PolicyStat> policyStat_;  // 策略 ID -> 自上次落库以来的增量
 };
 
 } // namespace novawaf

@@ -688,10 +688,11 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     const App* app = apps ? app_reg::select(*apps, hostHdr) : nullptr;
                     std::string appId = app ? app->id : "";
                     int appMode = app ? app->mode : 0; // 0防护 1观察 2维护
-                    // API 路径级防护策略：仅记录(log)/放行(pass)，最长前缀匹配（控制台热配置）
-                    PathPolicy::Verdict pathVerdict = PathPolicy::instance().match(req.path);
-                    const bool policyPass = (pathVerdict == PathPolicy::Verdict::PASS); // 跳过WAF检测
-                    const bool policyLog  = (pathVerdict == PathPolicy::Verdict::LOG);  // 命中只记录不拦截
+                    // API 路径级防护策略：仅记录(log)/放行(pass)，按应用隔离 + 最长前缀匹配（控制台热配置）
+                    PathPolicy::Match pathMatch = PathPolicy::instance().match(req.path, appId);
+                    const std::string policyId = pathMatch.id;  // 命中策略 ID，用于按策略统计访问/拦截/放行次数
+                    const bool policyPass = (pathMatch.verdict == PathPolicy::Verdict::PASS); // 跳过WAF检测
+                    const bool policyLog  = (pathMatch.verdict == PathPolicy::Verdict::LOG);  // 命中只记录不拦截
                     // 维护页（静态，仅构造一次）
                     static const std::string kMaint = []{
                         std::string b = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>系统维护中</title>"
@@ -721,6 +722,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             ctx.ua = hdrCi(req, "User-Agent"); ctx.host = hdrCi(req, "Host");
                             ctx.path = req.path; ctx.referer = hdrCi(req, "Referer");
                             ctx.country = geo.country(req.clientIp);
+                            ctx.policyId = policyId;
                             ctx.keepAlive = keepAlive;
                             // 异步转发完成(在 IO 线程)：keep-alive 则重新挂回 epoll 复用，否则关闭。
                             // 注：ddos 并发计数由转发器的 onDisconnect 统一释放，此处不重复。
@@ -916,8 +918,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
                     if (newSess && !outResp.empty())
                         injectHeader(outResp, "Set-Cookie: novasid=" + sid + "; Path=/; HttpOnly");
-                    // 流量统计埋点（仅已启用统计的应用；热路径入队不阻塞）
-                    if (app && app->statsEnabled) {
+                    // 流量统计埋点（已启用统计的应用，或命中 API 防护策略需按策略计数；热路径入队不阻塞）
+                    if ((app && app->statsEnabled) || !policyId.empty()) {
                         TrafficReq tr;
                         tr.ts = (int64_t)std::time(nullptr);
                         tr.appId = appId; tr.status = respStatus(outResp);
@@ -928,6 +930,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         tr.path = req.path;
                         tr.referer = hdrCi(req, "Referer");
                         tr.country = geo.country(req.clientIp);
+                        tr.policyId = policyId;
                         TrafficSink::instance().emit(std::move(tr));
                     }
                     _mark();  // [6] 后置处理(封禁/事件/统计/注入Cookie)结束，进入回写

@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS sys_login_log (
 CREATE TABLE IF NOT EXISTS waf_api_policy (
   id          BIGINT       NOT NULL AUTO_INCREMENT,
   name        VARCHAR(64)  NOT NULL COMMENT '策略名称',
+  app_id      VARCHAR(32)  DEFAULT NULL COMMENT '所属应用ID(NULL=全部应用)',
   prefix      VARCHAR(255) NOT NULL COMMENT '路径前缀，末尾*为通配',
   action      VARCHAR(16)  NOT NULL DEFAULT 'block' COMMENT '动作: block拦截/log仅记录/pass放行',
   enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用',
@@ -106,7 +107,8 @@ CREATE TABLE IF NOT EXISTS waf_api_policy (
   create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  UNIQUE KEY uk_prefix (prefix)
+  UNIQUE KEY uk_app_prefix (app_id, prefix),
+  KEY idx_app (app_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='API路径级防护策略';
 
 -- ---------- 部署方式-HA配置(单行 id=1；保存后发布 Redis novawaf:deploy:config) ----------
