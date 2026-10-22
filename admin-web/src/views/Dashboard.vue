@@ -199,6 +199,8 @@ function tagType(a) { return a === 'block' ? 'danger' : (a === 'pass' ? 'success
 
 function baseGrid() { return { left: 44, right: 16, top: 24, bottom: 28 } }
 function axisStyle() { return { axisLabel: { color: '#6f8bb0' }, axisLine: { lineStyle: { color: '#2a4a6a' } }, splitLine: { lineStyle: { color: 'rgba(0,229,255,0.08)' } } } }
+// 图表悬浮提示统一深色：避免默认白底浅字在暗色主题下看不清
+function darkTip(extra) { return { backgroundColor: 'rgba(14,25,41,0.95)', borderColor: 'rgba(0,229,255,0.4)', borderWidth: 1, textStyle: { color: '#e8f4ff', fontSize: 12 }, ...extra } }
 
 // ===== 攻击拦截趋势：以本机系统当前分钟为锚，固定展示最近10个分钟桶，每分钟自动往后滚 =====
 const trendWin = ref([])   // [{t, count}]，t 为分钟起始秒
@@ -207,7 +209,7 @@ function curMin() { return Math.floor(Date.now() / 60000) * 60 }
 function updateTrendChart() {
   if (!trendChart) return
   const xs = trendWin.value.map(p => fmt(p.t)), ys = trendWin.value.map(p => p.count)
-  trendChart.setOption({ grid: baseGrid(), tooltip: { trigger: 'axis' },
+  trendChart.setOption({ grid: baseGrid(), tooltip: darkTip({ trigger: 'axis' }),
     xAxis: { type: 'category', data: xs, ...axisStyle() },
     yAxis: { type: 'value', ...axisStyle() },
     series: [{ type: 'line', smooth: true, data: ys, symbol: 'none', lineStyle: { color: '#00e5ff', width: 2 },
@@ -240,7 +242,7 @@ function drawTrend() {
 }
 function drawDonut(el, data, colors) {
   const c = echarts.init(el.value); charts.push(c)
-  c.setOption({ tooltip: { trigger: 'item' }, legend: { textStyle: { color: '#9fc4e8' }, bottom: 0, type: 'scroll' },
+  c.setOption({ tooltip: darkTip({ trigger: 'item' }), legend: { textStyle: { color: '#9fc4e8' }, bottom: 0, type: 'scroll' },
     series: [{ type: 'pie', radius: ['42%', '68%'], center: ['50%', '44%'], data,
       label: { color: '#cfe9ff', fontSize: 11 }, itemStyle: { borderColor: '#070b12', borderWidth: 2 }, color: colors }] })
   return c
@@ -253,8 +255,7 @@ function drawQps() {
   c.setOption({
     grid: { left: 0, right: 6, top: 6, bottom: 0 }, xAxis: { show: false, type: 'category', boundaryGap: false },
     yAxis: { show: false, type: 'value', min: 0 },
-    tooltip: { trigger: 'axis', formatter: p => 'QPS ' + fmtBig(p[0].data),
-      backgroundColor: 'rgba(7,11,18,0.92)', borderColor: '#2a4a6a', textStyle: { color: '#cfe9ff', fontSize: 11 } },
+    tooltip: darkTip({ trigger: 'axis', formatter: p => 'QPS ' + fmtBig(p[0].data) }),
     series: [{ type: 'line', data, smooth: 0.6, symbol: 'none', sampling: 'lttb',
       lineStyle: { color: '#00e5ff', width: 2, shadowColor: 'rgba(0,229,255,0.8)', shadowBlur: 8 },
       areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [

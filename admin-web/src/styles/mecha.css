@@ -89,6 +89,11 @@ body {
 /* 下拉/日期等 popper 浮层 */
 .el-popper.is-light { background: var(--bg2) !important; border-color: var(--line) !important; color: var(--text) !important; }
 .el-popper.is-light .el-popper__arrow::before { background: var(--bg2) !important; border-color: var(--line) !important; }
+/* tooltip(effect=dark)：EP 默认 is-dark 背景取 --el-text-color-primary，本项目将其覆盖为浅色字色后
+   会导致白底白字完全看不清；显式锁定深色底+亮青边框+浅色文字 */
+.el-popper.is-dark { background: #0e1929 !important; border: 1px solid var(--line) !important; color: var(--text) !important;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.55) !important; }
+.el-popper.is-dark .el-popper__arrow::before { background: #0e1929 !important; border: 1px solid var(--line) !important; }
 .el-select-dropdown__item { color: var(--text) !important; }
 .el-select-dropdown__item.is-hovering, .el-select-dropdown__item:hover { background: rgba(0,229,255,0.10) !important; }
 .el-select-dropdown__item.is-selected { color: var(--cyan) !important; }
