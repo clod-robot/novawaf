@@ -124,12 +124,15 @@ struct StageTimer {
 };
 
 // 态势统计：拦截事件发布到事件总线（观察者模式），由各订阅者异步消费，热路径不阻塞
+// uri/host 随事件携带，归档后可按 API(host+uri) 维度统计拦截量
 static void emitEvt(const std::string& ip, const std::string& cat,
                     const std::string& action, const std::string& ruleId,
-                    const std::string& matched) {
+                    const std::string& matched,
+                    const std::string& uri = "", const std::string& host = "") {
     AttackEvent e;
     e.ts = (int64_t)std::time(nullptr);
     e.ip = ip; e.category = cat; e.action = action; e.ruleId = ruleId; e.matched = matched;
+    e.uri = uri; e.host = host;
     EventBus<AttackEvent>::instance().publish(e);
 }
 
@@ -799,13 +802,13 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         // 请求速率超限 → 触发封禁链路，返回 429
                         outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                         shield.recordBlock();
-                        emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit");
+                        emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "DDoS", "rate");
                         tBlocked = true;
                     } else if (!limiter.allow(req.clientIp)) {
                         outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
                         shield.recordBlock();
-                        emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit");
+                        emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "RateLimit", "rate");
                         tBlocked = true;
                     } else {
@@ -835,7 +838,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
                                 emitEvt(req.clientIp, "IpList", "block", "IP-BLACK",
-                                        std::string("blacklisted ip ") + req.clientIp);
+                                        std::string("blacklisted ip ") + req.clientIp, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                                 break;
                             default: break;
@@ -849,7 +852,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, tr->category, "block", tr->ruleId, tr->matched);
+                                emitEvt(req.clientIp, tr->category, "block", tr->ruleId, tr->matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -865,7 +868,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, "Geo", "block", gr->ruleId, gr->matched);
+                                emitEvt(req.clientIp, "Geo", "block", gr->ruleId, gr->matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -882,7 +885,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
                                 if (cr.action == Action::BLOCK) shield.recordBlock();
-                                emitEvt(req.clientIp, "CC", cr.action == Action::BLOCK ? "block" : "challenge", cr.ruleId, cr.matched);
+                                emitEvt(req.clientIp, "CC", cr.action == Action::BLOCK ? "block" : "challenge", cr.ruleId, cr.matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -900,7 +903,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
                                          "Content-Length: 0\r\n\r\n";
                                 if (br.action == Action::BLOCK) shield.recordBlock();
-                                emitEvt(req.clientIp, "Bot", br.action == Action::BLOCK ? "block" : "challenge", br.ruleId, br.matched);
+                                emitEvt(req.clientIp, "Bot", br.action == Action::BLOCK ? "block" : "challenge", br.ruleId, br.matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -915,7 +918,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                        "Content-Length: 44\r\n\r\n"
                                        "<html><body>Blocked by NovaWAF</body></html>";
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, dr.category, "block", dr.ruleId, dr.matched);
+                                emitEvt(req.clientIp, dr.category, "block", dr.ruleId, dr.matched, req.path, hdrCi(req, "Host"));
                                 tBlocked = true; tAttack = true;
                             } else {
                                 asyncHandled = forwardToApp();

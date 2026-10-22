@@ -142,6 +142,8 @@ public class TraceService {
             row.put("ruleId", str(e.get("ruleId")));
             row.put("matched", str(e.get("matched")));
             row.put("severity", str(e.get("severity")));
+            row.put("uri", str(e.get("uri")));
+            row.put("host", str(e.get("host")));
             row.put("stage", stageOf(str(e.get("category"))));
             timeline.add(row);
         }
@@ -158,6 +160,28 @@ public class TraceService {
         out.put("timeline", timeline);
         out.put("timelineTotal", mine.size());
         return out;
+    }
+
+    // ---------------- 按 API(host+uri) 维度统计 ----------------
+
+    /**
+     * 按 API(host+uri) 聚合攻击/拦截量(读 MySQL 归档, 任意时段), 用于评估防护策略效果:
+     * 哪些接口被攻击最多、拦截了多少、多少独立攻击源。
+     * 注意: uri/host 字段自 2026-10-22 起由引擎随事件携带, 此前的归档事件该字段为空、不计入统计。
+     */
+    public Map<String, Object> uriStats(Long from, Long to, int limit) {
+        if (limit <= 0) limit = 100;
+        if (limit > 500) limit = 500;
+        List<Map<String, Object>> rows;
+        try {
+            rows = archiveMapper.selectUriStats(from, to, limit);
+        } catch (Exception e) {
+            rows = new ArrayList<>(); // 表初始化中/列未补齐时降级
+        }
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("rows", rows);
+        resp.put("note", "统计自 MySQL 归档(waf_attack_event), 仅含 2026-10-22 升级后携带 uri 的事件");
+        return resp;
     }
 
     // ---------------- MySQL 归档读取(任意时段完整历史) ----------------

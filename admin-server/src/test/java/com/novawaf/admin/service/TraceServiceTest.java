@@ -28,12 +28,13 @@ class TraceServiceTest {
     @Mock private StringRedisTemplate redis;
     @Mock private ListOperations<String, String> listOps;
     @Mock private HashOperations<String, Object, Object> hashOps;
+    @Mock private com.novawaf.admin.mapper.WafAttackEventMapper archiveMapper;
 
     private TraceService service;
 
     @BeforeEach
     void setUp() {
-        service = new TraceService(redis);
+        service = new TraceService(redis, archiveMapper);
         lenient().when(redis.opsForList()).thenReturn(listOps);
         lenient().when(redis.opsForHash()).thenReturn(hashOps);
         // 默认分桶为空(绝大多数用例只测窗口样本逻辑)

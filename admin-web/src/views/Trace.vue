@@ -1,5 +1,8 @@
 <template>
   <div class="mecha-panel p">
+    <el-tabs v-model="tab" class="trace-tabs">
+      <!-- ============ 页签 1：攻击源 IP 排行 ============ -->
+      <el-tab-pane label="攻击源 IP 排行" name="ip">
     <!-- 状态栏 -->
     <div class="bar">
       <span class="hud-inline">// 攻击源 IP 排行（{{ scope }}）</span>
@@ -53,6 +56,38 @@
       攻击链：侦察(recon) → 渗透(exploit) → 入侵(intrusion) → 破坏(impact)，阶段越靠后威胁越大。
       「导出证据包」会同时生成明文 CSV 与 AES-256-GCM 加密包（32 位随机密码仅显示一次、不做任何保存），可用于公安电子证据留存与防篡改校验。
     </p>
+      </el-tab-pane>
+
+      <!-- ============ 页签 2：API 维度统计 ============ -->
+      <el-tab-pane label="API 维度统计" name="api">
+    <div class="bar">
+      <span class="hud-inline">// 按 API(Host + URI) 统计攻击/拦截量（评估防护策略效果）</span>
+      <span style="flex:1"></span>
+      <el-date-picker v-model="apiRange" type="datetimerange" size="small" range-separator="至"
+                      start-placeholder="开始时间" end-placeholder="结束时间" value-format="X"
+                      style="width:330px;margin-right:8px" @change="loadApiStats" />
+      <el-button size="small" @click="resetApiRange">今天</el-button>
+      <el-button size="small" @click="loadApiStats">刷新</el-button>
+    </div>
+    <DataTable :data="apiRows" :columns="apiColumns" height="calc(100vh - 260px)" class="tbl" v-loading="apiLoading">
+      <template #cell-host="{ row }"><span class="mono">{{ row.host || '-' }}</span></template>
+      <template #cell-uri="{ row }"><span class="mono">{{ row.uri }}</span></template>
+      <template #cell-total="{ row }"><span class="num hit">{{ fmtBig(row.total) }}</span></template>
+      <template #cell-blocked="{ row }"><span class="num blk">{{ fmtBig(row.blocked) }}</span></template>
+      <template #cell-challenged="{ row }"><span class="num chal">{{ fmtBig(row.challenged) }}</span></template>
+      <template #cell-attackers="{ row }">{{ fmtBig(row.attackers) }}</template>
+      <template #cell-blockRate="{ row }">
+        <el-progress :percentage="blockRate(row)" :stroke-width="8" color="#ff6b81" />
+      </template>
+      <template #cell-lastTs="{ row }"><span class="mono">{{ fmtTs(row.lastTs) }}</span></template>
+    </DataTable>
+    <p class="footnote">
+      数据来源：MySQL 攻击事件归档（waf_attack_event，引擎实时事件逐条落库，任意时段可查）。
+      攻击次数 = 该 API 命中的攻击事件总数；拦截 = action=block；挑战 = action=challenge（人机验证）；攻击源 = 去重后的独立攻击 IP 数。
+      注意：uri/host 字段自 2026-10-22 升级起由引擎随事件携带，此前的历史归档无此字段、不计入本统计。
+    </p>
+      </el-tab-pane>
+    </el-tabs>
 
     <!-- 单 IP 攻击链详情抽屉 -->
     <el-drawer v-model="drawer" :title="'攻击链溯源 // ' + (detail.ip || '')" size="62%" destroy-on-close>
@@ -99,6 +134,7 @@
           <template #cell-ts="{ row }"><span class="mono">{{ fmtTs(row.ts) }}</span></template>
           <template #cell-stage="{ row }"><span class="stage" :class="'st-' + row.stage">{{ stageText(row.stage) }}</span></template>
           <template #cell-ruleId="{ row }"><span class="mono">{{ row.ruleId || '-' }}</span></template>
+          <template #cell-uri="{ row }"><span class="mono">{{ row.uri ? (row.host || '') + row.uri : '-' }}</span></template>
           <template #cell-action="{ row }">
             <el-tag :type="row.action === 'block' ? 'danger' : 'info'" size="small" effect="dark">{{ actText(row.action) }}</el-tag>
           </template>
@@ -170,11 +206,24 @@ const tlColumns = [
   { prop: 'category', label: '攻击类型', width: 120 },
   { prop: 'ruleId', label: '规则', width: 130, slot: 'ruleId' },
   { label: '动作', width: 80, align: 'center', slot: 'action', noSearch: true },
+  { prop: 'uri', label: '目标 URI', minWidth: 220, slot: 'uri' },
   { prop: 'matched', label: '命中内容', minWidth: 200 }
+]
+const apiColumns = [
+  { prop: 'host', label: 'Host', width: 150, slot: 'host' },
+  { prop: 'uri', label: 'URI', minWidth: 240, slot: 'uri' },
+  { label: '攻击次数', width: 100, align: 'right', slot: 'total', noSearch: true },
+  { label: '拦截', width: 90, align: 'right', slot: 'blocked', noSearch: true },
+  { label: '挑战', width: 90, align: 'right', slot: 'challenged', noSearch: true },
+  { label: '攻击源数', width: 90, align: 'right', slot: 'attackers', noSearch: true },
+  { label: '拦截率', minWidth: 120, slot: 'blockRate', noSearch: true },
+  { label: '最近攻击', width: 165, slot: 'lastTs', noSearch: true }
 ]
 
 const rows = ref([]), limit = ref(50), loading = ref(false)
 const scope = ref('加载中…')
+const tab = ref('ip')
+const apiRows = ref([]), apiLoading = ref(false), apiRange = ref(null)
 const drawer = ref(false), detail = ref({})
 const range = ref(null)   // [from_epoch_sec, to_epoch_sec]
 const currentIp = ref('')
@@ -234,12 +283,12 @@ async function exportSummary() {
 async function exportIpDetail() {
   const d = detail.value
   if (!d || !d.ip) return
-  const header = ['攻击源IP', '时间', '阶段', '攻击类型', '规则', '动作', '命中内容', '风险分', '等级', '导出操作人', '导出时间']
+  const header = ['攻击源IP', '时间', '阶段', '攻击类型', '规则', '动作', '目标URI', '命中内容', '风险分', '等级', '导出操作人', '导出时间']
   const ts = new Date().toLocaleString('zh-CN', { hour12: false })
   const op = operatorName()
   const data = (d.timeline || []).map(r => [
     d.ip, fmtTs(r.ts), stageText(r.stage), r.category || '', r.ruleId || '', actText(r.action),
-    r.matched || '', d.riskScore, d.level, op, ts
+    r.uri ? (r.host || '') + r.uri : '', r.matched || '', d.riskScore, d.level, op, ts
   ])
   await doExport(`溯源_IP_${d.ip}`, header, data)
 }
@@ -275,7 +324,29 @@ async function reloadDetail() {
   const to = range.value && range.value[1] ? Number(range.value[1]) : undefined
   detail.value = await api.traceIp(currentIp.value, from, to)
 }
-onMounted(load)
+
+// ---------- API 维度统计 ----------
+function todayRange() {
+  const now = Math.floor(Date.now() / 1000)
+  const d = new Date(); d.setHours(0, 0, 0, 0)
+  return [Math.floor(d.getTime() / 1000), now]
+}
+function resetApiRange() { apiRange.value = todayRange(); loadApiStats() }
+function blockRate(row) {
+  const t = Number(row.total) || 0
+  return t > 0 ? Math.round((Number(row.blocked) || 0) * 100 / t) : 0
+}
+async function loadApiStats() {
+  apiLoading.value = true
+  try {
+    const from = apiRange.value && apiRange.value[0] ? Number(apiRange.value[0]) : undefined
+    const to = apiRange.value && apiRange.value[1] ? Number(apiRange.value[1]) : undefined
+    const resp = await api.traceUriStats(from, to, 200) || {}
+    apiRows.value = resp.rows || []
+  } finally { apiLoading.value = false }
+}
+
+onMounted(() => { load(); apiRange.value = todayRange(); loadApiStats() })
 </script>
 
 <style scoped>
@@ -305,6 +376,10 @@ onMounted(load)
 .pwd-input :deep(.el-input__inner) { font-family: monospace; letter-spacing: 1px; }
 .pwd-note { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.8; }
 .muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; font-weight: 600; }
+.num.hit { color: #7fe7ff; }
+.num.blk { color: #ff6b81; }
+.num.chal { color: #e6a23c; }
 .headline { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .meta { margin-bottom: 4px; }
 .steps { margin-top: 12px; }

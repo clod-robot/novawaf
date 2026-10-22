@@ -291,6 +291,8 @@ private:
         e.ruleId = "TAMPER-01";
         e.matched = host + path;
         e.severity = "high";
+        e.host = host;
+        e.uri = path;
         EventSink::instance().emit(std::move(e));
 #endif
     }

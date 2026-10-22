@@ -28,4 +28,13 @@ public class TraceController {
                                                 @RequestParam(required = false) Long to) {
         return Result.ok(trace.ipDetail(ip, from, to));
     }
+
+    /** 按 API(host+uri) 维度统计攻击/拦截量, 评估防护策略效果 */
+    @RequirePerms("waf:trace:list")
+    @GetMapping("/uri-stats")
+    public Result<Map<String, Object>> uriStats(@RequestParam(required = false) Long from,
+                                                @RequestParam(required = false) Long to,
+                                                @RequestParam(defaultValue = "100") int limit) {
+        return Result.ok(trace.uriStats(from, to, limit));
+    }
 }

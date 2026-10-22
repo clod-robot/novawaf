@@ -34,6 +34,8 @@ struct AttackEvent {
     std::string ruleId;
     std::string matched;
     std::string severity;    //  high / medium / low / info（可为空）
+    std::string uri;         //  请求 path（含 query），供按 API 维度统计拦截量
+    std::string host;        //  请求 Host 头，供按应用/域名维度区分
 };
 
 class EventSink {
@@ -232,7 +234,9 @@ private:
           << ",\"category\":\"" << esc(e.category) << "\""
           << ",\"ruleId\":\"" << esc(e.ruleId) << "\""
           << ",\"matched\":\"" << esc(e.matched) << "\""
-          << ",\"severity\":\"" << esc(e.severity) << "\"}";
+          << ",\"severity\":\"" << esc(e.severity) << "\""
+          << ",\"uri\":\"" << esc(e.uri) << "\""
+          << ",\"host\":\"" << esc(e.host) << "\"}";
         return o.str();
     }
 

@@ -37,7 +37,7 @@ public class AttackArchiveService {
     private static final int BATCH = 500;        // 每批消费条数
     private static final int MAX_PER_RUN = 5000; // 单次任务最多追平条数(防雪崩)
 
-    /** 启动后自动建表(IF NOT EXISTS 幂等) */
+    /** 启动后自动建表(IF NOT EXISTS 幂等) + 存量表补齐新增列 */
     @EventListener(ApplicationReadyEvent.class)
     public void initTable() {
         jdbc.execute("CREATE TABLE IF NOT EXISTS waf_attack_event ("
@@ -49,13 +49,35 @@ public class AttackArchiveService {
                 + "rule_id VARCHAR(64),"
                 + "matched VARCHAR(512),"
                 + "severity VARCHAR(16),"
-                + "dedup CHAR(32) NOT NULL COMMENT '去重哈希 md5(ip|ts|rule|matched)',"
+                + "uri VARCHAR(512) DEFAULT '' COMMENT '请求 path(含 query), 按 API 维度统计',"
+                + "host VARCHAR(255) DEFAULT '' COMMENT '请求 Host 头, 按应用/域名维度区分',"
+                + "dedup CHAR(32) NOT NULL COMMENT '去重哈希 md5(ip|ts|rule|matched|uri|host)',"
                 + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
                 + "UNIQUE KEY uk_dedup (dedup),"
                 + "KEY idx_ip_ts (ip, ts),"
-                + "KEY idx_ts (ts)"
+                + "KEY idx_ts (ts),"
+                + "KEY idx_uri (uri(191)),"
+                + "KEY idx_host (host(191))"
                 + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        // 存量表升级: 逐列检查补齐(MySQL 无 ADD COLUMN IF NOT EXISTS, 用 information_schema 判定)
+        ensureColumn("uri", "VARCHAR(512) DEFAULT '' COMMENT '请求 path(含 query), 按 API 维度统计'");
+        ensureColumn("host", "VARCHAR(255) DEFAULT '' COMMENT '请求 Host 头, 按应用/域名维度区分'");
         log.info("[archive] waf_attack_event 表就绪");
+    }
+
+    private void ensureColumn(String col, String ddl) {
+        try {
+            Integer n = jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                            + "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='waf_attack_event' AND COLUMN_NAME=?",
+                    Integer.class, col);
+            if (n != null && n == 0) {
+                jdbc.execute("ALTER TABLE waf_attack_event ADD COLUMN " + col + " " + ddl);
+                log.info("[archive] waf_attack_event 补列: {}", col);
+            }
+        } catch (Exception e) {
+            log.warn("[archive] 补列 {} 失败(不影响主流程): {}", col, e.getMessage());
+        }
     }
 
     /** 每 10s 消费归档队列 */
@@ -74,7 +96,11 @@ public class AttackArchiveService {
                         String ip = str(e.get("ip"));
                         long ts = toLong(e.get("ts"));
                         if (ip.isEmpty() || ts <= 0) continue;
-                        e.put("dedup", md5(ip + "|" + ts + "|" + str(e.get("ruleId")) + "|" + str(e.get("matched"))));
+                        String uri = str(e.get("uri"));
+                        String host = str(e.get("host"));
+                        if (uri.length() > 512) { e.put("uri", uri.substring(0, 512)); uri = uri.substring(0, 512); }
+                        if (host.length() > 255) { e.put("host", host.substring(0, 255)); host = host.substring(0, 255); }
+                        e.put("dedup", md5(ip + "|" + ts + "|" + str(e.get("ruleId")) + "|" + str(e.get("matched")) + "|" + uri + "|" + host));
                         if (str(e.get("matched")).length() > 512) e.put("matched", str(e.get("matched")).substring(0, 512));
                         rows.add(e);
                     } catch (Exception ignore) { /* 坏行跳过, 仍会被 LTRIM 清掉 */ }

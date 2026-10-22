@@ -113,8 +113,9 @@ export const api = {
   tamperStats: () => http.get('/tamper/stats'),
   tamperSaveConfig: (d) => http.post('/tamper/config', d),
   tamperPurge: (id) => http.post('/tamper/purge', { id }),
-  // 攻击溯源分析：攻击源 IP 排行 + 单 IP 攻击链时间线
+  // 攻击溯源分析：攻击源 IP 排行 + 单 IP 攻击链时间线 + API 维度统计
   traceSummary: (limit) => http.get('/trace/summary', { params: { limit } }),
-  traceIp: (ip, from, to) => http.get('/trace/ip/' + encodeURIComponent(ip), { params: { from, to } })
+  traceIp: (ip, from, to) => http.get('/trace/ip/' + encodeURIComponent(ip), { params: { from, to } }),
+  traceUriStats: (from, to, limit) => http.get('/trace/uri-stats', { params: { from, to, limit } })
 }
 export default http

@@ -13,20 +13,33 @@ import java.util.Map;
 public interface WafAttackEventMapper {
 
     /** 批量写入(INSERT IGNORE 去重: dedup 唯一键防消费崩溃重试导致的重复) */
-    @Insert("<script>INSERT IGNORE INTO waf_attack_event(ts,ip,action,category,rule_id,matched,severity,dedup) VALUES "
+    @Insert("<script>INSERT IGNORE INTO waf_attack_event(ts,ip,action,category,rule_id,matched,severity,uri,host,dedup) VALUES "
             + "<foreach collection='rows' item='r' separator=','>"
-            + "(#{r.ts},#{r.ip},#{r.action},#{r.category},#{r.ruleId},#{r.matched},#{r.severity},#{r.dedup})"
+            + "(#{r.ts},#{r.ip},#{r.action},#{r.category},#{r.ruleId},#{r.matched},#{r.severity},#{r.uri},#{r.host},#{r.dedup})"
             + "</foreach></script>")
     int insertBatch(@Param("rows") List<Map<String, Object>> rows);
 
     /** 按 IP + 时段查完整时间线(ts 升序) */
-    @Select("<script>SELECT ts,ip,action,category,rule_id AS ruleId,matched,severity FROM waf_attack_event "
+    @Select("<script>SELECT ts,ip,action,category,rule_id AS ruleId,matched,severity,uri,host FROM waf_attack_event "
             + "WHERE ip=#{ip} "
             + "<if test='from!=null'> AND ts&gt;=#{from} </if>"
             + "<if test='to!=null'> AND ts&lt;=#{to} </if>"
             + "ORDER BY ts ASC LIMIT #{limit}</script>")
     List<Map<String, Object>> selectByIp(@Param("ip") String ip, @Param("from") Long from,
                                          @Param("to") Long to, @Param("limit") int limit);
+
+    /** 按 API(host+uri) 维度统计攻击/拦截量(评估防护策略效果) */
+    @Select("<script>SELECT host,uri,COUNT(*) AS total,"
+            + "SUM(CASE WHEN action='block' THEN 1 ELSE 0 END) AS blocked,"
+            + "SUM(CASE WHEN action='challenge' THEN 1 ELSE 0 END) AS challenged,"
+            + "COUNT(DISTINCT ip) AS attackers,"
+            + "MAX(ts) AS lastTs "
+            + "FROM waf_attack_event WHERE uri != '' "
+            + "<if test='from!=null'> AND ts&gt;=#{from} </if>"
+            + "<if test='to!=null'> AND ts&lt;=#{to} </if>"
+            + "GROUP BY host,uri ORDER BY total DESC LIMIT #{limit}</script>")
+    List<Map<String, Object>> selectUriStats(@Param("from") Long from, @Param("to") Long to,
+                                             @Param("limit") int limit);
 
     /** 该 IP 归档总条数(用于提示实际归档规模) */
     @Select("SELECT COUNT(*) FROM waf_attack_event WHERE ip=#{ip}")
