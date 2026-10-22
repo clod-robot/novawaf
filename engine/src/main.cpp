@@ -40,6 +40,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <execinfo.h>   // debug-point segv-bt: 信号安全栈回溯
+#include <sys/stat.h>
+#include <time.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -552,7 +555,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     ce.events = EPOLLIN | EPOLLET;
                     ce.data.fd = cfd;
                     epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ce);
-                    conns[cfd].lastActiveMs = nowMs();
+                    { std::lock_guard<std::mutex> lk(busyMtx); conns[cfd].lastActiveMs = nowMs(); }
                 }
                 continue;
             }
@@ -565,37 +568,51 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 if (isBusy) continue;  // 异步转发进行中，交由 IO 线程回写
             }
             // 非阻塞回写排空：该连接此前 send EAGAIN，现 EPOLLOUT 可写，把剩余响应发完
+            // 并发约束：conns 同时被异步转发完成回调(IO 线程)访问，所有访问必须持 busyMtx；
+            // closeConn 内部会加锁，须在锁外调用。
             {
-                auto cd = conns.find(fd);
-                if (cd != conns.end() && !cd->second.outQ.empty()) {
-                    ConnState& cs = cd->second;
-                    bool werr = false;
-                    while (cs.outPos < cs.outQ.size()) {
-                        ssize_t w = send(fd, cs.outQ.data() + cs.outPos,
-                                         cs.outQ.size() - cs.outPos, MSG_NOSIGNAL | MSG_DONTWAIT);
-                        if (w > 0) { cs.outPos += (size_t)w; }
-                        else if (w < 0 && errno == EINTR) { continue; }
-                        else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { break; }
-                        else { werr = true; break; }
+                bool werr = false, doClose = false, backpressured = false, flushed = false, found = false;
+                {
+                    std::lock_guard<std::mutex> lk(busyMtx);
+                    auto cd = conns.find(fd);
+                    if (cd != conns.end() && !cd->second.outQ.empty()) {
+                        found = true;
+                        ConnState& cs = cd->second;
+                        while (cs.outPos < cs.outQ.size()) {
+                            ssize_t w = send(fd, cs.outQ.data() + cs.outPos,
+                                             cs.outQ.size() - cs.outPos, MSG_NOSIGNAL | MSG_DONTWAIT);
+                            if (w > 0) { cs.outPos += (size_t)w; }
+                            else if (w < 0 && errno == EINTR) { continue; }
+                            else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { break; }
+                            else { werr = true; break; }
+                        }
+                        if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) werr = true;
+                        if (!werr) {
+                            if (cs.outPos < cs.outQ.size()) {
+                                backpressured = true;  // 仍背压，等待下一次 EPOLLOUT
+                            } else {
+                                // 本响应已完整排空
+                                flushed = true;
+                                doClose = cs.closeAfterFlush;
+                                cs.outQ.clear(); cs.outPos = 0; cs.closeAfterFlush = false;
+                                epoll_event ev{}; ev.events = EPOLLIN | EPOLLET; ev.data.fd = fd;
+                                epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);  // 回到只关心可读
+                            }
+                        }
                     }
-                    if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) werr = true;
-                    if (werr) { closeConn(fd); continue; }
-                    if (cs.outPos < cs.outQ.size()) continue;  // 仍背压，等待下一次 EPOLLOUT
-                    // 本响应已完整排空
-                    bool doClose = cs.closeAfterFlush;
-                    cs.outQ.clear(); cs.outPos = 0; cs.closeAfterFlush = false;
-                    epoll_event ev{}; ev.events = EPOLLIN | EPOLLET; ev.data.fd = fd;
-                    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);  // 回到只关心可读
-                    if (doClose) { closeConn(fd); continue; }
-                    // 落到下面正常读/处理，顺带把背压期间已到达的请求 drain 掉（避免漏 ET 边沿）
                 }
+                if (werr) { closeConn(fd); continue; }
+                if (backpressured) continue;
+                if (flushed && doClose) { closeConn(fd); continue; }
+                // 完整排空且 keep-alive：落到下面正常读/处理，顺带把背压期间已到达的请求 drain 掉（避免漏 ET 边沿）
+                (void)found;
             }
             {
                 char buf[8192];
                 bool peerClosed = false, readErr = false;
                 while (true) {
                     ssize_t r = read(fd, buf, sizeof(buf));
-                    if (r > 0) conns[fd].inbuf.append(buf, (size_t)r);
+                    if (r > 0) { std::lock_guard<std::mutex> lk(busyMtx); conns[fd].inbuf.append(buf, (size_t)r); }
                     else if (r == 0) { peerClosed = true; break; }
                     else if (r < 0 && errno != EAGAIN) { readErr = true; break; }
                     else break;
@@ -608,6 +625,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
               bool draining = false;  // 响应进入 outQ 由 EPOLLOUT 异步排空，fd 暂不关闭
               while (keepOpen && g_running) {
                 {   // 空闲超时回收（惰性）
+                    std::lock_guard<std::mutex> lk(busyMtx);
                     auto it = conns.find(fd);
                     if (it != conns.end() && nowMs() - it->second.lastActiveMs > kKeepAliveIdleMs) {
                         keepOpen = false; break;
@@ -615,6 +633,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 }
                 std::string rawReq; size_t reqLen = 0;
                 {
+                    std::lock_guard<std::mutex> lk(busyMtx);
                     auto it = conns.find(fd);
                     if (it == conns.end()) { keepOpen = false; break; }
                     int nr = nextRequest(it->second.inbuf, rawReq, reqLen);
@@ -642,6 +661,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     keepAlive = wantsKeepAlive(req);
                     // 直连对端 IP 按连接缓存（keep-alive 多请求只解析一次）
                     {
+                        std::lock_guard<std::mutex> lk(busyMtx);
                         auto csIt = conns.find(fd);
                         if (csIt == conns.end()) { keepOpen = false; break; }
                         ConnState& _cs = csIt->second;
@@ -728,17 +748,20 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             // 注：ddos 并发计数由转发器的 onDisconnect 统一释放，此处不重复。
                             ctx.onComplete = [epfd, &busyMtx, &busy, &conns, nowMs]
                                              (int cfd, bool ka) {
+                                epoll_event e2{}; e2.events = EPOLLIN | EPOLLET; e2.data.fd = cfd;
                                 if (ka) {
-                                    { std::lock_guard<std::mutex> lk(busyMtx); busy.erase(cfd); }
-                                    auto it = conns.find(cfd);
-                                    if (it != conns.end()) it->second.lastActiveMs = nowMs();
-                                    epoll_event e2{}; e2.events = EPOLLIN | EPOLLET; e2.data.fd = cfd;
+                                    // 先挂回 epoll 再解锁 busy，避免 reactor 在间隙看到未注册的非 busy fd
                                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &e2) < 0 && errno == EEXIST)
                                         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &e2);  // 兜底：已注册则改事件
+                                    std::lock_guard<std::mutex> lk(busyMtx);
+                                    busy.erase(cfd);
+                                    auto it = conns.find(cfd);   // conns 跨线程共享，必须持 busyMtx
+                                    if (it != conns.end()) it->second.lastActiveMs = nowMs();
                                 } else {
-                                    { std::lock_guard<std::mutex> lk(busyMtx); busy.erase(cfd); }
                                     epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
-                                    conns.erase(cfd);
+                                    { std::lock_guard<std::mutex> lk(busyMtx);
+                                      busy.erase(cfd);
+                                      conns.erase(cfd); }        // conns 跨线程共享，必须持 busyMtx
                                     ::close(cfd);
                                 }
                             };
@@ -910,7 +933,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     if (asyncHandled) {
                         // fd 已从 epoll 摘除并标记 busy，交给异步转发器回写；
                         // 消费掉本请求字节，停止本连接的处理循环，等待完成回调 re-arm。
-                        { auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
                         keepOpen = false;
                         break;
                     }
@@ -950,9 +973,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             else { writeFail = true; break; }
                         }
                         // 消费本请求字节（响应是否排队都不再需要它）
-                        { auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
                         if (writeFail) { keepOpen = false; break; }
                         if (left > 0) {
+                            std::lock_guard<std::mutex> lk(busyMtx);
                             auto ci = conns.find(fd);
                             if (ci == conns.end()) { keepOpen = false; break; }
                             ci->second.outQ.assign(p, left);
@@ -963,7 +987,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             draining = true; keepOpen = false; break;  // 交 EPOLLOUT 排空，本连接暂停
                         }
                         if (!keepAlive) { keepOpen = false; break; }
-                        if (auto ci = conns.find(fd); ci != conns.end()) ci->second.lastActiveMs = nowMs();
+                        { std::lock_guard<std::mutex> lk(busyMtx); if (auto ci = conns.find(fd); ci != conns.end()) ci->second.lastActiveMs = nowMs(); }
                         _mark();  // [7] 回写结束（响应已全部进入内核缓冲或已排队异步排空）
                         _flush(SEQ);
                     }
@@ -1000,6 +1024,32 @@ int main(int argc, char** argv) {
     int port = (argc > 1) ? atoi(argv[1]) : 8080;
     int threads = (argc > 2) ? atoi(argv[2]) : (int)std::thread::hardware_concurrency();
     signal(SIGPIPE, SIG_IGN);
+
+// region debug-point segv-bt
+    // SIGSEGV/SIGBUS 自取证：崩溃瞬间把带时间戳的符号化栈回溯追加到 /tmp/novawaf-crash.log，
+    // 然后恢复默认处理重新抛出（systemd 记 SIGSEGV、内核照常可产 core）。
+    // 依赖编译参数 -rdynamic 使 backtrace_symbols_fd 能解析函数名。
+    auto segvHandler = [](int sig) {
+        int fd = ::open("/tmp/novawaf-crash.log", O_WRONLY | O_CREAT | O_APPEND | O_SYNC, 0644);
+        if (fd >= 0) {
+            char ts[48] = {0};
+            time_t t = ::time(nullptr);
+            struct tm tmv{};
+            localtime_r(&t, &tmv);
+            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+            dprintf(fd, "==== signal %d at %s pid=%d ====\n", sig, ts, (int)getpid());
+            void* bt[48];
+            int n = backtrace(bt, 48);
+            backtrace_symbols_fd(bt, n, fd);
+            dprintf(fd, "==== end ====\n");
+            ::close(fd);
+        }
+        signal(sig, SIG_DFL);
+        raise(sig);
+    };
+    signal(SIGSEGV, segvHandler);
+    signal(SIGBUS, segvHandler);
+// endregion
 
     // 提升文件描述符软限到硬限，避免高并发连接（默认软限常为 1024）导致 accept EMFILE、
     // 资源分配抛异常而中断服务；提升失败不致命（沿用系统限制）。
