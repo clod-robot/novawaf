@@ -19,6 +19,8 @@ struct App {
     int         upstreamPort = 0;
     bool        isDefault    = false;
     bool        statsEnabled = false;
+    // 上游不可达时的跳转地址（登录页）；为空则退化为同源 /login
+    std::string loginUrl;
     // 运行模式：0=防护(拦截) 1=观察(只记录不拦截) 2=维护(全员维护页)
     int         mode         = 0;
     inline bool isObserve() const { return mode == 1; }
@@ -82,6 +84,7 @@ inline void applyField(App& a, const std::string& key, const std::string& s, siz
         std::string v = parseStr(s, i);
         if (key == "id") a.id = v; else if (key == "name") a.name = v;
         else if (key == "host") a.host = v; else if (key == "upstreamHost") a.upstreamHost = v;
+        else if (key == "loginUrl") a.loginUrl = v;
         else if (key == "mode") a.mode = (v == "observe") ? 1 : (v == "maintenance" ? 2 : 0);
     } else if (i < s.size() && (s[i] == 't' || s[i] == 'f')) {
         bool v = (s[i] == 't');

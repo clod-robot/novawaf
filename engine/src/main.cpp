@@ -733,6 +733,29 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
 
                     std::string outResp;
                     bool asyncHandled = false;  // 异步转发器接管后，reactor 跳过回写与关闭
+                    // 上游不可达时的劫持目标：仅对浏览器页面导航生效（GET + Accept: text/html），
+                    // 接口/XHR 调用保持 502，避免客户端拿到 HTML 跳转页而解析失败。
+                    // 优先用应用配置的登录页，未配置则退化到同源 /login。
+                    std::string failRedirect;
+                    {
+                        std::string acc = hdrCi(req, "Accept");
+                        bool navReq = req.method == "GET" &&
+                                      acc.find("text/html") != std::string::npos &&
+                                      hdrCi(req, "X-Requested-With").empty();
+                        if (app && navReq) failRedirect = app->loginUrl.empty() ? "/login" : app->loginUrl;
+                    }
+                    auto buildRedirect = [](const std::string& url) {
+                        std::string body =
+                            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                            "<meta http-equiv=\"refresh\" content=\"0;url=" + url + "\">"
+                            "<title>正在跳转登录</title></head><body>"
+                            "<p>应用暂不可用，正在跳转到登录页…</p>"
+                            "<p><a href=\"" + url + "\">点此继续</a></p></body></html>";
+                        return "HTTP/1.1 302 Found\r\nLocation: " + url + "\r\n"
+                               "Content-Type: text/html; charset=utf-8\r\n"
+                               "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                               "Cache-Control: no-store\r\n\r\n" + body;
+                    };
                     // 转发到上游：异步优先，失败回退同步；返回 true 表示已由异步 IO 接管
                     auto forwardToApp = [&]() -> bool {
                         static const std::string k502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
@@ -747,6 +770,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             ctx.country = geo.country(req.clientIp);
                             ctx.policyId = policyId;
                             ctx.keepAlive = keepAlive;
+                            ctx.failRedirect = failRedirect;
                             // 异步转发完成(在 IO 线程)：keep-alive 则重新挂回 epoll 复用，否则关闭。
                             // 注：ddos 并发计数由转发器的 onDisconnect 统一释放，此处不重复。
                             ctx.onComplete = [epfd, &busyMtx, &busy, &conns, nowMs]
@@ -790,7 +814,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             setRespConnection(outResp, keepAlive);
                             return false;
                         }
-                        outResp = k502;
+                        outResp = failRedirect.empty() ? k502 : buildRedirect(failRedirect);
                         setRespConnection(outResp, false);
                         return false;
                     };

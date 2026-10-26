@@ -353,6 +353,19 @@ public:
         bool isUpload = ct.find("multipart/form-data") != std::string::npos ||
                         req.body.find("filename=") != std::string::npos;
         if (!isUpload) return {};
+        // PHP2Shell 类畸形 multipart 防护（CVE-2026-109618/109619）：
+        // 特制 multipart POST 触发 PHP 核心内存破坏。正常表单 part 数量远低于 500，
+        // 超限即视为畸形 multipart 洪泛/内存破坏尝试，直接拦截。
+        {
+            std::string low = req.body;
+            for (auto& c : low) c = (char)std::tolower((unsigned char)c);
+            size_t parts = 0, pos = 0;
+            while ((pos = low.find("content-disposition", pos)) != std::string::npos) {
+                if (++parts > 500)
+                    return {Action::BLOCK, "UPLOAD-003", "FileUpload", "Malformed multipart flood (PHP2Shell)", ""};
+                pos += 19;
+            }
+        }
         std::string norm = Decoder::normalize(req.body);
         std::string normPath = Decoder::normalize(req.path);
         std::string normQ = Decoder::normalize(req.query);

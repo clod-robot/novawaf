@@ -49,6 +49,9 @@ public:
         std::string country;
         std::string policyId;      // 命中的 API 防护策略 ID（按策略统计访问/拦截/放行次数）
         bool        keepAlive = false;   // 客户端连接是否复用(keep-alive)
+        // 上游不可达时的劫持跳转地址（通常是应用登录页）。非空则返回 302 而非 502，
+        // 用于「访问不了的页面直接跳到对应应用登录页」的兜底体验。
+        std::string failRedirect;
         // 转发完成回调（在 IO 线程执行）：keepAlive=true 时由回调把客户端 fd 重新挂回 epoll；
         // keepAlive=false 时回调负责关闭 fd。为空则沿用旧行为(直接关闭)。
         std::function<void(int clientFd, bool keepAlive)> onComplete;
@@ -109,11 +112,15 @@ private:
         resp = out + "\r\n" + body;  // 头区已各自带 CRLF，此处补空行 + 精确 body
     }
 
-    // 客户端连接收尾：keep-alive 交回 reactor 复用，否则关闭
+    // 客户端连接收尾：keep-alive 交回 reactor 复用，否则关闭。
+    // 并发计数不变式：谁关闭 fd 谁释放 DDoS 并发计数。onComplete 存在时由它关 fd，
+    // 但它拿不到 clientIp，因此关闭场景下必须由这里补调 onDisconnect_，
+    // 否则每条放行的短连接泄漏 1 个并发计数，最终源 IP 被 DDoS guard 永久封禁。
     void finishClient(Ctx& ctx) {
         setCliNonblock(ctx.clientFd);  // 复位非阻塞，交还 reactor 做 ET 读
         if (ctx.onComplete) {
             ctx.onComplete(ctx.clientFd, ctx.keepAlive);
+            if (!ctx.keepAlive && onDisconnect_) onDisconnect_(ctx.clientIp);
         } else {
             ::close(ctx.clientFd);
             if (onDisconnect_) onDisconnect_(ctx.clientIp);
@@ -167,6 +174,19 @@ private:
 
         if (!ok) {
             std::string e = k502;
+            if (!ctx.failRedirect.empty()) {
+                // 劫持：上游不可达时把访客导流到该应用的登录页，避免暴露 502 空白页
+                std::string body =
+                    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                    "<meta http-equiv=\"refresh\" content=\"0;url=" + ctx.failRedirect + "\">"
+                    "<title>正在跳转登录</title></head><body>"
+                    "<p>应用暂不可用，正在跳转到登录页…</p>"
+                    "<p><a href=\"" + ctx.failRedirect + "\">点此继续</a></p></body></html>";
+                e = "HTTP/1.1 302 Found\r\nLocation: " + ctx.failRedirect + "\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Cache-Control: no-store\r\n\r\n" + body;
+            }
             setResponseConnection(e, false);
             writeAll(ctx.clientFd, e);
             finishClient(ctx);
