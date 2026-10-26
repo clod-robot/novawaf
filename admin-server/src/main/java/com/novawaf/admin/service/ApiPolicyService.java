@@ -10,6 +10,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +80,42 @@ public class ApiPolicyService {
     }
 
     private static String str(Object o) { return o == null ? "" : String.valueOf(o); }
+
+    /** 应用名称 -> 应用 id（导入时允许按名称指定所属应用） */
+    public Map<String, String> appIdByName() {
+        Map<String, String> m = new HashMap<>();
+        for (Map.Entry<String, String> e : appNames().entrySet()) m.put(e.getValue(), e.getKey());
+        return m;
+    }
+
+    /** 批量导入：逐条校验+插入，仅发布一次；失败条目带原始下标返回 */
+    @Transactional
+    public Map<String, Object> addBatch(List<ApiPolicy> items) {
+        List<Map<String, Object>> failed = new ArrayList<>();
+        int ok = 0;
+        for (int i = 0; i < items.size(); i++) {
+            ApiPolicy p = items.get(i);
+            try {
+                validate(p);
+                if (mapper.countByPrefix(p.getPrefix(), p.getAppId(), null) > 0) {
+                    throw new BusinessException("该应用下路径已存在：" + p.getPrefix());
+                }
+                if (p.getEnabled() == null) p.setEnabled(true);
+                mapper.insert(p);
+                ok++;
+            } catch (Exception e) {
+                Map<String, Object> f = new HashMap<>();
+                f.put("index", i);
+                f.put("reason", e.getMessage() == null ? "导入失败" : e.getMessage());
+                failed.add(f);
+            }
+        }
+        if (ok > 0) publish();
+        Map<String, Object> r = new HashMap<>();
+        r.put("success", ok);
+        r.put("failed", failed);
+        return r;
+    }
 
     @Transactional
     public void add(ApiPolicy p) {

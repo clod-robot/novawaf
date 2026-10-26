@@ -37,7 +37,13 @@
           </el-dropdown>
         </div>
       </el-header>
-      <el-main class="main"><router-view /></el-main>
+      <el-main class="main">
+        <router-view v-slot="{ Component }">
+          <transition name="page-switch" mode="out-in">
+            <component :is="Component" :key="$route.path" />
+          </transition>
+        </router-view>
+      </el-main>
     </el-container>
   </el-container>
 </template>
@@ -98,4 +104,15 @@ async function onCmd(c) {
 .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .user { color: var(--cyan); cursor: pointer; display: flex; align-items: center; gap: 4px; }
 .main { padding: 14px; overflow: auto; }
+
+/* 页面切换动效：淡入 + 轻微上浮/缩放，避免生硬跳变 */
+.page-switch-enter-active { transition: opacity .28s ease, transform .28s cubic-bezier(.22,.68,0,1); }
+.page-switch-leave-active { transition: opacity .16s ease, transform .16s ease; }
+.page-switch-enter-from { opacity: 0; transform: translateY(14px) scale(.985); }
+.page-switch-leave-to { opacity: 0; transform: translateY(-8px) scale(.995); }
+
+/* 侧边菜单项动效 */
+:deep(.el-menu-item) { transition: background-color .22s ease, padding-left .22s ease, color .22s ease; }
+:deep(.el-menu-item:hover) { padding-left: 26px; }
+:deep(.el-sub-menu__title) { transition: background-color .22s ease, color .22s ease; }
 </style>

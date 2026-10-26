@@ -104,3 +104,41 @@ body {
 .el-message-box__title, .el-message-box__content, .el-message-box__message { color: var(--text) !important; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.3); border-radius: 4px; }
+
+/* ===== 全局交互动效：让切换/悬停不再生硬 ===== */
+/* 按钮：悬停微升 + 光晕，按下回弹 */
+.el-button { transition: transform .18s ease, box-shadow .22s ease, background-color .22s ease, color .22s ease, border-color .22s ease; }
+.el-button:not(.is-disabled):hover { transform: translateY(-1px); box-shadow: 0 3px 12px rgba(0,229,255,.22); }
+.el-button:not(.is-disabled):active { transform: translateY(0) scale(.97); }
+
+/* 表格行、卡片、标签：平滑过渡 */
+.el-table__row { transition: background-color .2s ease; }
+.el-table__body tr:hover > td { background: rgba(0,229,255,.06) !important; }
+.el-tag { transition: transform .18s ease, box-shadow .18s ease; }
+.el-tag:hover { transform: translateY(-1px); box-shadow: 0 2px 10px rgba(0,229,255,.25); }
+.mecha-panel { transition: box-shadow .28s ease, border-color .28s ease; }
+
+/* 页签切换：内容淡入上浮 */
+.el-tabs__item { transition: color .22s ease, transform .22s ease; }
+.el-tabs__item:hover { transform: translateY(-1px); }
+.el-tab-pane { animation: tabFade .3s cubic-bezier(.22,.68,0,1); }
+@keyframes tabFade {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 弹窗/抽屉：缩放淡入 */
+.el-dialog, .el-drawer { animation: dlgIn .26s cubic-bezier(.22,.68,0,1); }
+@keyframes dlgIn {
+  from { opacity: 0; transform: scale(.96) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* 输入框聚焦光晕 */
+.el-input__wrapper, .el-select__wrapper { transition: box-shadow .22s ease, border-color .22s ease; }
+.el-input__wrapper.is-focus, .el-select__wrapper.is-focused { box-shadow: 0 0 0 1px var(--cyan) inset, 0 0 10px rgba(0,229,255,.25) !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  .el-button, .el-tag, .el-tabs__item, .mecha-panel { transition: none; }
+  .el-tab-pane, .el-dialog, .el-drawer { animation: none; }
+}

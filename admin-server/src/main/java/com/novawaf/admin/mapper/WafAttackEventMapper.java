@@ -41,6 +41,20 @@ public interface WafAttackEventMapper {
     List<Map<String, Object>> selectUriStats(@Param("from") Long from, @Param("to") Long to,
                                              @Param("limit") int limit);
 
+    /** 分钟物化表的已聚合起点(分钟桶)；为空表示尚未回填 */
+    @Select("SELECT MIN(minute) FROM waf_api_stat")
+    Long selectStatCoverageMin();
+
+    /** 从分钟物化表聚合 API 维度统计(毫秒级，任意时间跨度都不扫明细表) */
+    @Select("SELECT host,uri,SUM(total) AS total,SUM(blocked) AS blocked,"
+            + "SUM(challenged) AS challenged,MAX(attackers) AS attackers,"
+            + "(MAX(minute)+1)*60-1 AS lastTs "
+            + "FROM waf_api_stat WHERE minute>=#{fromMin} AND minute<=#{toMin} "
+            + "GROUP BY host,uri ORDER BY total DESC LIMIT #{limit}")
+    List<Map<String, Object>> selectUriStatsFromStat(@Param("fromMin") long fromMin,
+                                                     @Param("toMin") long toMin,
+                                                     @Param("limit") int limit);
+
     /** 该 IP 归档总条数(用于提示实际归档规模) */
     @Select("SELECT COUNT(*) FROM waf_attack_event WHERE ip=#{ip}")
     long countByIp(@Param("ip") String ip);

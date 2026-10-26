@@ -28,7 +28,7 @@
           <div class="col-hdr">
             <span class="col-label">{{ c.label }}</span>
             <el-input
-              v-if="searchable && !c.noSearch && c.prop && c.type !== 'index' && !c.noHeader"
+              v-if="searchable && headerSearch && !c.noSearch && c.prop && c.type !== 'index' && !c.noHeader"
               v-model="filters[c.prop]"
               size="small"
               :placeholder="'搜' + c.label"
@@ -71,6 +71,8 @@ const props = defineProps({
   pageSize: { type: Number, default: 50 },
   pageSizes: { type: Array, default: () => [50, 100, 150, 200] },
   searchable: { type: Boolean, default: true },
+  // 表头内嵌搜索框开关：false 时由页面用独立筛选条自行过滤，避免表头重排抖动
+  headerSearch: { type: Boolean, default: true },
   loading: { type: Boolean, default: false },
   height: { type: [String, Number], default: 'calc(100vh - 160px)' }
 })
@@ -87,7 +89,8 @@ const wrapStyle = computed(() => ({
   flexDirection: 'column'
 }))
 
-watch(() => props.data, () => { page.value = 1 })
+// 仅在数据条数变化时回到首页；次数等原地更新不会打断当前分页（避免刷新抖动）
+watch(() => (props.data || []).length, () => { page.value = 1 })
 
 const filtered = computed(() => {
   let list = (props.data || []).slice()

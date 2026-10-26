@@ -63,13 +63,26 @@
     <div class="bar">
       <span class="hud-inline">// 按 API(Host + URI) 统计攻击/拦截量（评估防护策略效果）</span>
       <span style="flex:1"></span>
+      <el-select v-model="apiApp" size="small" clearable placeholder="所属应用" style="width:150px;margin-right:8px">
+        <el-option label="全部应用" value="__all__" />
+        <el-option v-for="a in apps" :key="a.id" :label="a.name" :value="String(a.id)" />
+      </el-select>
       <el-date-picker v-model="apiRange" type="datetimerange" size="small" range-separator="至"
                       start-placeholder="开始时间" end-placeholder="结束时间" value-format="X"
                       style="width:330px;margin-right:8px" @change="loadApiStats" />
       <el-button size="small" @click="resetApiRange">今天</el-button>
       <el-button size="small" @click="loadApiStats">刷新</el-button>
     </div>
-    <DataTable :data="apiRows" :columns="apiColumns" height="calc(100vh - 260px)" class="tbl" v-loading="apiLoading">
+    <div v-if="apiSummary.length" class="api-summary">
+      <span v-for="s in apiSummary" :key="s.name" class="sum-chip" :class="{ active: apiApp === s.id }"
+            @click="apiApp = apiApp === s.id ? '' : s.id">
+        {{ s.name }} <b>{{ fmtBig(s.total) }}</b>
+      </span>
+    </div>
+    <DataTable :data="apiRowsView" :columns="apiColumns" height="calc(100vh - 300px)" class="tbl" v-loading="apiLoading">
+      <template #cell-appName="{ row }">
+        <el-tag size="small" effect="plain" :type="row.host ? 'primary' : 'info'">{{ row.appName }}</el-tag>
+      </template>
       <template #cell-host="{ row }"><span class="mono">{{ row.host || '-' }}</span></template>
       <template #cell-uri="{ row }"><span class="mono">{{ row.uri }}</span></template>
       <template #cell-total="{ row }"><span class="num hit">{{ fmtBig(row.total) }}</span></template>
@@ -82,9 +95,10 @@
       <template #cell-lastTs="{ row }"><span class="mono">{{ fmtTs(row.lastTs) }}</span></template>
     </DataTable>
     <p class="footnote">
-      数据来源：MySQL 攻击事件归档（waf_attack_event，引擎实时事件逐条落库，任意时段可查）。
-      攻击次数 = 该 API 命中的攻击事件总数；拦截 = action=block；挑战 = action=challenge（人机验证）；攻击源 = 去重后的独立攻击 IP 数。
-      注意：uri/host 字段自 2026-10-22 升级起由引擎随事件携带，此前的历史归档无此字段、不计入本统计。
+      数据来源：分钟聚合表 waf_api_stat（由 MySQL 归档 waf_attack_event 每分钟预聚合，页面查询不再扫明细表，延迟约 1 分钟）。
+      攻击次数 = 该时段命中该 API 的攻击事件总数；拦截 = action=block；挑战 = action=challenge（人机验证）；攻击源 = 该时段内单分钟峰值独立 IP 数。
+      所属应用按事件 Host 头匹配防护应用域名，未匹配归入「未绑定应用」。
+      默认统计范围为今天 0 点至当前，可自行选择任意时段（超出预聚合覆盖范围时自动回退明细表查询，速度较慢但结果完整）。
     </p>
       </el-tab-pane>
     </el-tabs>
@@ -177,7 +191,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
 import { fmtBig } from '../utils/format'
@@ -210,6 +224,7 @@ const tlColumns = [
   { prop: 'matched', label: '命中内容', minWidth: 200 }
 ]
 const apiColumns = [
+  { prop: 'appName', label: '所属应用', width: 140, slot: 'appName', noSearch: true },
   { prop: 'host', label: 'Host', width: 150, slot: 'host' },
   { prop: 'uri', label: 'URI', minWidth: 240, slot: 'uri' },
   { label: '攻击次数', width: 100, align: 'right', slot: 'total', noSearch: true },
@@ -224,6 +239,8 @@ const rows = ref([]), limit = ref(50), loading = ref(false)
 const scope = ref('加载中…')
 const tab = ref('ip')
 const apiRows = ref([]), apiLoading = ref(false), apiRange = ref(null)
+const apiApp = ref('')
+const apps = ref([])
 const drawer = ref(false), detail = ref({})
 const range = ref(null)   // [from_epoch_sec, to_epoch_sec]
 const currentIp = ref('')
@@ -332,6 +349,35 @@ function todayRange() {
   return [Math.floor(d.getTime() / 1000), now]
 }
 function resetApiRange() { apiRange.value = todayRange(); loadApiStats() }
+
+// 应用归属：按事件 Host 头匹配应用域名，未匹配的归入「未绑定应用」
+function appOf(host) {
+  const h = String(host || '').toLowerCase()
+  if (!h) return { id: '', name: '未知应用' }
+  const a = apps.value.find((x) => String(x.host || '').toLowerCase() === h)
+  return a ? { id: String(a.id), name: a.name } : { id: '', name: '未绑定应用' }
+}
+const apiRowsView = computed(() => {
+  let list = apiRows.value.map((r) => {
+    const a = appOf(r.host)
+    return { ...r, appId: a.id, appName: a.name }
+  })
+  if (apiApp.value && apiApp.value !== '__all__') list = list.filter((r) => r.appId === apiApp.value)
+  return list.sort((a, b) => (Number(b.total) || 0) - (Number(a.total) || 0))
+})
+// 每个应用的攻击量汇总，作为顶部快捷筛选
+const apiSummary = computed(() => {
+  const m = new Map()
+  for (const r of apiRows.value) {
+    const a = appOf(r.host)
+    const key = a.id || 'none'
+    const cur = m.get(key) || { id: a.id || 'none', name: a.name, total: 0 }
+    cur.total += Number(r.total) || 0
+    m.set(key, cur)
+  }
+  return [...m.values()].sort((x, y) => y.total - x.total).slice(0, 8)
+})
+
 function blockRate(row) {
   const t = Number(row.total) || 0
   return t > 0 ? Math.round((Number(row.blocked) || 0) * 100 / t) : 0
@@ -346,11 +392,25 @@ async function loadApiStats() {
   } finally { apiLoading.value = false }
 }
 
-onMounted(() => { load(); apiRange.value = todayRange(); loadApiStats() })
+onMounted(() => {
+  load()
+  apiRange.value = todayRange()
+  loadApiStats()
+  api.wafApps().then((x) => { apps.value = x || [] }).catch(() => { apps.value = [] })
+})
 </script>
 
 <style scoped>
 .p { padding: 16px; }
+.api-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.sum-chip {
+  font-size: 12px; padding: 3px 10px; border-radius: 12px; cursor: pointer;
+  border: 1px solid rgba(0, 229, 255, .25); background: rgba(0, 229, 255, .06);
+  color: #bfe9ff; transition: all .2s ease;
+}
+.sum-chip:hover { transform: translateY(-1px); box-shadow: 0 2px 10px rgba(0, 229, 255, .25); }
+.sum-chip.active { border-color: #00e5ff; background: rgba(0, 229, 255, .18); color: #eaffff; }
+.sum-chip b { margin-left: 4px; color: #7fe7ff; font-variant-numeric: tabular-nums; }
 .bar { display: flex; align-items: center; margin-bottom: 12px; }
 .hud-inline { font-size: 13px; color: var(--cyan); letter-spacing: 1px; }
 .tbl { margin-top: 6px; }

@@ -86,6 +86,9 @@ export const api = {
   apiPolicyUpdate: (d) => http.put('/waf/api-policy', d),
   apiPolicyToggle: (id, enabled) => http.put('/waf/api-policy/' + id + '/enabled', { enabled }),
   apiPolicyDelete: (id) => http.delete('/waf/api-policy/' + id),
+  // 批量导入（CSV：序号,请求格式,API接口,动作,所属应用,策略名称,备注）与模板下载
+  apiPolicyImport: (fd) => http.post('/waf/api-policy/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  apiPolicyTemplate: () => http.get('/waf/api-policy/template', { responseType: 'blob' }),
   // 通用设置-部署方式：网络类型探测(nat)与 HA 配置读写
   deployGet: () => http.get('/system/deploy'),
   deploySave: (d) => http.put('/system/deploy', d),

@@ -56,6 +56,7 @@
         <el-descriptions-item label="应用名称">{{ cur.name }}</el-descriptions-item>
         <el-descriptions-item label="防护域名">{{ cur.host }}</el-descriptions-item>
         <el-descriptions-item label="上游地址">{{ cur.upstreamHost }}:{{ cur.upstreamPort }}</el-descriptions-item>
+        <el-descriptions-item label="登录页地址">{{ cur.loginUrl || '未配置（默认同源 /login）' }}</el-descriptions-item>
         <el-descriptions-item label="运行模式">{{ cur.mode }}模式</el-descriptions-item>
         <el-descriptions-item label="统计采集">{{ cur.statsEnabled ? '已开启' : '未开启' }}</el-descriptions-item>
         <el-descriptions-item label="今日请求">{{ cur.todayReq }}</el-descriptions-item>
@@ -78,6 +79,9 @@
         </el-form-item>
         <el-form-item label="上游端口" required>
           <el-input-number v-model="form.upstreamPort" :min="1" :max="65535" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="登录页地址">
+          <el-input v-model="form.loginUrl" placeholder="上游不可达时跳转，如 /login 或 https://nac.example.com/login" />
         </el-form-item>
         <el-form-item label="流量统计">
           <el-switch v-model="form.statsEnabled" active-text="开启" />
@@ -120,7 +124,7 @@ const showAdd = ref(false)
 const saving = ref(false)
 const cur = ref({})
 const editingId = ref(null)
-const form = reactive({ name: '', host: '', upstreamHost: '', upstreamPort: 80, statsEnabled: true })
+const form = reactive({ name: '', host: '', upstreamHost: '', upstreamPort: 80, statsEnabled: true, loginUrl: '' })
 
 const modeShow = ref(false)
 const modeSaving = ref(false)
@@ -152,7 +156,7 @@ const filtered = computed(() => {
 function openDetail(a) { cur.value = a; detailShow.value = true }
 function openEdit(a) {
   editingId.value = a.id
-  Object.assign(form, { name: a.name || '', host: a.host || '', upstreamHost: a.upstreamHost || '', upstreamPort: a.upstreamPort || 80, statsEnabled: !!a.statsEnabled })
+  Object.assign(form, { name: a.name || '', host: a.host || '', upstreamHost: a.upstreamHost || '', upstreamPort: a.upstreamPort || 80, statsEnabled: !!a.statsEnabled, loginUrl: a.loginUrl || '' })
   showAdd.value = true
 }
 
@@ -169,7 +173,7 @@ async function submit() {
     }
     showAdd.value = false
     editingId.value = null
-    Object.assign(form, { name: '', host: '', upstreamHost: '', upstreamPort: 80, statsEnabled: true })
+    Object.assign(form, { name: '', host: '', upstreamHost: '', upstreamPort: 80, statsEnabled: true, loginUrl: '' })
     await load()
   } catch (e) { /* 拦截器已提示 */ } finally { saving.value = false }
 }

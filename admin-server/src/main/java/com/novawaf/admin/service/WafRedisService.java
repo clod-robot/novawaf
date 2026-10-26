@@ -102,7 +102,14 @@ public class WafRedisService {
             + "{\"id\":3021,\"name\":\"Jenkins ScriptSecurity 沙箱绕过 RCE\",\"pattern\":\"descriptorbyname/org.jenkinsci.plugins.scriptsecurity.sandbox.groovy.securescriptwhiteloader\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"国际通用\",\"cve\":\"CVE-2018-1000861\",\"vulnName\":\"Jenkins Stapler 路由绕过沙箱 RCE\",\"severity\":\"critical\",\"component\":\"Jenkins\",\"cvss\":9.8,\"year\":2018,\"desc\":\"Stapler 动态路由调用 ScriptSecurity 描述符方法绕过沙箱执行 Groovy\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2018-1000861\"},"
             + "{\"id\":3022,\"name\":\"Hadoop YARN 未授权 RCE\",\"pattern\":\"/ws/v1/cluster/apps/new-application\",\"category\":\"AuthBypass\",\"action\":\"block\",\"enabled\":true,\"group\":\"国际通用\",\"vulnName\":\"Hadoop YARN ResourceManager 未授权命令执行\",\"severity\":\"high\",\"component\":\"Apache Hadoop\",\"cvss\":9.8,\"year\":2016,\"desc\":\"ResourceManager REST API 未授权创建 application 执行任意命令\"},"
             + "{\"id\":3023,\"name\":\"ActiveMQ Web控制台探测\",\"pattern\":\"/admin/test/systemproperties.jsp\",\"category\":\"InfoLeak\",\"action\":\"block\",\"enabled\":true,\"group\":\"国际通用\",\"vulnName\":\"ActiveMQ Web Console 测试页信息泄露/利用入口\",\"severity\":\"medium\",\"component\":\"Apache ActiveMQ\",\"cvss\":7.5,\"year\":2015,\"desc\":\"默认 Web 控制台 test 页面泄露系统属性，常作为漏洞利用入口\"},"
-            + "{\"id\":3024,\"name\":\"vCenter vROPS 插件文件上传\",\"pattern\":\"/ui/vropspluginui/rest/services/uploadova\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"国际通用\",\"cve\":\"CVE-2021-21972\",\"vulnName\":\"VMware vCenter vROPS 插件未授权文件上传 RCE\",\"severity\":\"critical\",\"component\":\"VMware vCenter\",\"cvss\":9.8,\"year\":2021,\"desc\":\"uploadova 接口未授权上传 tar 写 webshell\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2021-21972\"}"
+            + "{\"id\":3024,\"name\":\"vCenter vROPS 插件文件上传\",\"pattern\":\"/ui/vropspluginui/rest/services/uploadova\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"国际通用\",\"cve\":\"CVE-2021-21972\",\"vulnName\":\"VMware vCenter vROPS 插件未授权文件上传 RCE\",\"severity\":\"critical\",\"component\":\"VMware vCenter\",\"cvss\":9.8,\"year\":2021,\"desc\":\"uploadova 接口未授权上传 tar 写 webshell\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2021-21972\"},"
+            + "{\"id\":4001,\"name\":\"PHP 伪协议 php://input 代码执行\",\"pattern\":\"php://input\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"cve\":\"CVE-2026-6735\",\"vulnName\":\"PHP URL 净化不当致伪协议绕过\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.8,\"year\":2026,\"desc\":\"php://input 读取原始请求体传入 include/eval 执行任意代码；PHP<8.2.31/8.3.31/8.4.21/8.5.6 存在 URL 净化缺陷可绕过过滤\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2026-6735\"},"
+            + "{\"id\":4002,\"name\":\"PHP 伪协议 php://filter 源码读取\",\"pattern\":\"php://filter\",\"category\":\"LFI\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"cve\":\"CVE-2026-6735\",\"vulnName\":\"PHP URL 净化不当致伪协议绕过\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.8,\"year\":2026,\"desc\":\"php://filter 链式过滤器 base64 读取任意源码/配置文件，常与文件包含组合 getshell\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2026-6735\"},"
+            + "{\"id\":4003,\"name\":\"PHP phar:// 反序列化\",\"pattern\":\"phar://\",\"category\":\"Deserialization\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"vulnName\":\"PHP phar 反序列化对象注入\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.8,\"year\":2026,\"desc\":\"phar:// 触发 PHAR 元数据反序列化，配合 POP 链执行任意代码（file_exists/is_dir 等均可触发）\"},"
+            + "{\"id\":4004,\"name\":\"PHP data://text/plain 代码执行\",\"pattern\":\"data://text/plain\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"vulnName\":\"PHP data 包装器远程代码执行\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.8,\"year\":2026,\"desc\":\"allow_url_include 开启时 data://text/plain;base64,<payload> 直接 include 执行任意 PHP 代码\"},"
+            + "{\"id\":4005,\"name\":\"PHP expect:// 命令执行\",\"pattern\":\"expect://\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"vulnName\":\"PHP expect 包装器命令执行\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.8,\"year\":2026,\"desc\":\"expect:// 包装器直接执行系统命令，无需上传文件\"},"
+            + "{\"id\":4006,\"name\":\"PHP-CGI auto_prepend_file 参数注入\",\"pattern\":\"auto_prepend_file\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"cve\":\"CVE-2026-109618\",\"vulnName\":\"PHP2Shell 未认证远程代码执行\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.2,\"year\":2026,\"desc\":\"PHP-CGI 模式下通过查询串注入 -d auto_prepend_file=php://input 执行请求体代码（PHP2Shell 利用链）\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2026-109618\"},"
+            + "{\"id\":4007,\"name\":\"PHP-CGI allow_url_include 参数注入\",\"pattern\":\"allow_url_include\",\"category\":\"RCE\",\"action\":\"block\",\"enabled\":true,\"group\":\"PHP漏洞防护\",\"cve\":\"CVE-2026-109619\",\"vulnName\":\"PHP2Shell 未认证远程代码执行\",\"severity\":\"critical\",\"component\":\"PHP\",\"cvss\":9.2,\"year\":2026,\"desc\":\"PHP-CGI 模式下注入 -d allow_url_include=1 配合 data://php:// 包装器远程包含执行代码（PHP2Shell 利用链）\",\"ref\":\"https://nvd.nist.gov/vuln/detail/CVE-2026-109619\"}"
             + "]";
 
     public void ensureRulesSeed() {
@@ -152,6 +159,7 @@ public class WafRedisService {
             m.put("upstreamHost", a.get("upstreamHost"));
             m.put("upstreamPort", a.get("upstreamPort"));
             m.put("statsEnabled", Boolean.TRUE.equals(a.get("statsEnabled")));
+            m.put("loginUrl", a.get("loginUrl") == null ? "" : a.get("loginUrl"));
             String mv = str(a.get("mode"));
             m.put("mode", "observe".equals(mv) ? "观察" : "maintenance".equals(mv) ? "维护" : "防护");
             m.put("todayReq", todayReq);
@@ -195,6 +203,7 @@ public class WafRedisService {
         app.put("upstreamHost", upHost);
         app.put("upstreamPort", (int) port);
         app.put("statsEnabled", Boolean.TRUE.equals(req.get("statsEnabled")));
+        app.put("loginUrl", normLoginUrl(req.get("loginUrl")));
         app.put("mode", normMode(req.get("mode")));
         app.put("default", false);
         list.add(app);
@@ -205,6 +214,16 @@ public class WafRedisService {
     private String normMode(Object o) {
         String v = str(o);
         return ("observe".equals(v) || "maintenance".equals(v)) ? v : "protect";
+    }
+
+    /** 归一化登录页地址：允许空、http(s):// 绝对地址、以 / 开头的同源路径；其余一律拒绝 */
+    private String normLoginUrl(Object o) {
+        String v = str(o).trim();
+        if (v.isEmpty()) return "";
+        if (!(v.startsWith("/") || v.startsWith("http://") || v.startsWith("https://")))
+            throw new BusinessException(400, "登录页地址必须是 http(s):// 开头的完整地址，或以 / 开头的站内路径");
+        if (v.matches(".*\\s.*")) throw new BusinessException(400, "登录页地址不能包含空白字符");
+        return v;
     }
 
     /** 设置应用运行模式 */
@@ -260,6 +279,7 @@ public class WafRedisService {
             a.put("upstreamHost", upHost);
             a.put("upstreamPort", (int) port);
             if (req.containsKey("statsEnabled")) a.put("statsEnabled", Boolean.TRUE.equals(req.get("statsEnabled")));
+            if (req.containsKey("loginUrl")) a.put("loginUrl", normLoginUrl(req.get("loginUrl")));
             if (req.containsKey("mode")) a.put("mode", normMode(req.get("mode")));
             found = true;
             break;

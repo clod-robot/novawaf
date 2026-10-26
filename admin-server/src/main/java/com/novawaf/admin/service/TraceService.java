@@ -172,17 +172,49 @@ public class TraceService {
     public Map<String, Object> uriStats(Long from, Long to, int limit) {
         if (limit <= 0) limit = 100;
         if (limit > 500) limit = 500;
+        long nowS = System.currentTimeMillis() / 1000;
+        // 默认只统计今天(0 点起)：明细表日增千万级，无界查询会让页面长时间转圈
+        if (from == null) from = LocalDate.now(ZONE).atStartOfDay(ZONE).toEpochSecond();
+        if (to == null || to <= 0) to = nowS;
+        long fromMin = from / 60, toMin = to / 60;
         List<Map<String, Object>> rows;
-        try {
-            rows = archiveMapper.selectUriStats(from, to, limit);
-        } catch (Exception e) {
-            rows = new ArrayList<>(); // 表初始化中/列未补齐时降级
+        String mode = "minute";
+        // 15 秒结果缓存：页面反复刷新/多端同时查看时不再重复聚合
+        String key = fromMin + "|" + toMin + "|" + limit;
+        long nowMs = System.currentTimeMillis();
+        if (uriCache != null && key.equals(uriCacheKey) && nowMs - uriCacheAt < 15000) {
+            rows = uriCache;
+            mode = "cache";
+        } else {
+            try {
+                Long cov = archiveMapper.selectStatCoverageMin();
+                if (cov != null && cov <= fromMin) {
+                    // 命中分钟物化表：任意跨度都是毫秒级
+                    rows = archiveMapper.selectUriStatsFromStat(fromMin, toMin, limit);
+                } else {
+                    // 物化表尚未覆盖该时段(服务刚启动/回填中)：退回明细表(较慢，但结果完整)
+                    mode = "raw";
+                    rows = archiveMapper.selectUriStats(from, to, limit);
+                }
+            } catch (Exception e) {
+                rows = new ArrayList<>(); // 表初始化中/列未补齐时降级
+            }
+            uriCache = rows;
+            uriCacheAt = nowMs;
+            uriCacheKey = key;
         }
         Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("rows", rows);
-        resp.put("note", "统计自 MySQL 归档(waf_attack_event), 仅含 2026-10-22 升级后携带 uri 的事件");
+        resp.put("cached", nowMs - uriCacheAt);
+        resp.put("range", from + "~" + to);
+        resp.put("mode", mode);
+        resp.put("note", "统计自分钟聚合表(waf_api_stat，延迟约 1 分钟)；攻击源=该时段单分钟峰值独立 IP 数");
         return resp;
     }
+
+    private volatile List<Map<String, Object>> uriCache;
+    private volatile long uriCacheAt;
+    private volatile String uriCacheKey = "";
 
     // ---------------- MySQL 归档读取(任意时段完整历史) ----------------
 
