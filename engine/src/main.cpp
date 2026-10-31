@@ -26,6 +26,7 @@
 #include "novawaf/protect/geo_filter.h"
 #include "novawaf/protect/iplist_filter.h"
 #include "novawaf/protect/path_policy.h"
+#include "novawaf/protect/rmi_guard.h"
 #include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
@@ -1093,6 +1094,9 @@ int main(int argc, char** argv) {
     // 态势统计事件汇聚（异步写 Redis，可视化大屏数据源）
     EventSink::instance().start();
     TrafficSink::instance().start();
+
+    // L4 RMI 反序列化防护（JRMP 前置代理，命中断连+封 IP；未配置 NOVA_RMI_GUARD_LISTEN/BACKEND 则不启动）
+    RmiGuard::instance().start();
 
     // 网页防篡改缓存（页面基线学习/恢复，后台同步 Redis 持久化与配置热加载）
     TamperCache::instance().start();
