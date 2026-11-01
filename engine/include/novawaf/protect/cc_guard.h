@@ -44,9 +44,13 @@ public:
     DetectionResult assess(const std::string& ip, const std::string& path) {
         int64_t now = nowMs();
         double f = factor_.load(std::memory_order_acquire);
-        int maxReq = (int)(cfg_.maxReqPerWindow * f);
-        int burst = (int)(cfg_.burstPerUrl * f);
+        int baseMax = (int)(cfg_.maxReqPerWindow * f);
+        int baseBurst = (int)(cfg_.burstPerUrl * f);
         int hot = (int)(cfg_.hotUrlGlobal * f);
+        // 阈值抖动：按 IP 生成稳定的 ±15% 偏移（进程启动种子固定），
+        // 使攻击者无法通过探测摸清统一阈值，而正常用户阈值稳定不影响体验。
+        int maxReq = jitterFor(ip, baseMax);
+        int burst = jitterFor(ip, baseBurst);
         if (maxReq < 5) maxReq = 5;
         if (burst < 3) burst = 3;
         int score = 0;
@@ -146,6 +150,19 @@ private:
     static int64_t nowMs() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // 按 IP 生成稳定的 ±15% 阈值抖动：同一 IP 阈值恒定（不影响正常体验），
+    // 不同 IP 阈值不同（攻击者无法跨源归纳统一阈值）。进程启动种子固定。
+    static int jitterFor(const std::string& ip, int base) {
+        static const uint64_t seed =
+            (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+        uint64_t h = std::hash<std::string>{}(ip) ^ seed;
+        int delta = base * 15 / 100;
+        if (delta < 1) delta = 1;
+        int off = (int)(h % (uint64_t)(delta * 2 + 1)) - delta;
+        int r = base + off;
+        return r < 1 ? 1 : r;
     }
 };
 

@@ -27,13 +27,17 @@ public:
             // 2. HTML entity decode
             std::string htmlDecoded = htmlEntityDecode(urlDecoded);
             if (htmlDecoded != urlDecoded) { changed = true; }
+            // 2.5 SQL 语义归一化：注释块/十六进制串/反引号 → 可被词法识别的形态
+            //      （对抗 0x3127... 十六进制编码、/**/ 注释替换空格、`ident` 反引号包裹等绕过）
+            std::string sqlNorm = sqlNormalize(htmlDecoded);
+            if (sqlNorm != htmlDecoded) { changed = true; }
             // 3. Base64 检测解码（尝试）
-            std::string b64 = tryBase64Decode(htmlDecoded);
-            if (!b64.empty() && b64 != htmlDecoded) {
+            std::string b64 = tryBase64Decode(sqlNorm);
+            if (!b64.empty() && b64 != sqlNorm) {
                 next = b64;
                 changed = true;
             } else {
-                next = htmlDecoded;
+                next = sqlNorm;
             }
             // 4. 转小写归一（大小写绕过）
             toLowerInPlace(next);
@@ -89,6 +93,52 @@ public:
                     continue;
                 }
             }
+            out.push_back(s[i++]);
+        }
+        return out;
+    }
+
+    // SQL 语义归一化：把 SQL 语法糖还原为词法可识别的形态，配合后续特征/词法检测。
+    //   - /* ... */ 块注释 → 单个空格（对抗 /**/ 替换空格分隔关键字）
+    //   - 0x[0-9a-fA-F]+ 十六进制字符串 → ASCII（仅当解码结果可打印，对抗 0x312720... 编码）
+    //   - `反引号` → 单引号（MySQL 标识符引号，绕过单引号过滤）
+    // 幂等且对非 SQL 载荷无副作用（XSS/RCE 等不会以这些形态出现）。
+    static std::string sqlNormalize(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size();) {
+            // 块注释 /* ... */ → 空格
+            if (s[i] == '/' && i + 1 < s.size() && s[i + 1] == '*') {
+                size_t end = s.find("*/", i + 2);
+                out.push_back(' ');
+                if (end == std::string::npos) break;  // 未闭合注释：截断后续，保守处理
+                i = end + 2;
+                continue;
+            }
+            // 0x 十六进制串 → ASCII
+            if (s[i] == '0' && i + 1 < s.size() &&
+                (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+                size_t j = i + 2;
+                while (j < s.size() && isHex(s[j])) ++j;
+                std::string hex = s.substr(i + 2, j - i - 2);
+                if (!hex.empty() && (hex.size() % 2) == 0) {
+                    std::string decoded;
+                    decoded.reserve(hex.size() / 2);
+                    bool printable = true;
+                    for (size_t k = 0; k < hex.size(); k += 2) {
+                        unsigned char c = (unsigned char)(hexVal(hex[k]) * 16 + hexVal(hex[k + 1]));
+                        if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') { printable = false; break; }
+                        decoded.push_back((char)c);
+                    }
+                    if (printable && !decoded.empty()) {
+                        out.append(decoded);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            // 反引号 → 单引号
+            if (s[i] == '`') { out.push_back('\''); ++i; continue; }
             out.push_back(s[i++]);
         }
         return out;

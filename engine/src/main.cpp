@@ -141,6 +141,16 @@ static void emitEvt(const std::string& ip, const std::string& cat,
     EventBus<AttackEvent>::instance().publish(e);
 }
 
+// 为引擎直接构造的非拦截响应（502/429/维护页/跳转）注入统一 Server 头，
+// 消除"无 Server 头"与拦截响应/静态页之间的指纹差异。拦截响应由 BlockPage 自带 Server 头，无需调用。
+static void injectServerLine(std::string& resp) {
+    if (WafMode::isPublic(WafMode::instance().current())) return;
+    auto prof = MimicDefense::instance().current();
+    std::string b = prof ? prof->serverBanner : "nginx";
+    size_t p = resp.find("\r\n");
+    if (p != std::string::npos) resp.insert(p + 2, "Server: " + b + "\r\n");
+}
+
 // 统一拦截/挑战响应出口：生成追踪ID → 事件上报（携带 trace 供溯源）→ 按指纹模式渲染独立拦截页。
 // HIDDEN（默认）：无品牌通用页 + Server: nginx；PUBLIC：品牌页 + X-WAF 头（wafw00f 可识别）。
 static std::string blockResp(const std::string& ip, const std::string& cat,
@@ -869,21 +879,25 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         }
                         outResp = failRedirect.empty() ? k502 : buildRedirect(failRedirect);
                         setRespConnection(outResp, false);
+                        injectServerLine(outResp);
                         return false;
                     };
                     _mark();  // [1] 解析+sid+app 结束，进入限流判定
                     if (appMode == 2) {
                         // 维护模式：所有请求返回维护页，不检测、不转发
                         outResp = kMaint;
+                        injectServerLine(outResp);
                     } else if (!ddos.onRequest(req.clientIp)) {
                         // 请求速率超限 → 触发封禁链路，返回 429
                         outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+                        injectServerLine(outResp);
                         shield.recordBlock();
                         emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "DDoS", "rate");
                         tBlocked = true;
                     } else if (!limiter.allow(req.clientIp)) {
                         outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+                        injectServerLine(outResp);
                         shield.recordBlock();
                         emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "RateLimit", "rate");

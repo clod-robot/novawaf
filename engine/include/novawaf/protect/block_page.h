@@ -18,7 +18,9 @@ namespace novawaf {
 
 class BlockPage {
 public:
-    // trc-<base36时间>-<5位随机hex>，全局唯一、可按时间排序
+    // 追踪 ID 生成：<base36时间>-<8位随机hex>，全局唯一、可按时间排序。
+    // 故意不使用固定前缀（如 trc-），避免响应头/页面形成可被指纹库固化的产品级标识；
+    // 排障仍可按该 ID 在事件中心溯源（控制台按 IP/时间关联）。
     static std::string genTraceId() {
         static const char* b36 = "0123456789abcdefghijklmnopqrstuvwxyz";
         uint64_t t = (uint64_t)std::time(nullptr);
@@ -30,9 +32,9 @@ public:
         if (::getrandom(&rnd, sizeof(rnd), 0) != (ssize_t)sizeof(rnd)) {
             rnd = (uint32_t)(t * 2654435761u) ^ 0x9e3779b9u;
         }
-        char rb[8];
-        std::snprintf(rb, sizeof(rb), "%05x", rnd & 0xFFFFF);
-        return std::string("trc-") + (tb + i) + "-" + rb;
+        char rb[10];
+        std::snprintf(rb, sizeof(rb), "%08x", rnd);
+        return std::string(tb + i) + "-" + rb;
     }
 
     // 渲染完整 HTTP 响应（状态行+头+HTML体）。
@@ -44,7 +46,16 @@ public:
     static std::string render(const char* status, const char* statusText,
                               const std::string& title, const std::string& detail,
                               const std::string& traceId, bool branded) {
-        std::string body = html(title, detail, traceId, branded);
+        // HIDDEN 模式（branded=false）：拦截页必须伪装成站点原生错误，不出现"拦截/防护"等
+        // 自我宣告字样，否则等于向攻击者暴露 WAF 存在并提供"被拦=载荷被识别"的即时反馈通道。
+        // 标题统一为状态码+状态文本，详情留空；PUBLIC 模式保留品牌化中文提示。
+        std::string t = title;
+        std::string d = detail;
+        if (!branded) {
+            t = std::string(status) + " " + statusText;
+            d.clear();
+        }
+        std::string body = html(t, d, traceId, branded);
         std::string resp;
         resp.reserve(body.size() + 512);
         resp += "HTTP/1.1 ";

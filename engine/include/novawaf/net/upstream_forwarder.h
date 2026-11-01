@@ -190,6 +190,7 @@ private:
                     "Cache-Control: no-store\r\n\r\n" + body;
             }
             setResponseConnection(e, false);
+            normalizeServerHeader(e);
             writeAll(ctx.clientFd, e);
             finishClient(ctx);
             return;
@@ -198,6 +199,7 @@ private:
         if (isStreamResp(outResp)) {
             if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
             setResponseConnection(outResp, false);
+            normalizeServerHeader(outResp);
             writeAll(ctx.clientFd, outResp);
             relay(ctx.clientFd, ufd);
             connPool_.discard(ufd);
@@ -213,6 +215,7 @@ private:
         }
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
         setResponseConnection(outResp, ctx.keepAlive);
+        normalizeServerHeader(outResp);
         if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
         finishClient(ctx);
@@ -356,6 +359,37 @@ private:
     static std::string sessCookieName() {
         if (WafMode::isPublic(WafMode::instance().current())) return "novasid";
         return MimicDefense::instance().cookieName("sid");
+    }
+
+    // 上游响应 Server 头归一化（消除指纹三态）：
+    //   HIDDEN 模式下，经 WAF 转发的响应统一 Server 头为人格 banner——
+    //   上游无 Server 头则追加，有则替换。避免"上游无 Server / nginx 带版本号"形成
+    //   可被探测的路径级指纹差异。PUBLIC 模式保留上游原样（品牌威慑优先）。
+    static void normalizeServerHeader(std::string& resp) {
+        if (WafMode::isPublic(WafMode::instance().current())) return;
+        std::string banner = "nginx";
+        auto prof = MimicDefense::instance().current();
+        if (prof) banner = prof->serverBanner;
+        size_t he = resp.find("\r\n\r\n");
+        std::string head = (he == std::string::npos) ? resp : resp.substr(0, he);
+        std::string body = (he == std::string::npos) ? "" : resp.substr(he + 4);
+        std::string out;
+        size_t pos = 0;
+        while (pos < head.size()) {
+            size_t eol = head.find("\r\n", pos);
+            std::string line = (eol == std::string::npos) ? head.substr(pos) : head.substr(pos, eol - pos);
+            std::string low = line;
+            for (auto& c : low) c = (char)tolower((unsigned char)c);
+            if (low.compare(0, 7, "server:") != 0) {
+                out += line; out += "\r\n";
+            }
+            if (eol == std::string::npos) break;
+            pos = eol + 2;
+        }
+        size_t firstEol = out.find("\r\n");
+        if (firstEol != std::string::npos)
+            out.insert(firstEol + 2, "Server: " + banner + "\r\n");
+        resp = out + "\r\n" + body;
     }
 
     static int respStatus(const std::string& resp) {

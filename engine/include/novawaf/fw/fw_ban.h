@@ -38,7 +38,9 @@ public:
     }
     bool disabled() const { return disabled_; }
 
-    // 热路径：投递一个待封禁 IP（同 IP 在去重窗口内只投一次，避免刷屏）
+    // 热路径：投递一个待封禁 IP（同 IP 在去重窗口内只投一次，避免刷屏）。
+    // 累犯分级：维护 IP 违规次数，随消息一起投递，由 fw_enforcer 据此决定分级 TTL
+    //   （首次短封、累犯递增），使封禁行为可预期且对重复攻击者更严厉。
     void enqueue(const std::string& ip, const std::string& category, const std::string& ruleId) {
         if (disabled_ || ip.empty()) return;
         if (ip == "127.0.0.1" || ip == "::1") return;  // 绝不封本机
@@ -47,11 +49,20 @@ public:
         auto it = lastSent_.find(ip);
         if (it != lastSent_.end() && now - it->second < kDedupSec) return;  // 去重窗口
         lastSent_[ip] = now;
-        queue_.push_back(ip + "|" + std::to_string(now) + "|" + category + "|" + ruleId);
+        // 累犯计数：1 小时内重复违规递增，超时重置为首次
+        int count = 1;
+        auto cit = offenseCount_.find(ip);
+        if (cit != offenseCount_.end() && now - cit->second.second < kOffenseWindow) {
+            count = cit->second.first + 1;
+        }
+        offenseCount_[ip] = {count, now};
+        queue_.push_back(ip + "|" + std::to_string(now) + "|" + category + "|" + ruleId +
+                           "|" + std::to_string(count));
     }
 
 private:
     static constexpr int kDedupSec = 60;
+    static constexpr int64_t kOffenseWindow = 3600;  // 累犯计数窗口（秒），超时重置为首次
     void run() {
         RedisClient r;
         bool connected = false;
@@ -74,6 +85,16 @@ private:
             if (!batch.empty() && ensureConn()) {
                 r.rpushMulti("novawaf:fw:ban", batch);
             }
+            // 清理过期累犯计数，防止内存无限增长
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                int64_t now = std::time(nullptr);
+                for (auto it = offenseCount_.begin(); it != offenseCount_.end();) {
+                    if (now - it->second.second >= kOffenseWindow)
+                        it = offenseCount_.erase(it);
+                    else ++it;
+                }
+            }
             for (int i = 0; i < 5 && running_; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -85,6 +106,7 @@ private:
     std::mutex mtx_;
     std::vector<std::string> queue_;
     std::unordered_map<std::string, int64_t> lastSent_;  // IP -> 上次投递时间，去重
+    std::unordered_map<std::string, std::pair<int, int64_t>> offenseCount_;  // IP -> {违规次数, 末次时间}
 };
 
 }  // namespace novawaf
