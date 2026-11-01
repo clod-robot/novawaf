@@ -127,6 +127,10 @@ export const api = {
   // 攻击溯源分析：攻击源 IP 排行 + 单 IP 攻击链时间线 + API 维度统计
   traceSummary: (limit) => http.get('/trace/summary', { params: { limit } }),
   traceIp: (ip, from, to) => http.get('/trace/ip/' + encodeURIComponent(ip), { params: { from, to } }),
-  traceUriStats: (from, to, limit) => http.get('/trace/uri-stats', { params: { from, to, limit } })
+  traceUriStats: (from, to, limit) => http.get('/trace/uri-stats', { params: { from, to, limit } }),
+  // 系统设置：全局防护模式（WAF 指纹三态）+ 检测规则版本
+  settingsWafModeGet: () => http.get('/settings/waf-mode'),
+  settingsWafModeSave: (mode) => http.put('/settings/waf-mode', { mode }),
+  settingsRulesVersion: () => http.get('/settings/rules-version')
 }
 export default http

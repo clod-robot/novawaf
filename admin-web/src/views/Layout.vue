@@ -75,7 +75,8 @@ const all = [
     ] }
   ] },
   { path: '/system/user', title: '用户管理', perm: 'sys:user:list', icon: 'User' },
-  { path: '/system/log', title: '审计日志', perm: 'sys:log:list', icon: 'Tickets' }
+  { path: '/system/log', title: '审计日志', perm: 'sys:log:list', icon: 'Tickets' },
+  { path: '/system/settings', title: '系统设置', perm: 'system:settings:list', icon: 'Setting' }
 ]
 // 目录节点按子项可见性过滤：无权限时整组隐藏
 function filterTree(items) {

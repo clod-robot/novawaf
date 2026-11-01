@@ -118,6 +118,19 @@ public class WafRedisService {
             redis.opsForValue().set("novawaf:rules", DEFAULT_RULES);
             bumpRulesVersion();
         }
+        // 版本元数据兜底：seed 后或历史数据缺 meta 时补齐，保证设置页版本信息完整
+        Map<Object, Object> meta = redis.opsForHash().entries("novawaf:rules:meta");
+        if (meta.get("updatedAt") == null) {
+            int count = 0;
+            Object arr = parse(redis.opsForValue().get("novawaf:rules"));
+            if (arr instanceof List) count = ((List<?>) arr).size();
+            Map<String, String> m = new HashMap<>();
+            m.put("updatedAt", java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+            m.put("count", String.valueOf(count));
+            m.put("source", "内置规则集(通用攻击特征+CVE定向)");
+            redis.opsForHash().putAll("novawaf:rules:meta", m);
+        }
     }
 
     /** 防护应用列表(novawaf:apps)，叠加每应用今日统计与引擎能力标签 */
@@ -548,5 +561,49 @@ public class WafRedisService {
     public void setRules(String json) {
         redis.opsForValue().set("novawaf:rules", json);
         bumpRulesVersion();
+        // 规则版本元数据：设置页展示可维护的版本管理（条数/更新时间/来源）
+        int count = 0;
+        Object arr = parse(json);
+        if (arr instanceof List) count = ((List<?>) arr).size();
+        Map<String, String> meta = new HashMap<>();
+        meta.put("updatedAt", java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+        meta.put("count", String.valueOf(count));
+        meta.putIfAbsent("source", "内置规则集(通用攻击特征+CVE定向)");
+        redis.opsForHash().putAll("novawaf:rules:meta", meta);
+    }
+
+    /* ---------- 全局防护模式（WAF 指纹三态） ---------- */
+
+    /** 读取全局防护模式：hidden(默认)/public/off。键缺失或非法值一律回退 hidden（fail-safe，与引擎一致）。 */
+    public String getWafMode() {
+        String v = redis.opsForValue().get("novawaf:wafmode");
+        if (v == null) return "hidden";
+        v = v.trim().toLowerCase();
+        return ("public".equals(v) || "off".equals(v)) ? v : "hidden";
+    }
+
+    /** 设置全局防护模式：hidden(开启且隐藏指纹)/public(开启且公开指纹)/off(关闭防护仅观察)。引擎热路径 2s 内生效。 */
+    public void setWafMode(String mode) {
+        String m = mode == null ? "" : mode.trim().toLowerCase();
+        if (!m.equals("hidden") && !m.equals("public") && !m.equals("off"))
+            throw new BusinessException(400, "非法模式: " + mode + " (可选 hidden/public/off)");
+        redis.opsForValue().set("novawaf:wafmode", m);
+    }
+
+    /* ---------- 规则版本管理 ---------- */
+
+    /** 规则版本信息：版本号(单调递增)/规则条数/最近更新时间/规则集来源 */
+    public Map<String, Object> rulesVersionInfo() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("version", toLong(redis.opsForValue().get("novawaf:rules:version")));
+        int count = 0;
+        Object arr = parse(redis.opsForValue().get("novawaf:rules"));
+        if (arr instanceof List) count = ((List<?>) arr).size();
+        m.put("count", count);
+        Map<Object, Object> meta = redis.opsForHash().entries("novawaf:rules:meta");
+        m.put("updatedAt", meta.get("updatedAt") == null ? "" : String.valueOf(meta.get("updatedAt")));
+        m.put("source", meta.get("source") == null ? "内置规则集(通用攻击特征+CVE定向)" : String.valueOf(meta.get("source")));
+        return m;
     }
 }

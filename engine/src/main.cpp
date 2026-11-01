@@ -27,6 +27,8 @@
 #include "novawaf/protect/iplist_filter.h"
 #include "novawaf/protect/path_policy.h"
 #include "novawaf/protect/rmi_guard.h"
+#include "novawaf/core/waf_mode.h"
+#include "novawaf/protect/block_page.h"
 #include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
@@ -129,12 +131,29 @@ struct StageTimer {
 static void emitEvt(const std::string& ip, const std::string& cat,
                     const std::string& action, const std::string& ruleId,
                     const std::string& matched,
-                    const std::string& uri = "", const std::string& host = "") {
+                    const std::string& uri = "", const std::string& host = "",
+                    const std::string& traceId = "") {
     AttackEvent e;
     e.ts = (int64_t)std::time(nullptr);
     e.ip = ip; e.category = cat; e.action = action; e.ruleId = ruleId; e.matched = matched;
-    e.uri = uri; e.host = host;
+    e.uri = uri; e.host = host; e.traceId = traceId;
     EventBus<AttackEvent>::instance().publish(e);
+}
+
+// 统一拦截/挑战响应出口：生成追踪ID → 事件上报（携带 trace 供溯源）→ 按指纹模式渲染独立拦截页。
+// HIDDEN（默认）：无品牌通用页 + Server: nginx；PUBLIC：品牌页 + X-WAF 头（wafw00f 可识别）。
+static std::string blockResp(const std::string& ip, const std::string& cat,
+                             const std::string& ruleId, const std::string& matched,
+                             const std::string& uri, const std::string& host,
+                             bool challenge = false) {
+    std::string tid = BlockPage::genTraceId();
+    emitEvt(ip, cat, challenge ? "challenge" : "block", ruleId, matched, uri, host, tid);
+    bool branded = WafMode::isPublic(WafMode::instance().current());
+    if (challenge)
+        return BlockPage::render("503", "Service Unavailable", "访问频率异常",
+                                 "系统检测到异常访问行为，请稍后重试", tid, branded);
+    return BlockPage::render("403", "Forbidden", "请求已被拦截",
+                             branded ? ("命中安全防护策略：" + cat) : "命中站点安全策略", tid, branded);
 }
 
 // 拆分逗号分隔字符串（用于 NOVA_GEO_BLOCK=CN,RU 等环境变量）
@@ -242,7 +261,10 @@ static int createListenFd(int port, int backlog) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // NOVA_LISTEN_ADDR 指定绑定地址（默认 0.0.0.0 兼容旧部署）。生产应设 127.0.0.1：
+    // 引擎只接受同机 nginx 反代流量，杜绝绕过 443 直连 WAF 端口的暴露面。
+    const char* bindIp = getenv("NOVA_LISTEN_ADDR");
+    addr.sin_addr.s_addr = (bindIp && *bindIp) ? inet_addr(bindIp) : htonl(INADDR_ANY);
     addr.sin_port = htons(port);
     if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     if (listen(fd, backlog) < 0) { close(fd); return -1; }
@@ -357,7 +379,7 @@ static std::string genSid() {
     for (int i = 0; i < 16; ++i) { s += hx[buf[i] >> 4]; s += hx[buf[i] & 0xf]; }
     return s;
 }
-// 从请求头提取 novasid
+// 从请求头提取会话 cookie（novasid 品牌名 / sid 通用名，对应指纹三态的 PUBLIC/HIDDEN）
 static std::string getCookieSid(const std::unordered_map<std::string,std::string>& headers) {
     for (auto& [k, v] : headers) {
         std::string lk = k; for (auto& c : lk) c = (char)tolower((unsigned char)c);
@@ -367,7 +389,7 @@ static std::string getCookieSid(const std::unordered_map<std::string,std::string
                 size_t sc = v.find(';', p);
                 std::string kv = (sc == std::string::npos) ? v.substr(p) : v.substr(p, sc - p);
                 size_t a = 0; while (a < kv.size() && isspace((unsigned char)kv[a])) ++a;
-                if (kv.compare(a, 7, "novasid") == 0) {
+                if (kv.compare(a, 7, "novasid") == 0 || kv.compare(a, 3, "sid") == 0) {
                     size_t eq = kv.find('=', a);
                     if (eq != std::string::npos) return kv.substr(eq + 1);
                 }
@@ -400,6 +422,12 @@ static std::string hdrCi(const HttpRequest& req, const std::string& key) {
         if (eq) return kv.second;
     }
     return {};
+}
+
+// 是否 API 接口请求：/api/ 前缀的 XHR/JSON 调用。
+// Bot JS 挑战只对页面路由有意义；API 客户端（axios/脚本）不执行 JS，挑战等于永久误杀。
+static bool isApiPath(const std::string& path) {
+    return path.rfind("/api/", 0) == 0 || path == "/api";
 }
 
 // ---- HTTP keep-alive 支持 ----
@@ -712,6 +740,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     const App* app = apps ? app_reg::select(*apps, hostHdr) : nullptr;
                     std::string appId = app ? app->id : "";
                     int appMode = app ? app->mode : 0; // 0防护 1观察 2维护
+                    // 全局防护模式（指纹三态）：OFF=旁路，全站降级为观察（仅记录不拦截不封禁）；
+                    // HIDDEN/PUBLIC 仅影响拦截页品牌与会话 cookie 指纹，不影响检测语义。
+                    const WafMode::Mode wafMode = WafMode::instance().current();
+                    if (wafMode == WafMode::OFF) appMode = 1;
                     // API 路径级防护策略：仅记录(log)/放行(pass)，按应用隔离 + 最长前缀匹配（控制台热配置）
                     PathPolicy::Match pathMatch = PathPolicy::instance().match(req.path, appId);
                     const std::string policyId = pathMatch.id;  // 命中策略 ID，用于按策略统计访问/拦截/放行次数
@@ -858,12 +890,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         switch (IpListFilter::instance().match(req.clientIp)) {
                             case IpListFilter::Verdict::WHITE: whitelisted = true; break;
                             case IpListFilter::Verdict::BLACK:
-                                outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 44\r\n\r\n"
-                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                outResp = blockResp(req.clientIp, "IpList", "IP-BLACK",
+                                                    std::string("blacklisted ip ") + req.clientIp,
+                                                    req.path, hdrCi(req, "Host"));
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, "IpList", "block", "IP-BLACK",
-                                        std::string("blacklisted ip ") + req.clientIp, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                                 break;
                             default: break;
@@ -873,11 +903,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             if (tr && tr->isBlocked()) {
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
                                             idx, tr->category.c_str(), ipstr, tr->matched.c_str());
-                                outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 44\r\n\r\n"
-                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                outResp = blockResp(req.clientIp, tr->category, tr->ruleId,
+                                                    tr->matched, req.path, hdrCi(req, "Host"));
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, tr->category, "block", tr->ruleId, tr->matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -889,11 +917,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             if (gr && gr->isBlocked()) {
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK Geo from %s: %s\n",
                                             idx, ipstr, gr->matched.c_str());
-                                outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 44\r\n\r\n"
-                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                outResp = blockResp(req.clientIp, "Geo", gr->ruleId,
+                                                    gr->matched, req.path, hdrCi(req, "Host"));
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, "Geo", "block", gr->ruleId, gr->matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -903,32 +929,24 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] %s CC from %s: %s\n",
                                             idx, cr.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, cr.matched.c_str());
-                                outResp = (cr.action == Action::BLOCK)
-                                       ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 44\r\n\r\n"
-                                         "<html><body>Blocked by NovaWAF</body></html>"
-                                       : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 0\r\n\r\n";
+                                outResp = blockResp(req.clientIp, "CC", cr.ruleId, cr.matched,
+                                                    req.path, hdrCi(req, "Host"),
+                                                    cr.action != Action::BLOCK);
                                 if (cr.action == Action::BLOCK) shield.recordBlock();
-                                emitEvt(req.clientIp, "CC", cr.action == Action::BLOCK ? "block" : "challenge", cr.ruleId, cr.matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
-                        // Bot 行为防护
-                        if (!whitelisted && !policyPass && !blocked) {
+                        // Bot 行为防护（跳过 /api/ 接口：JS 挑战对 API 客户端无意义，避免误杀脚本化调用）
+                        if (!whitelisted && !policyPass && !blocked && !isApiPath(req.path)) {
                             DetectionResult br = bot.assess(req, ja4);
                             if (br.action != Action::PASS) {
                                 if (g_debugLog) std::printf("[reactor %d] %s Bot from %s: %s\n",
                                             idx, br.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, br.matched.c_str());
-                                outResp = (br.action == Action::BLOCK)
-                                       ? "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 44\r\n\r\n"
-                                         "<html><body>Blocked by NovaWAF</body></html>"
-                                       : "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\n"
-                                         "Content-Length: 0\r\n\r\n";
+                                outResp = blockResp(req.clientIp, "Bot", br.ruleId, br.matched,
+                                                    req.path, hdrCi(req, "Host"),
+                                                    br.action != Action::BLOCK);
                                 if (br.action == Action::BLOCK) shield.recordBlock();
-                                emitEvt(req.clientIp, "Bot", br.action == Action::BLOCK ? "block" : "challenge", br.ruleId, br.matched, req.path, hdrCi(req, "Host"));
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
@@ -939,11 +957,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             if (dr.isBlocked()) {
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK %s from %s: %s\n",
                                             idx, dr.category.c_str(), ipstr, dr.matched.c_str());
-                                outResp = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n"
-                                       "Content-Length: 44\r\n\r\n"
-                                       "<html><body>Blocked by NovaWAF</body></html>";
+                                outResp = blockResp(req.clientIp, dr.category, dr.ruleId,
+                                                    dr.matched, req.path, hdrCi(req, "Host"));
                                 shield.recordBlock();
-                                emitEvt(req.clientIp, dr.category, "block", dr.ruleId, dr.matched, req.path, hdrCi(req, "Host"));
                                 tBlocked = true; tAttack = true;
                             } else {
                                 asyncHandled = forwardToApp();
@@ -967,8 +983,12 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     }
                     // 确认攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁）
                     if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
-                    if (newSess && !outResp.empty())
-                        injectHeader(outResp, "Set-Cookie: novasid=" + sid + "; Path=/; HttpOnly");
+                    // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=通用 sid 名
+                    // （与任意站点会话 cookie 同形，wafw00f 无法归因）；关闭=不注入。
+                    if (newSess && !outResp.empty() && wafMode != WafMode::OFF)
+                        injectHeader(outResp, std::string("Set-Cookie: ") +
+                            (WafMode::isPublic(wafMode) ? "novasid=" : "sid=") + sid +
+                            "; Path=/; HttpOnly");
                     // 流量统计埋点（已启用统计的应用，或命中 API 防护策略需按策略计数；热路径入队不阻塞）
                     if ((app && app->statsEnabled) || !policyId.empty()) {
                         TrafficReq tr;

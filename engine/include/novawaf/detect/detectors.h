@@ -529,6 +529,10 @@ public:
             req.headers.count("X-Csrf-Token") || req.headers.count("X-Xsrf-Token"))
             return {};
         std::string host = headerCi(req, "Host");
+        // 前置可信反代(nginx)会把 Host 重写为内部上游名(如 novawaf-admin)，
+        // 同源校验须以用户可见的原始 Host 为准，由 X-Forwarded-Host 透传
+        std::string xfh = headerCi(req, "X-Forwarded-Host");
+        if (!xfh.empty()) host = xfh;
         std::string origin = headerCi(req, "Origin");
         std::string referer = headerCi(req, "Referer");
         std::string src = !origin.empty() ? origin : referer;

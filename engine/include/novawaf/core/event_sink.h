@@ -36,6 +36,7 @@ struct AttackEvent {
     std::string severity;    //  high / medium / low / info（可为空）
     std::string uri;         //  请求 path（含 query），供按 API 维度统计拦截量
     std::string host;        //  请求 Host 头，供按应用/域名维度区分
+    std::string traceId;     //  拦截追踪 ID（trc-*），与拦截页/X-Request-Id 一致，供一键溯源
 };
 
 class EventSink {
@@ -236,7 +237,9 @@ private:
           << ",\"matched\":\"" << esc(e.matched) << "\""
           << ",\"severity\":\"" << esc(e.severity) << "\""
           << ",\"uri\":\"" << esc(e.uri) << "\""
-          << ",\"host\":\"" << esc(e.host) << "\"}";
+          << ",\"host\":\"" << esc(e.host) << "\"";
+        if (!e.traceId.empty()) o << ",\"trace\":\"" << esc(e.traceId) << "\"";
+        o << "}";
         return o.str();
     }
 
