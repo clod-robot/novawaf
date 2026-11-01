@@ -65,7 +65,67 @@ public:
         return resp;
     }
 
+    // 拟态渲染：按画像输出目标服务器风格的原生错误页（无品牌、无 NovaWAF 痕迹）。
+    //   tpl: 0=nginx 风格 1=Apache 风格 2=IIS 风格 3=nginx 404 风格 4=nginx 503 风格
+    //   banner: Server 响应头与页脚签名（与画像一致）
+    // 追踪 ID 仅经 X-Request-Id 响应头携带（页面不展示，保持原生风格拟真；
+    // 溯源走事件中心，控制台按 IP/时间关联）。
+    static std::string renderMimic(int status, const char* statusText, int tpl,
+                                   const char* banner, const std::string& traceId) {
+        std::string body = mimicHtml(status, statusText, tpl, banner);
+        std::string resp;
+        resp.reserve(body.size() + 256);
+        resp += "HTTP/1.1 " + std::to_string(status) + " " + statusText + "\r\n"
+                "Server: " + banner + "\r\n"
+                "Content-Type: text/html\r\n"
+                "X-Request-Id: " + traceId + "\r\n"
+                "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        resp += body;
+        return resp;
+    }
+
 private:
+    static std::string mimicHtml(int status, const char* statusText, int tpl,
+                                 const char* banner) {
+        std::string code = std::to_string(status);
+        std::string title = code + " " + statusText;
+        switch (tpl) {
+            case 1:  // Apache 2.x 默认 403
+                return "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
+                       "<html><head>\n<title>" + title + "</title>\n</head><body>\n"
+                       "<h1>Forbidden</h1>\n"
+                       "<p>You don't have permission to access this resource on this server.</p>\n"
+                       "<hr>\n<address>" + banner + " Server at localhost Port 80</address>\n"
+                       "</body></html>\n";
+            case 2:  // IIS 10 默认 403
+                return "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" "
+                       "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n"
+                       "<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n"
+                       "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\"/>\n"
+                       "<title>403 - Forbidden: Access is denied.</title>\n"
+                       "<style type=\"text/css\">body{margin:0;font-family:Verdana,Arial,sans-serif;"
+                       "font-size:.7em;background:#EFEFF0;color:#000}"
+                       "#header{width:96%;margin:0 0 0 0;padding:6px 2% 6px 2%;}"
+                       "h1{font-size:1.4em;margin:0 0 0 0}h2{font-size:1.1em;margin:0 0 0 0}"
+                       "h3{font-size:.9em;font-weight:normal;margin:0 0 0 0}"
+                       "#content{padding:0 2% 2% 2%}</style>\n</head>\n"
+                       "<body><div id=\"header\"><h1>Server Error</h1></div>\n"
+                       "<div id=\"content\"><h2>403 - Forbidden: Access is denied.</h2>\n"
+                       "<h3>You do not have permission to view this directory or page "
+                       "using the credentials that you supplied.</h3></div>\n</body></html>\n";
+            case 3:  // nginx 404（幽灵人格：被拦路径在扫描器报告中"不存在"）
+                title = "404 Not Found";
+                [[fallthrough]];
+            case 4:  // nginx 503（过载人格：诱导扫描器降速）
+                if (tpl == 4) title = "503 Service Temporarily Unavailable";
+                [[fallthrough]];
+            default:  // nginx 原生错误页风格
+                return "<html>\n<head><title>" + title + "</title></head>\n"
+                       "<body>\n<center><h1>" + title + "</h1></center>\n"
+                       "<hr><center>" + banner + "</center>\n</body>\n</html>\n";
+        }
+    }
+
     static std::string esc(const std::string& s) {
         std::string o;
         o.reserve(s.size());

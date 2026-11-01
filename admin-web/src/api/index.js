@@ -128,9 +128,12 @@ export const api = {
   traceSummary: (limit) => http.get('/trace/summary', { params: { limit } }),
   traceIp: (ip, from, to) => http.get('/trace/ip/' + encodeURIComponent(ip), { params: { from, to } }),
   traceUriStats: (from, to, limit) => http.get('/trace/uri-stats', { params: { from, to, limit } }),
-  // 系统设置：全局防护模式（WAF 指纹三态）+ 检测规则版本
+  // 系统设置：全局防护模式（WAF 指纹三态）+ 检测规则版本 + 拟态防御
   settingsWafModeGet: () => http.get('/settings/waf-mode'),
   settingsWafModeSave: (mode) => http.put('/settings/waf-mode', { mode }),
-  settingsRulesVersion: () => http.get('/settings/rules-version')
+  settingsRulesVersion: () => http.get('/settings/rules-version'),
+  settingsMimicGet: () => http.get('/settings/mimic'),
+  settingsMimicSave: (d) => http.put('/settings/mimic', d),
+  settingsMimicRotateSalt: () => http.post('/settings/mimic/rotate-salt')
 }
 export default http

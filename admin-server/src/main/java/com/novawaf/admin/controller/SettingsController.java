@@ -48,4 +48,39 @@ public class SettingsController {
     public Result<Map<String, Object>> rulesVersion() {
         return Result.ok(waf.rulesVersionInfo());
     }
+
+    /** 查询拟态防御配置与引擎当前人格预览 */
+    @RequirePerms("system:settings:list")
+    @GetMapping("/mimic")
+    public Result<Map<String, Object>> getMimic() {
+        return Result.ok(waf.getMimic());
+    }
+
+    /** 设置拟态防御：enabled 开关 + windowMin 轮换窗口(分钟,5-1440)。
+     *  启用后拦截响应的 Server banner/状态码/页面模板/会话 cookie 名按时间窗确定性轮换，
+     *  攻击者跨窗指纹探测结论全部失效；仅作用于"隐藏指纹"模式。引擎 2s 内热生效。 */
+    @RequirePerms("system:settings:edit")
+    @PutMapping("/mimic")
+    public Result<String> setMimic(@RequestBody Map<String, Object> req) {
+        boolean enabled = Boolean.TRUE.equals(req.get("enabled"))
+                || "true".equals(String.valueOf(req.get("enabled")));
+        int windowMin = 60;
+        try { windowMin = Integer.parseInt(String.valueOf(req.get("windowMin"))); }
+        catch (Exception ignore) {}
+        waf.setMimic(enabled, windowMin);
+        String by = UserContext.get() == null ? "system" : UserContext.get().getUsername();
+        audit.record(by, "system", "设置拟态防御", "PUT", null, 1,
+                "mimic=" + (enabled ? "on" : "off") + ",windowMin=" + windowMin, 0);
+        return Result.ok(enabled ? "拟态防御已开启，引擎 2 秒内热生效" : "拟态防御已关闭");
+    }
+
+    /** 一键轮换盐：全部人格序列立即更换，正在进行的探测结论即刻作废 */
+    @RequirePerms("system:settings:edit")
+    @PostMapping("/mimic/rotate-salt")
+    public Result<String> rotateMimicSalt() {
+        String tail = waf.rotateMimicSalt();
+        String by = UserContext.get() == null ? "system" : UserContext.get().getUsername();
+        audit.record(by, "system", "轮换拟态盐", "POST", null, 1, "saltTail=" + tail, 0);
+        return Result.ok("盐已轮换(尾号 " + tail + ")，全部人格序列已更换");
+    }
 }

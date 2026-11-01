@@ -29,6 +29,7 @@
 #include "novawaf/protect/rmi_guard.h"
 #include "novawaf/core/waf_mode.h"
 #include "novawaf/protect/block_page.h"
+#include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/net/http_parser.h"
@@ -145,10 +146,21 @@ static void emitEvt(const std::string& ip, const std::string& cat,
 static std::string blockResp(const std::string& ip, const std::string& cat,
                              const std::string& ruleId, const std::string& matched,
                              const std::string& uri, const std::string& host,
-                             bool challenge = false) {
+                             bool challenge = false, bool scanner = false) {
     std::string tid = BlockPage::genTraceId();
     emitEvt(ip, cat, challenge ? "challenge" : "block", ruleId, matched, uri, host, tid);
     bool branded = WafMode::isPublic(WafMode::instance().current());
+    // 拟态防御（仅 HIDDEN 模式）：拦截响应的 banner/状态码/页面风格按时间窗人格轮换，
+    // 攻击者无法获得稳定指纹；扫描器来源每次随机人格，同窗内连续探测亦自相矛盾。
+    // 检测语义零影响：内部解析检测始终全维度最严，拟态只改变对外表现。
+    if (!branded) {
+        auto& mm = MimicDefense::instance();
+        if (mm.current()) {
+            const MimicDefense::Profile* prof = scanner ? mm.randomProfile() : mm.current();
+            return BlockPage::renderMimic(prof->blockStatus, prof->blockStatusText,
+                                          prof->pageTemplate, prof->serverBanner, tid);
+        }
+    }
     if (challenge)
         return BlockPage::render("503", "Service Unavailable", "访问频率异常",
                                  "系统检测到异常访问行为，请稍后重试", tid, branded);
@@ -379,8 +391,13 @@ static std::string genSid() {
     for (int i = 0; i < 16; ++i) { s += hx[buf[i] >> 4]; s += hx[buf[i] & 0xf]; }
     return s;
 }
-// 从请求头提取会话 cookie（novasid 品牌名 / sid 通用名，对应指纹三态的 PUBLIC/HIDDEN）
+// 从请求头提取会话 cookie。可识别的名字 = 品牌名 novasid + 拟态人格池全部 cookie 名
+// （跨窗轮换后旧窗签发的 cookie 仍可被识别，保证 UV 去重与行为分析连续）。
 static std::string getCookieSid(const std::unordered_map<std::string,std::string>& headers) {
+    static const char* kNames[] = {
+        "novasid", "sid", "sess", "session", "token",
+        "PHPSESSID", "JSESSIONID", "ASP.NET_SessionId"
+    };
     for (auto& [k, v] : headers) {
         std::string lk = k; for (auto& c : lk) c = (char)tolower((unsigned char)c);
         if (lk == "cookie") {
@@ -389,9 +406,10 @@ static std::string getCookieSid(const std::unordered_map<std::string,std::string
                 size_t sc = v.find(';', p);
                 std::string kv = (sc == std::string::npos) ? v.substr(p) : v.substr(p, sc - p);
                 size_t a = 0; while (a < kv.size() && isspace((unsigned char)kv[a])) ++a;
-                if (kv.compare(a, 7, "novasid") == 0 || kv.compare(a, 3, "sid") == 0) {
-                    size_t eq = kv.find('=', a);
-                    if (eq != std::string::npos) return kv.substr(eq + 1);
+                for (auto* n : kNames) {
+                    size_t nl = std::strlen(n);
+                    if (kv.compare(a, nl, n) == 0 && a + nl < kv.size() && kv[a + nl] == '=')
+                        return kv.substr(a + nl + 1);
                 }
                 if (sc == std::string::npos) break;
                 p = sc + 1;
@@ -691,6 +709,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     if (parser.hasError()) { keepOpen = false; break; }
                     HttpRequest req = parser.request();
                     keepAlive = wantsKeepAlive(req);
+                    // 拟态探测干扰：扫描器 UA 特征的拦截响应每次随机人格（同窗内亦矛盾）
+                    const bool scannerUa = MimicDefense::looksLikeScanner(hdrCi(req, "User-Agent"));
                     // 直连对端 IP 按连接缓存（keep-alive 多请求只解析一次）
                     {
                         std::lock_guard<std::mutex> lk(busyMtx);
@@ -892,7 +912,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             case IpListFilter::Verdict::BLACK:
                                 outResp = blockResp(req.clientIp, "IpList", "IP-BLACK",
                                                     std::string("blacklisted ip ") + req.clientIp,
-                                                    req.path, hdrCi(req, "Host"));
+                                                    req.path, hdrCi(req, "Host"), false, scannerUa);
                                 shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
                                 break;
@@ -904,7 +924,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK TI-%s from %s: %s\n",
                                             idx, tr->category.c_str(), ipstr, tr->matched.c_str());
                                 outResp = blockResp(req.clientIp, tr->category, tr->ruleId,
-                                                    tr->matched, req.path, hdrCi(req, "Host"));
+                                                    tr->matched, req.path, hdrCi(req, "Host"),
+                                                    false, scannerUa);
                                 shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
@@ -918,7 +939,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK Geo from %s: %s\n",
                                             idx, ipstr, gr->matched.c_str());
                                 outResp = blockResp(req.clientIp, "Geo", gr->ruleId,
-                                                    gr->matched, req.path, hdrCi(req, "Host"));
+                                                    gr->matched, req.path, hdrCi(req, "Host"),
+                                                    false, scannerUa);
                                 shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
@@ -931,7 +953,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                             ipstr, cr.matched.c_str());
                                 outResp = blockResp(req.clientIp, "CC", cr.ruleId, cr.matched,
                                                     req.path, hdrCi(req, "Host"),
-                                                    cr.action != Action::BLOCK);
+                                                    cr.action != Action::BLOCK, scannerUa);
                                 if (cr.action == Action::BLOCK) shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
@@ -945,7 +967,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                             ipstr, br.matched.c_str());
                                 outResp = blockResp(req.clientIp, "Bot", br.ruleId, br.matched,
                                                     req.path, hdrCi(req, "Host"),
-                                                    br.action != Action::BLOCK);
+                                                    br.action != Action::BLOCK, scannerUa);
                                 if (br.action == Action::BLOCK) shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
@@ -958,7 +980,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] BLOCK %s from %s: %s\n",
                                             idx, dr.category.c_str(), ipstr, dr.matched.c_str());
                                 outResp = blockResp(req.clientIp, dr.category, dr.ruleId,
-                                                    dr.matched, req.path, hdrCi(req, "Host"));
+                                                    dr.matched, req.path, hdrCi(req, "Host"),
+                                                    false, scannerUa);
                                 shield.recordBlock();
                                 tBlocked = true; tAttack = true;
                             } else {
@@ -983,12 +1006,13 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     }
                     // 确认攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁）
                     if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
-                    // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=通用 sid 名
-                    // （与任意站点会话 cookie 同形，wafw00f 无法归因）；关闭=不注入。
+                    // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=通用名
+                    // （拟态启用时按人格轮换 sid/sess/PHPSESSID 等，wafw00f 无法归因）；关闭=不注入。
                     if (newSess && !outResp.empty() && wafMode != WafMode::OFF)
                         injectHeader(outResp, std::string("Set-Cookie: ") +
-                            (WafMode::isPublic(wafMode) ? "novasid=" : "sid=") + sid +
-                            "; Path=/; HttpOnly");
+                            (WafMode::isPublic(wafMode) ? "novasid"
+                                                        : MimicDefense::instance().cookieName("sid")) +
+                            "=" + sid + "; Path=/; HttpOnly");
                     // 流量统计埋点（已启用统计的应用，或命中 API 防护策略需按策略计数；热路径入队不阻塞）
                     if ((app && app->statsEnabled) || !policyId.empty()) {
                         TrafficReq tr;

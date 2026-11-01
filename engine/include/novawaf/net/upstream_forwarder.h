@@ -6,7 +6,9 @@
 
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/core/traffic_sink.h"
+#include "novawaf/core/waf_mode.h"
 #include "novawaf/net/upstream_pool.h"
+#include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 
 #include <arpa/inet.h>
@@ -194,7 +196,7 @@ private:
         }
         // SSE(101/事件流)：流式中继，长连接不复用
         if (isStreamResp(outResp)) {
-            if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
+            if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
             setResponseConnection(outResp, false);
             writeAll(ctx.clientFd, outResp);
             relay(ctx.clientFd, ufd);
@@ -209,7 +211,7 @@ private:
                                                                 outResp, ctx.clientIp))
                 outResp = std::move(*restored);
         }
-        if (ctx.newSess) injectHeader(outResp, "Set-Cookie: novasid=" + ctx.sid + "; Path=/; HttpOnly");
+        if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
         setResponseConnection(outResp, ctx.keepAlive);
         if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
@@ -348,6 +350,12 @@ private:
     static void injectHeader(std::string& resp, const std::string& headerLine) {
         auto p = resp.find("\r\n");
         if (p != std::string::npos) resp.insert(p + 2, headerLine + "\r\n");
+    }
+
+    // 会话 cookie 名：PUBLIC=品牌名 novasid；HIDDEN=拟态人格轮换（未启用拟态回退通用 sid）
+    static std::string sessCookieName() {
+        if (WafMode::isPublic(WafMode::instance().current())) return "novasid";
+        return MimicDefense::instance().cookieName("sid");
     }
 
     static int respStatus(const std::string& resp) {

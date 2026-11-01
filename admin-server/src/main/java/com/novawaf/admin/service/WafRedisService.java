@@ -591,6 +591,49 @@ public class WafRedisService {
         redis.opsForValue().set("novawaf:wafmode", m);
     }
 
+    /* ---------- 拟态防御（动态指纹/移动目标防御） ---------- */
+
+    /**
+     * 查询拟态防御配置与引擎当前人格。
+     * 配置存 novawaf:mimic(hash): enabled/windowMin/salt；salt 不下发，只告知是否已设置。
+     * 引擎回写 novawaf:mimic:status(hash): persona/banner/blockStatus/cookieName/slotEnd 供预览。
+     */
+    public Map<String, Object> getMimic() {
+        Map<Object, Object> raw = redis.opsForHash().entries("novawaf:mimic");
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("enabled", "1".equals(str(raw.get("enabled"))));
+        int w = 60;
+        try { w = Integer.parseInt(str(raw.get("windowMin"))); } catch (Exception ignore) {}
+        m.put("windowMin", w < 5 ? 60 : Math.min(w, 1440));
+        m.put("saltSet", !str(raw.get("salt")).isEmpty());
+        // 引擎回写的当前人格（未启用/引擎未上报时为空对象）
+        Map<Object, Object> st = redis.opsForHash().entries("novawaf:mimic:status");
+        Map<String, Object> status = new LinkedHashMap<>();
+        st.forEach((k, v) -> status.put(String.valueOf(k), String.valueOf(v)));
+        m.put("status", status);
+        return m;
+    }
+
+    /** 设置拟态防御开关与轮换窗口（分钟，5-1440）。引擎热路径 2s 内生效。 */
+    public void setMimic(boolean enabled, int windowMin) {
+        if (windowMin < 5 || windowMin > 1440)
+            throw new BusinessException(400, "轮换窗口须在 5-1440 分钟之间: " + windowMin);
+        Map<String, String> m = new HashMap<>();
+        m.put("enabled", enabled ? "1" : "0");
+        m.put("windowMin", String.valueOf(windowMin));
+        redis.opsForHash().putAll("novawaf:mimic", m);
+    }
+
+    /** 一键轮换盐：全部人格序列立即更换（已在探测的攻击者结论即刻失效）。返回新盐末 4 位供确认。 */
+    public String rotateMimicSalt() {
+        java.security.SecureRandom rnd = new java.security.SecureRandom();
+        StringBuilder sb = new StringBuilder(32);
+        for (int i = 0; i < 32; i++) sb.append("0123456789abcdef".charAt(rnd.nextInt(16)));
+        String salt = sb.toString();
+        redis.opsForHash().put("novawaf:mimic", "salt", salt);
+        return salt.substring(salt.length() - 4);
+    }
+
     /* ---------- 规则版本管理 ---------- */
 
     /** 规则版本信息：版本号(单调递增)/规则条数/最近更新时间/规则集来源 */
