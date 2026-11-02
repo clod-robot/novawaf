@@ -834,6 +834,34 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     parser.feed(data);
                     if (parser.hasError()) { keepOpen = false; break; }
                     HttpRequest req = parser.request();
+                    // 统一错误页保留端点：nginx 解析层直返的 400/408/413/414/429 等错误
+                    // 带 Server: nginx 真实指纹（本机 nginx 无 headers_more 无法改写），
+                    // nac.conf 用 error_page 劫持到此路径，由 WAF 按全站人格渲染出口，
+                    // 消除「畸形请求零载荷拿真实指纹」的旁路（V6 复测：9 条畸形 4 条 nginx 直返）。
+                    // nginx 私有码 494-497 不外露，统一按 400 渲染。
+                    if (req.path.compare(0, 15, "/__novawaf-err/") == 0) {
+                        int code = std::atoi(req.path.c_str() + 15);
+                        const char* txt = "Bad Request";
+                        switch (code) {
+                            case 400: break;
+                            case 404: txt = "Not Found"; break;
+                            case 408: txt = "Request Timeout"; break;
+                            case 413: txt = "Request Entity Too Large"; break;
+                            case 414: txt = "Request-URI Too Large"; break;
+                            case 429: txt = "Too Many Requests"; break;
+                            default:  code = 400; break;
+                        }
+                        std::string e = errResp(code, txt, code == 429 ? "Retry-After: 30\r\n" : "");
+                        setRespConnection(e, false);
+                        const char* wp = e.data(); size_t wl = e.size();
+                        while (wl > 0) {
+                            ssize_t w = ::send(fd, wp, wl, MSG_NOSIGNAL | MSG_DONTWAIT);
+                            if (w > 0) { wp += w; wl -= (size_t)w; }
+                            else if (w < 0 && errno == EINTR) continue;
+                            else break;
+                        }
+                        keepOpen = false; break;
+                    }
                     keepAlive = wantsKeepAlive(req);
                     // 拟态探测干扰：扫描器 UA 特征的拦截响应每次随机人格（同窗内亦矛盾）
                     const bool scannerUa = MimicDefense::looksLikeScanner(hdrCi(req, "User-Agent"));
