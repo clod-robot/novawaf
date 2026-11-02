@@ -99,6 +99,21 @@ public:
         return false;
     }
 
+    // ---- 全站统一固定人格（HIDDEN 模式）----
+    // 第三方评估证实：静态资源 nginx / 动态接口 IIS / 拦截页轮换人格的"分裂指纹"
+    // 比不伪装更容易识破（两个请求即可推出 WAF 存在与作用边界）。因此 HIDDEN 模式
+    // 收敛为全站统一的固定人格：静态页、动态接口、错误页、拦截页、会话 cookie 一致。
+    // 真实 IIS 10 的 Server 头恒为 Microsoft-IIS/10.0（去版本号反而失真），故保留。
+    // 可用 NOVA_SITE_BANNER / NOVA_SITE_COOKIE 覆盖（须与前置反代层同步修改）。
+    static std::string siteBanner() {
+        const char* e = std::getenv("NOVA_SITE_BANNER");
+        return (e && *e) ? std::string(e) : std::string("Microsoft-IIS/10.0");
+    }
+    static std::string siteCookie() {
+        const char* e = std::getenv("NOVA_SITE_COOKIE");
+        return (e && *e) ? std::string(e) : std::string("ASP.NET_SessionId");
+    }
+
     // 管理面/测试用：立即刷新配置
     void forceRefresh() {
         lastRefresh_.store(0, std::memory_order_release);

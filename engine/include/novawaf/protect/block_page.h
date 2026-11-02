@@ -8,6 +8,8 @@
 //   * 纯函数无状态，热路径零分配之外的负担可忽略（拦截本就是低频冷路径）。
 #pragma once
 
+#include "novawaf/protect/mimic.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -64,12 +66,15 @@ public:
         resp += statusText;
         resp += "\r\nContent-Type: text/html; charset=utf-8\r\n"
                 "Cache-Control: no-store\r\n"
-                "X-Content-Type-Options: nosniff\r\n"
-                "X-Request-Id: " + traceId + "\r\n";
+                "X-Content-Type-Options: nosniff\r\n";
         if (branded) {
+            // PUBLIC：品牌输出并回显追踪 ID，便于用户报障溯源
             resp += "Server: NovaWAF\r\nX-WAF: NovaWAF\r\n";
+            resp += "X-Request-Id: " + traceId + "\r\n";
         } else {
-            resp += "Server: nginx\r\n";  // 与前置反代保持一致，不暴露差异
+            // HIDDEN：不向客户端回显 X-Request-Id（格式再随机也是可提取的弱特征；
+            // 溯源 ID 只留在服务端事件中心，控制台按 IP/时间关联）。
+            resp += "Server: " + MimicDefense::siteBanner() + "\r\n";
         }
         resp += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
         resp += body;
@@ -79,23 +84,58 @@ public:
     // 拟态渲染：按画像输出目标服务器风格的原生错误页（无品牌、无 NovaWAF 痕迹）。
     //   tpl: 0=nginx 风格 1=Apache 风格 2=IIS 风格 3=nginx 404 风格 4=nginx 503 风格
     //   banner: Server 响应头与页脚签名（与画像一致）
-    // 追踪 ID 仅经 X-Request-Id 响应头携带（页面不展示，保持原生风格拟真；
-    // 溯源走事件中心，控制台按 IP/时间关联）。
+    // 追踪 ID 不回显给客户端（格式再随机也是可提取的弱特征）；
+    // 溯源走事件中心，控制台按 IP/时间关联。
     static std::string renderMimic(int status, const char* statusText, int tpl,
                                    const char* banner, const std::string& traceId) {
+        (void)traceId;
         std::string body = mimicHtml(status, statusText, tpl, banner);
         std::string resp;
         resp.reserve(body.size() + 256);
         resp += "HTTP/1.1 " + std::to_string(status) + " " + statusText + "\r\n"
                 "Server: " + banner + "\r\n"
                 "Content-Type: text/html\r\n"
-                "X-Request-Id: " + traceId + "\r\n"
+                "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        resp += body;
+        return resp;
+    }
+
+    // 全站统一人格的通用错误页（413/429/400 等低频错误）。
+    // 与拦截页同一 IIS 风格模板 + 固定 banner，消除不同错误出口之间的指纹分裂。
+    // extraHead：可选附加响应头（如 "Retry-After: 60\r\n"）。
+    static std::string renderStatus(int status, const char* statusText,
+                                    const std::string& extraHead = "") {
+        const std::string banner = MimicDefense::siteBanner();
+        std::string body = iisHtml(status, statusText);
+        std::string resp;
+        resp.reserve(body.size() + 256);
+        resp += "HTTP/1.1 " + std::to_string(status) + " " + statusText + "\r\n"
+                "Server: " + banner + "\r\n"
+                "Content-Type: text/html\r\n" + extraHead +
                 "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
         resp += body;
         return resp;
     }
 
 private:
+    // IIS 10 风格通用错误页（状态码/短语参数化，与 tpl=2 的 403 页同一模板语言）
+    static std::string iisHtml(int status, const char* statusText) {
+        std::string code = std::to_string(status);
+        std::string title = code + " - " + statusText;
+        return "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" "
+               "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n"
+               "<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n"
+               "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-1\"/>\n"
+               "<title>" + title + "</title>\n"
+               "<style type=\"text/css\">body{margin:0;font-family:Verdana,Arial,sans-serif;"
+               "font-size:.7em;background:#EFEFF0;color:#000}"
+               "#header{width:96%;margin:0 0 0 0;padding:6px 2% 6px 2%;}"
+               "h1{font-size:1.4em;margin:0 0 0 0}h2{font-size:1.1em;margin:0 0 0 0}"
+               "#content{padding:0 2% 2% 2%}</style>\n</head>\n"
+               "<body><div id=\"header\"><h1>Server Error</h1></div>\n"
+               "<div id=\"content\"><h2>" + title + "</h2>\n</div>\n</body></html>\n";
+    }
+
     static std::string mimicHtml(int status, const char* statusText, int tpl,
                                  const char* banner) {
         std::string code = std::to_string(status);

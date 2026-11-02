@@ -29,6 +29,7 @@
 #include "novawaf/protect/rmi_guard.h"
 #include "novawaf/core/waf_mode.h"
 #include "novawaf/protect/block_page.h"
+#include "novawaf/protect/brute_guard.h"
 #include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
@@ -145,10 +146,23 @@ static void emitEvt(const std::string& ip, const std::string& cat,
 // 消除"无 Server 头"与拦截响应/静态页之间的指纹差异。拦截响应由 BlockPage 自带 Server 头，无需调用。
 static void injectServerLine(std::string& resp) {
     if (WafMode::isPublic(WafMode::instance().current())) return;
-    auto prof = MimicDefense::instance().current();
-    std::string b = prof ? prof->serverBanner : "nginx";
     size_t p = resp.find("\r\n");
-    if (p != std::string::npos) resp.insert(p + 2, "Server: " + b + "\r\n");
+    if (p != std::string::npos)
+        resp.insert(p + 2, "Server: " + MimicDefense::siteBanner() + "\r\n");
+}
+
+// 全站统一人格的通用错误页出口（413/429/400 等低频错误），
+// extraHead 可携带 Retry-After 等附加响应头。
+static std::string errResp(int status, const char* statusText,
+                           const std::string& extraHead = "") {
+    if (WafMode::isPublic(WafMode::instance().current())) {
+        std::string r = "HTTP/1.1 " + std::to_string(status) + " " + statusText + "\r\n" +
+                        extraHead + "Content-Length: 0\r\n\r\n";
+        size_t p = r.find("\r\n");
+        r.insert(p + 2, "Server: NovaWAF\r\nX-WAF: NovaWAF\r\n");
+        return r;
+    }
+    return BlockPage::renderStatus(status, statusText, extraHead);
 }
 
 // 统一拦截/挑战响应出口：生成追踪ID → 事件上报（携带 trace 供溯源）→ 按指纹模式渲染独立拦截页。
@@ -160,16 +174,14 @@ static std::string blockResp(const std::string& ip, const std::string& cat,
     std::string tid = BlockPage::genTraceId();
     emitEvt(ip, cat, challenge ? "challenge" : "block", ruleId, matched, uri, host, tid);
     bool branded = WafMode::isPublic(WafMode::instance().current());
-    // 拟态防御（仅 HIDDEN 模式）：拦截响应的 banner/状态码/页面风格按时间窗人格轮换，
-    // 攻击者无法获得稳定指纹；扫描器来源每次随机人格，同窗内连续探测亦自相矛盾。
-    // 检测语义零影响：内部解析检测始终全维度最严，拟态只改变对外表现。
+    // HIDDEN（默认）：全站统一固定 IIS 人格。第三方复测证实轮换人格会在
+    // 静态/动态/拦截响应之间制造指纹分裂（比不伪装更易识破），故拦截页与
+    // 转发响应、错误页收敛为同一画像。检测语义零影响：内部解析始终全维度最严。
     if (!branded) {
-        auto& mm = MimicDefense::instance();
-        if (mm.current()) {
-            const MimicDefense::Profile* prof = scanner ? mm.randomProfile() : mm.current();
-            return BlockPage::renderMimic(prof->blockStatus, prof->blockStatusText,
-                                          prof->pageTemplate, prof->serverBanner, tid);
-        }
+        const std::string banner = MimicDefense::siteBanner();
+        if (challenge)
+            return BlockPage::renderMimic(503, "Service Unavailable", 2, banner.c_str(), tid);
+        return BlockPage::renderMimic(403, "Forbidden", 2, banner.c_str(), tid);
     }
     if (challenge)
         return BlockPage::render("503", "Service Unavailable", "访问频率异常",
@@ -459,13 +471,17 @@ static bool isApiPath(const std::string& path) {
 }
 
 // ---- HTTP keep-alive 支持 ----
-// 从接收缓冲区切出一个完整请求：返回 1=完整(rawReq/totalLen) 0=不完整 -1=协议错误
-static int nextRequest(const std::string& buf, std::string& rawReq, size_t& totalLen) {
+// 从接收缓冲区切出一个完整请求。
+// 返回 1=完整(rawReq/totalLen) 0=不完整 -1=协议错误
+//      -2=声明的 Content-Length 超过请求体上限(应 413) -3=头部超限(应 400)
+static int nextRequest(const std::string& buf, std::string& rawReq, size_t& totalLen,
+                       size_t maxBody, size_t maxHead) {
     size_t he = buf.find("\r\n\r\n");
     if (he == std::string::npos) {
-        // 请求行/头过长仍不完整，按畸形处理，防止无限缓冲
-        return buf.size() > 65536 ? -1 : 0;
+        // 头部超上限仍不完整：按超限处理，拒绝并断连（防 Slowloris 型无限缓冲）
+        return buf.size() > maxHead ? -3 : 0;
     }
+    if (he > maxHead) return -3;  // 头区总长超限（16KB 默认，对齐评估基线）
     std::string head = buf.substr(0, he);
     long long bodyLen = -1;
     {   // 解析 Content-Length（大小写不敏感）
@@ -479,6 +495,8 @@ static int nextRequest(const std::string& buf, std::string& rawReq, size_t& tota
         }
     }
     if (bodyLen < 0) bodyLen = 0;
+    // 请求体大小限制：声明即超限直接拒绝，不再继续缓冲（防大 body 耗尽内存/连接池）
+    if ((size_t)bodyLen > maxBody) return -2;
     totalLen = he + 4 + (size_t)bodyLen;
     if (buf.size() < totalLen) return 0;
     rawReq = buf.substr(0, totalLen);
@@ -546,11 +564,25 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
         size_t outPos = 0;
         bool closeAfterFlush = false;
         int64_t lastActiveMs = 0;
+        int64_t firstByteMs = 0;  // 当前不完整请求的首字节时间（慢速请求检测）
     };
     std::unordered_map<int, ConnState> conns;
     std::mutex busyMtx;
     std::unordered_set<int> busy;   // 已交给异步转发器、尚未回写完成的 fd
     constexpr int64_t kKeepAliveIdleMs = 15000;  // 空闲连接 15s 回收
+    // 请求体/头部上限与慢速请求时限（环境变量可调的冷启动常量，多 reactor 共享只读）
+    static const size_t kMaxBody = [] {
+        const char* e = getenv("NOVA_MAX_BODY");
+        return (e && *e) ? (size_t)std::atoll(e) : (size_t)1048576;  // 默认 1MB
+    }();
+    static const size_t kMaxHead = [] {
+        const char* e = getenv("NOVA_MAX_HEAD");
+        return (e && *e) ? (size_t)std::atoll(e) : (size_t)16384;    // 默认 16KB
+    }();
+    static const int64_t kSlowReqMs = [] {
+        const char* e = getenv("NOVA_SLOW_REQ_MS");
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)20000;  // 默认 20s
+    }();
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now().time_since_epoch()).count(); };
 
@@ -672,7 +704,12 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 bool peerClosed = false, readErr = false;
                 while (true) {
                     ssize_t r = read(fd, buf, sizeof(buf));
-                    if (r > 0) { std::lock_guard<std::mutex> lk(busyMtx); conns[fd].inbuf.append(buf, (size_t)r); }
+                    if (r > 0) {
+                        std::lock_guard<std::mutex> lk(busyMtx);
+                        ConnState& cs = conns[fd];
+                        if (cs.inbuf.empty()) cs.firstByteMs = nowMs();  // 新请求首字节
+                        cs.inbuf.append(buf, (size_t)r);
+                    }
                     else if (r == 0) { peerClosed = true; break; }
                     else if (r < 0 && errno != EAGAIN) { readErr = true; break; }
                     else break;
@@ -692,14 +729,41 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     }
                 }
                 std::string rawReq; size_t reqLen = 0;
+                int nr = 0;
                 {
                     std::lock_guard<std::mutex> lk(busyMtx);
                     auto it = conns.find(fd);
                     if (it == conns.end()) { keepOpen = false; break; }
-                    int nr = nextRequest(it->second.inbuf, rawReq, reqLen);
+                    nr = nextRequest(it->second.inbuf, rawReq, reqLen, kMaxBody, kMaxHead);
                     if (nr == 0) break;        // 数据不完整，等更多字节
-                    if (nr < 0) { keepOpen = false; break; }  // 协议错误
                 }
+                // 请求体/头部超限：立即统一错误页拒绝并断连，不再缓冲
+                if (nr == -2 || nr == -3) {
+                    std::string e = (nr == -2)
+                        ? errResp(413, "Request Entity Too Large")
+                        : errResp(400, "Bad Request");
+                    setRespConnection(e, false);
+                    // 取连接对端 IP 记录事件（解析前拒绝，拿不到 req）
+                    std::string peer;
+                    {
+                        sockaddr_in pa{}; socklen_t pl = sizeof(pa);
+                        if (getpeername(fd, (sockaddr*)&pa, &pl) == 0) {
+                            char ipb[32] = {0};
+                            if (inet_ntop(AF_INET, &pa.sin_addr, ipb, sizeof(ipb))) peer = ipb;
+                        }
+                    }
+                    emitEvt(peer, nr == -2 ? "BodyLimit" : "HeadLimit", "block", "",
+                            nr == -2 ? "body too large" : "header too large");
+                    const char* wp = e.data(); size_t wl = e.size();
+                    while (wl > 0) {
+                        ssize_t w = ::send(fd, wp, wl, MSG_NOSIGNAL | MSG_DONTWAIT);
+                        if (w > 0) { wp += w; wl -= (size_t)w; }
+                        else if (w < 0 && errno == EINTR) continue;
+                        else break;
+                    }
+                    keepOpen = false; break;
+                }
+                if (nr < 0) { keepOpen = false; break; }  // 协议错误
                 bool keepAlive = false;
                 const std::string data = rawReq;   // 检测/转发使用的完整请求字节
                 {
@@ -888,16 +952,14 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         outResp = kMaint;
                         injectServerLine(outResp);
                     } else if (!ddos.onRequest(req.clientIp)) {
-                        // 请求速率超限 → 触发封禁链路，返回 429
-                        outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
-                        injectServerLine(outResp);
+                        // 请求速率超限 → 触发封禁链路，返回 429 + Retry-After
+                        outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
                         shield.recordBlock();
                         emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "DDoS", "rate");
                         tBlocked = true;
                     } else if (!limiter.allow(req.clientIp)) {
-                        outResp = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
-                        injectServerLine(outResp);
+                        outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
                         shield.recordBlock();
                         emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit", req.path, hdrCi(req, "Host"));
                         FwBanPoster::instance()->enqueue(req.clientIp, "RateLimit", "rate");
@@ -965,11 +1027,35 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] %s CC from %s: %s\n",
                                             idx, cr.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, cr.matched.c_str());
-                                outResp = blockResp(req.clientIp, "CC", cr.ruleId, cr.matched,
-                                                    req.path, hdrCi(req, "Host"),
-                                                    cr.action != Action::BLOCK, scannerUa);
-                                if (cr.action == Action::BLOCK) shield.recordBlock();
+                                if (cr.action == Action::BLOCK) {
+                                    // 限流语义用 429 + Retry-After（而非 403），
+                                    // 避免攻击者把限流与规则拦截混为一谈做差异探测
+                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
+                                    emitEvt(req.clientIp, "CC", "block", cr.ruleId, cr.matched,
+                                            req.path, hdrCi(req, "Host"));
+                                    shield.recordBlock();
+                                } else {
+                                    outResp = blockResp(req.clientIp, "CC", cr.ruleId, cr.matched,
+                                                        req.path, hdrCi(req, "Host"),
+                                                        true, scannerUa);
+                                }
                                 blocked = true; tBlocked = true; tAttack = true;
+                            }
+                        }
+                        // 认证爆破防护：登录/验证码等认证接口的尝试计数与源 IP 锁定。
+                        // 响应侧无法区分成败（业务失败也回 200），故按尝试次数独立限流。
+                        if (!whitelisted && !policyPass && !blocked) {
+                            int lockSec = BruteGuard::instance().hit(req.clientIp, req.path);
+                            if (lockSec > 0) {
+                                if (g_debugLog) std::printf("[reactor %d] BLOCK BruteForce from %s: %s\n",
+                                            idx, ipstr, req.path.c_str());
+                                outResp = errResp(429, "Too Many Requests",
+                                                  "Retry-After: " + std::to_string(lockSec) + "\r\n");
+                                shield.recordBlock();
+                                emitEvt(req.clientIp, "BruteForce", "block", "BF-001",
+                                        "auth attempts exceeded, locked", req.path, hdrCi(req, "Host"));
+                                // 本地 429 锁定即可，不上报防火墙全端口封禁（避免误伤 SSH 等管理通道）
+                                blocked = true; tBlocked = true;
                             }
                         }
                         // Bot 行为防护（跳过 /api/ 接口：JS 挑战对 API 客户端无意义，避免误杀脚本化调用）
@@ -1014,18 +1100,18 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     if (asyncHandled) {
                         // fd 已从 epoll 摘除并标记 busy，交给异步转发器回写；
                         // 消费掉本请求字节，停止本连接的处理循环，等待完成回调 re-arm。
-                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) { ci->second.inbuf.erase(0, reqLen); if (ci->second.inbuf.empty()) ci->second.firstByteMs = 0; } }
                         keepOpen = false;
                         break;
                     }
                     // 确认攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁）
                     if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
-                    // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=通用名
-                    // （拟态启用时按人格轮换 sid/sess/PHPSESSID 等，wafw00f 无法归因）；关闭=不注入。
+                    // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=全站固定
+                    // 人格（默认 ASP.NET_SessionId，与 banner/拦截页一致，避免分裂指纹）；关闭=不注入。
                     if (newSess && !outResp.empty() && wafMode != WafMode::OFF)
                         injectHeader(outResp, std::string("Set-Cookie: ") +
                             (WafMode::isPublic(wafMode) ? "novasid"
-                                                        : MimicDefense::instance().cookieName("sid")) +
+                                                        : MimicDefense::siteCookie()) +
                             "=" + sid + "; Path=/; HttpOnly");
                     // 流量统计埋点（已启用统计的应用，或命中 API 防护策略需按策略计数；热路径入队不阻塞）
                     if ((app && app->statsEnabled) || !policyId.empty()) {
@@ -1059,7 +1145,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             else { writeFail = true; break; }
                         }
                         // 消费本请求字节（响应是否排队都不再需要它）
-                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) ci->second.inbuf.erase(0, reqLen); }
+                        { std::lock_guard<std::mutex> lk(busyMtx); auto ci = conns.find(fd); if (ci != conns.end()) { ci->second.inbuf.erase(0, reqLen); if (ci->second.inbuf.empty()) ci->second.firstByteMs = 0; } }
                         if (writeFail) { keepOpen = false; break; }
                         if (left > 0) {
                             std::lock_guard<std::mutex> lk(busyMtx);
@@ -1096,8 +1182,14 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
             std::vector<int> stale;
             {
                 std::lock_guard<std::mutex> lk(busyMtx);
-                for (auto& [cfd, st] : conns)
-                    if (!busy.count(cfd) && now - st.lastActiveMs > kKeepAliveIdleMs) stale.push_back(cfd);
+                for (auto& [cfd, st] : conns) {
+                    if (busy.count(cfd)) continue;
+                    // 空闲 keep-alive 连接回收
+                    if (now - st.lastActiveMs > kKeepAliveIdleMs) { stale.push_back(cfd); continue; }
+                    // 慢速请求（Slowloris/慢body）回收：首字节后超时仍未凑齐完整请求
+                    if (!st.inbuf.empty() && st.firstByteMs && now - st.firstByteMs > kSlowReqMs)
+                        stale.push_back(cfd);
+                }
             }  // 先释放锁，再逐个关闭（closeConn 自身会加锁）
             for (int cfd : stale) closeConn(cfd);
         }

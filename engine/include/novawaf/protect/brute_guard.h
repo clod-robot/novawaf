@@ -1,0 +1,116 @@
+// NovaWAF - 认证爆破防护（登录/验证码等认证接口的独立限流与源 IP 锁定）
+// 背景：复测确认对认证接口连发错误凭证零防护（15 次全放行）。由于业务失败响应
+// 与成功响应同为 200（错误信息在 body），无法按状态码区分成败，因此对认证接口
+// 采用「尝试计数 + 滑动窗口 + 超限锁定」的独立限流：
+//   * 窗口内尝试次数超过阈值即锁定源 IP 一段时间（默认 5 次/60s → 锁 600s）；
+//   * 正常用户登录一次成功，几乎不受影响；脚本化爆破 6 次内即被切断；
+//   * 锁定期间直接 429 + Retry-After，不进入上游，不消耗后端资源。
+// 设计：分片锁降低并发竞争；配置走环境变量（热更由 PathPolicy/名单体系承担，
+// 本组件为冷启动常量，变更需重启——阈值类配置低频，可接受）。
+// 环境变量：
+//   NOVA_BRUTE_PATHS  逗号分隔的认证接口前缀（默认见 kDefaultPaths）
+//   NOVA_BRUTE_MAX    窗口内最大尝试次数（默认 5）
+//   NOVA_BRUTE_WIN    统计窗口秒数（默认 60）
+//   NOVA_BRUTE_LOCK   锁定时长秒数（默认 600）
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace novawaf {
+
+class BruteGuard {
+public:
+    static BruteGuard& instance() {
+        static BruteGuard inst;
+        return inst;
+    }
+
+    // 请求前调用：返回剩余锁定秒数（>0 表示已锁定，调用方应 429 拒绝）；
+    // 返回 0 表示未锁定且本次尝试已计入。非认证路径恒返回 0 且不计数。
+    int hit(const std::string& ip, const std::string& path) {
+        if (!isAuthPath(path)) return 0;
+        int64_t now = nowSec();
+        auto& s = shard(ip);
+        std::lock_guard<std::mutex> lk(s.mtx);
+        IpState& st = s.states[ip];
+        if (st.lockUntil > now) return (int)(st.lockUntil - now);
+        // 驱逐窗口外尝试
+        while (!st.hits.empty() && st.hits.front() <= now - winSec_) st.hits.pop_front();
+        st.hits.push_back(now);
+        if ((int)st.hits.size() > maxAttempts_) {
+            st.lockUntil = now + lockSec_;
+            st.hits.clear();
+            return lockSec_;
+        }
+        return 0;
+    }
+
+    // 管理台/排障用：某 IP 当前剩余锁定秒数（不产生副作用）
+    int lockedRemain(const std::string& ip) {
+        auto& s = shard(ip);
+        std::lock_guard<std::mutex> lk(s.mtx);
+        auto it = s.states.find(ip);
+        if (it == s.states.end()) return 0;
+        int64_t r = it->second.lockUntil - nowSec();
+        return r > 0 ? (int)r : 0;
+    }
+
+private:
+    BruteGuard() {
+        // 认证接口默认前缀：登录、验证码、注册、找回密码等凭证相关端点。
+        // 注意不含 /api/auth/me 等高频会话查询，避免正常浏览触发计数。
+        const char* defPaths = "/api/auth/login,/api/auth/captcha,"
+                               "/api/auth/register,/api/auth/sendcode,"
+                               "/api/auth/reset,/api/auth/forgot";
+        const char* p = std::getenv("NOVA_BRUTE_PATHS");
+        std::string csv = (p && *p) ? p : defPaths;
+        std::string cur;
+        for (char c : csv) {
+            if (c == ',') { if (!cur.empty()) paths_.push_back(cur); cur.clear(); }
+            else cur += c;
+        }
+        if (!cur.empty()) paths_.push_back(cur);
+        if (const char* e = std::getenv("NOVA_BRUTE_MAX")) { int v = std::atoi(e); if (v >= 1) maxAttempts_ = v; }
+        if (const char* e = std::getenv("NOVA_BRUTE_WIN")) { int64_t v = std::atoll(e); if (v >= 1) winSec_ = v; }
+        if (const char* e = std::getenv("NOVA_BRUTE_LOCK")) { int64_t v = std::atoll(e); if (v >= 10) lockSec_ = v; }
+    }
+
+    bool isAuthPath(const std::string& path) const {
+        for (auto& p : paths_)
+            if (path.compare(0, p.size(), p) == 0) return true;
+        return false;
+    }
+
+    static int64_t nowSec() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    struct IpState {
+        std::deque<int64_t> hits;   // 窗口内尝试时间戳
+        int64_t lockUntil = 0;      // 锁定截止
+    };
+    struct Shard {
+        mutable std::mutex mtx;
+        std::unordered_map<std::string, IpState> states;
+    };
+    static constexpr size_t kShards = 32;
+    Shard& shard(const std::string& ip) {
+        return shards_[std::hash<std::string>{}(ip) & (kShards - 1)];
+    }
+
+    std::vector<std::string> paths_;
+    int maxAttempts_ = 5;        // 窗口内最大尝试次数
+    int64_t winSec_ = 60;        // 统计窗口（秒）
+    int64_t lockSec_ = 600;      // 锁定时长（秒）
+    Shard shards_[kShards];
+};
+
+}  // namespace novawaf

@@ -28,8 +28,13 @@ class SqlInjectionDetector : public IDetector {
 public:
     SqlInjectionDetector() {
         // SQL 关键词特征（AC 预筛）
+        // 注：归一化阶段会把 /**/→空格、0x 十六进制串→ASCII、反引号→单引号，
+        // 因此通用永真片段（' or / ' and 等）必须进入预筛，否则十六进制/注释
+        // 编码还原后的永真注入会在预筛阶段漏过（复测确认 0x3127... 绕过即此因）。
         for (auto& p : {"union select", "select ", "insert ", "update ", "delete ",
-                         "drop table", "--", "/*", "*/", "or 1=1", "or '1'='1",
+                         "drop table", "--", "/*", "*/", "or 1=1", "and 1=1",
+                         "' or ", "' and ", "\" or ", "\" and ", " or 1=", " and 1=",
+                         "or '1'='1", "and '1'='1", " or true", " or false",
                          "information_schema", "sleep(", "benchmark(", "xp_cmdshell",
                          "exec(", "execute(", "char(", "concat(", "0x"})
             ac_.addPattern(p);
@@ -63,11 +68,15 @@ private:
         bool hasComment = s.find("--") != std::string::npos ||
                           s.find("/*") != std::string::npos ||
                           s.find("#") != std::string::npos;
-        // 永真注入：' or '1'='1  /  " or "1"="1  /  or 1=1
+        // 永真注入：' or '1'='1  /  " or "1"="1  /  or 1=1  /  ' and '1'='1 及归一化还原形态
         bool tautology = (s.find("' or ") != std::string::npos ||
                           s.find("\" or ") != std::string::npos ||
+                          s.find("' and ") != std::string::npos ||
+                          s.find("\" and ") != std::string::npos ||
                           s.find(" or 1=1") != std::string::npos ||
-                          s.find("or '1'='1") != std::string::npos);
+                          s.find(" and 1=1") != std::string::npos ||
+                          s.find("or '1'='1") != std::string::npos ||
+                          s.find("and '1'='1") != std::string::npos);
         bool timeBased = s.find("sleep(") != std::string::npos ||
                          s.find("benchmark(") != std::string::npos ||
                          s.find("waitfor delay") != std::string::npos;

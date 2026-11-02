@@ -355,21 +355,20 @@ private:
         if (p != std::string::npos) resp.insert(p + 2, headerLine + "\r\n");
     }
 
-    // 会话 cookie 名：PUBLIC=品牌名 novasid；HIDDEN=拟态人格轮换（未启用拟态回退通用 sid）
+    // 会话 cookie 名：PUBLIC=品牌名 novasid；HIDDEN=全站固定人格（与 Server 头一致）
     static std::string sessCookieName() {
         if (WafMode::isPublic(WafMode::instance().current())) return "novasid";
-        return MimicDefense::instance().cookieName("sid");
+        return MimicDefense::siteCookie();
     }
 
-    // 上游响应 Server 头归一化（消除指纹三态）：
-    //   HIDDEN 模式下，经 WAF 转发的响应统一 Server 头为人格 banner——
-    //   上游无 Server 头则追加，有则替换。避免"上游无 Server / nginx 带版本号"形成
-    //   可被探测的路径级指纹差异。PUBLIC 模式保留上游原样（品牌威慑优先）。
+    // 上游响应 Server 头归一化（消除指纹分裂）：
+    //   HIDDEN 模式下，经 WAF 转发的响应统一 Server 头为全站固定人格 banner——
+    //   上游无 Server 头则追加，有则替换。第三方复测证实：静态页 nginx 与动态接口
+    //   轮换人格并存时，两个请求即可推出 WAF 存在与作用边界，故收敛为固定人格。
+    //   PUBLIC 模式保留上游原样（品牌威慑优先）。
     static void normalizeServerHeader(std::string& resp) {
         if (WafMode::isPublic(WafMode::instance().current())) return;
-        std::string banner = "nginx";
-        auto prof = MimicDefense::instance().current();
-        if (prof) banner = prof->serverBanner;
+        std::string banner = MimicDefense::siteBanner();
         size_t he = resp.find("\r\n\r\n");
         std::string head = (he == std::string::npos) ? resp : resp.substr(0, he);
         std::string body = (he == std::string::npos) ? "" : resp.substr(he + 4);
