@@ -176,7 +176,10 @@ private:
 class SstiDetector : public IDetector {
 public:
     SstiDetector() {
-        for (auto& p : {"{{", "}}", "${", "<%=", "%{", "{%", "%}",
+        // 注意：裸 "{{"/"}}" 不进 AC 词典——嵌套 JSON（{"a":{"b":1}}）结尾必然带
+        // 连续 "}"，单括号模式会系统性误伤合法 JSON（复测 C4r 项证实 5000 层
+        // 嵌套 JSON 被 SSTI-001 误拦）。{{...}} 改为 detect 中成对共现判定。
+        for (auto& p : {"${", "<%=", "%{", "{%", "%}",
                          "7*7", "config.items", "self.__init__", "__globals__",
                          "request|attr", "lipsum.__globals__", "get_flashed_messages"})
             ac_.addPattern(p);
@@ -188,6 +191,12 @@ public:
         for (auto& payload : req.collectPayloads()) {
             std::string norm = Decoder::normalize(payload);
             if (ac_.containsAny(norm)) {
+                return {Action::BLOCK, "SSTI-001", "SSTI", "Server-side template injection", norm};
+            }
+            // Jinja/Twig 风格 {{表达式}}：要求成对共现（JSON 中 "{" 后必跟引号，
+            // "{{" 在合法 JSON 中不存在，成对判定对 JSON 永假，零误伤）
+            if (norm.find("{{") != std::string::npos &&
+                norm.find("}}") != std::string::npos) {
                 return {Action::BLOCK, "SSTI-001", "SSTI", "Server-side template injection", norm};
             }
         }

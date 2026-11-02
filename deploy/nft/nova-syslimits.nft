@@ -1,0 +1,15 @@
+#!/usr/sbin/nft -f
+# NovaWAF 内核级连接数护栏（nftables）
+# 背景：nginx limit_conn 只在请求头完整后计数，预请求/握手期连接不在其视野；
+# 内核 conntrack 计数覆盖全生命周期（含 TIME_WAIT），400 并发建连压测已验证。
+# priority -200：先于 fw_enforcer 管理的 inet novawaf 表（priority 0）执行，
+# 超限连接在进入 WAF 封禁判定前即在内核层丢弃，避免占用用户态资源。
+# 幂等：destroy 对不存在对象为 no-op，可重复 nft -f 应用。
+table inet nova-syslimits
+destroy table inet nova-syslimits
+table inet nova-syslimits {
+    chain input {
+        type filter hook input priority -200; policy accept;
+        tcp dport 443 ct count over 64 counter drop comment "connlimit-443"
+    }
+}

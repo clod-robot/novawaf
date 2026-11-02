@@ -474,14 +474,21 @@ static bool isApiPath(const std::string& path) {
 // 从接收缓冲区切出一个完整请求。
 // 返回 1=完整(rawReq/totalLen) 0=不完整 -1=协议错误
 //      -2=声明的 Content-Length 超过请求体上限(应 413) -3=头部超限(应 400)
+// maxHeaders：头部字段数量上限（默认 128）。第三方复测证实纯字节上限(16KB)下
+// 约 500 个小头部才触发拒绝，数量级过宽；数量与字节双阈值收紧模糊测试空间。
 static int nextRequest(const std::string& buf, std::string& rawReq, size_t& totalLen,
-                       size_t maxBody, size_t maxHead) {
+                       size_t maxBody, size_t maxHead, size_t maxHeaders) {
     size_t he = buf.find("\r\n\r\n");
     if (he == std::string::npos) {
         // 头部超上限仍不完整：按超限处理，拒绝并断连（防 Slowloris 型无限缓冲）
         return buf.size() > maxHead ? -3 : 0;
     }
     if (he > maxHead) return -3;  // 头区总长超限（16KB 默认，对齐评估基线）
+    // 头部字段数量上限：请求行之后每个 "\r\n" 分隔一个头部字段
+    size_t nHeaders = 0;
+    for (size_t p = buf.find("\r\n"); p != std::string::npos && p < he;
+         p = buf.find("\r\n", p + 2)) ++nHeaders;
+    if (nHeaders > maxHeaders) return -3;
     std::string head = buf.substr(0, he);
     long long bodyLen = -1;
     {   // 解析 Content-Length（大小写不敏感）
@@ -501,6 +508,33 @@ static int nextRequest(const std::string& buf, std::string& rawReq, size_t& tota
     if (buf.size() < totalLen) return 0;
     rawReq = buf.substr(0, totalLen);
     return 1;
+}
+
+// JSON 嵌套深度护栏（字符串状态机：跳过 "..." 字符串与 \ 转义内的括号，
+// 只对结构字符 { [ 入栈计数，} ] 出栈）。深度超 limit 立即返回（O(n) 单次遍历
+// + 提前退出，病态嵌套体不会拖慢热路径）。引号内的括号不计入，合法 JSON 零误判。
+static bool jsonDepthExceeds(const std::string& body, size_t limit) {
+    size_t depth = 0;
+    bool inStr = false, esc = false;
+    for (char ch : body) {
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch == '\\') esc = true;
+            else if (ch == '"') inStr = false;
+            continue;
+        }
+        switch (ch) {
+            case '"': inStr = true; break;
+            case '{': case '[':
+                if (++depth > limit) return true;
+                break;
+            case '}': case ']':
+                if (depth > 0) --depth;
+                break;
+            default: break;
+        }
+    }
+    return false;
 }
 
 // 按 HTTP 版本与 Connection 头判定是否复用连接
@@ -579,9 +613,17 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
         const char* e = getenv("NOVA_MAX_HEAD");
         return (e && *e) ? (size_t)std::atoll(e) : (size_t)16384;    // 默认 16KB
     }();
+    static const size_t kMaxHeaders = [] {
+        const char* e = getenv("NOVA_MAX_HEADERS");
+        return (e && *e) ? (size_t)std::atoll(e) : (size_t)128;      // 默认 128 个
+    }();
     static const int64_t kSlowReqMs = [] {
         const char* e = getenv("NOVA_SLOW_REQ_MS");
-        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)20000;  // 默认 20s
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)15000;  // 默认 15s（绝对时长上限）
+    }();
+    static const size_t kJsonMaxDepth = [] {
+        const char* e = getenv("NOVA_JSON_MAX_DEPTH");
+        return (e && *e) ? (size_t)std::atoll(e) : (size_t)100;      // 默认 100 层
     }();
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now().time_since_epoch()).count(); };
@@ -598,7 +640,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
         if (getpeername(cfd, (sockaddr*)&peer, &plen) == 0) {
             char ipstr[32] = {0};
             inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
-            ddos.onDisconnect(ipstr);
+            // 与 accept 侧对称：可信反代连接未计入 onConnect，此处不释放
+            if (!isTrustedProxy(ipstr)) ddos.onDisconnect(ipstr);
         }
         ::close(cfd);
     };
@@ -623,10 +666,15 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     socklen_t clen = sizeof(caddr);
                     int cfd = accept(listenFd, (sockaddr*)&caddr, &clen);
                     if (cfd < 0) break;
-                    // DDoS 防护：取源 IP，检查并发上限/连接速率/黑名单
+                    // DDoS 防护：取源 IP，检查并发上限/连接速率/黑名单。
+                    // 可信反代豁免：前置 nginx 部署下 accept 对端恒为回环地址，全站流量会
+                    // 挤进单一计数桶；且释放路径键不对称（短连接由转发器按真实客户端 IP
+                    // 释放）导致计数只增不减，泄漏累积后误封回环地址造成全站自我 DoS。
+                    // 可信代理入口的连接级防护前置到 nginx limit_conn / nft connlimit，
+                    // 真实客户端的速率/封禁在请求层按 XFF 解析后的 clientIp 键控（不受影响）。
                     char ipstr[32] = {0};
                     inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
-                    if (!ddos.onConnect(ipstr)) {
+                    if (!isTrustedProxy(ipstr) && !ddos.onConnect(ipstr)) {
                         close(cfd);  // 直接丢弃，不消耗应用层资源
                         continue;
                     }
@@ -734,7 +782,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     std::lock_guard<std::mutex> lk(busyMtx);
                     auto it = conns.find(fd);
                     if (it == conns.end()) { keepOpen = false; break; }
-                    nr = nextRequest(it->second.inbuf, rawReq, reqLen, kMaxBody, kMaxHead);
+                    nr = nextRequest(it->second.inbuf, rawReq, reqLen, kMaxBody, kMaxHead, kMaxHeaders);
                     if (nr == 0) break;        // 数据不完整，等更多字节
                 }
                 // 请求体/头部超限：立即统一错误页拒绝并断连，不再缓冲
@@ -1035,9 +1083,12 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                             req.path, hdrCi(req, "Host"));
                                     shield.recordBlock();
                                 } else {
-                                    outResp = blockResp(req.clientIp, "CC", cr.ruleId, cr.matched,
-                                                        req.path, hdrCi(req, "Host"),
-                                                        true, scannerUa);
+                                    // CHALLENGE 与 BLOCK 统一 429 限流语义：复测证实先 503 后 429
+                                    // 的混合出栈会被读作"后端过载"，且 503 拟态页不携带重试信息。
+                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
+                                    emitEvt(req.clientIp, "CC", "challenge", cr.ruleId, cr.matched,
+                                            req.path, hdrCi(req, "Host"));
+                                    shield.recordBlock();
                                 }
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
@@ -1065,14 +1116,39 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 if (g_debugLog) std::printf("[reactor %d] %s Bot from %s: %s\n",
                                             idx, br.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, br.matched.c_str());
-                                outResp = blockResp(req.clientIp, "Bot", br.ruleId, br.matched,
-                                                    req.path, hdrCi(req, "Host"),
-                                                    br.action != Action::BLOCK, scannerUa);
-                                if (br.action == Action::BLOCK) shield.recordBlock();
+                                if (br.action == Action::BLOCK) {
+                                    outResp = blockResp(req.clientIp, "Bot", br.ruleId, br.matched,
+                                                        req.path, hdrCi(req, "Host"), false, scannerUa);
+                                    shield.recordBlock();
+                                } else {
+                                    // CHALLENGE 统一 429 限流语义（与 CC 一致）：原 503 拟态页
+                                    // 会被读作后端过载，且不携带重试信息（复测 C3 项）
+                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
+                                    emitEvt(req.clientIp, "Bot", "challenge", br.ruleId, br.matched,
+                                            req.path, hdrCi(req, "Host"));
+                                    shield.recordBlock();
+                                }
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
                         _mark();  // [4] Geo/CC/Bot 结束，进入规则+AI 检测流水线
+                        // JSON 嵌套深度结构护栏：超深 JSON 按 400 拒绝（结构性限制，
+                        // tAttack 保持 false —— 不记攻击、不封禁、不上报 FwBan，
+                        // 观察模式下也不放行，与 413/头部超限同语义）。背景：5000 层
+                        // 嵌套曾触发 SSTI-001 误拦(AC 裸 "}}" 模式，已改成对共现判定)，
+                        // 此处独立护栏防止递归解析型上游被病态 JSON 打爆。
+                        if (!whitelisted && !policyPass && !blocked && !req.body.empty()) {
+                            std::string ct = hdrCi(req, "Content-Type");
+                            for (auto& c : ct) c = (char)tolower((unsigned char)c);
+                            if (ct.find("json") != std::string::npos &&
+                                jsonDepthExceeds(req.body, kJsonMaxDepth)) {
+                                outResp = errResp(400, "Bad Request");
+                                emitEvt(req.clientIp, "JsonDepth", "block", "JSON-DEPTH",
+                                        "json nesting too deep", req.path, hdrCi(req, "Host"));
+                                shield.recordBlock();
+                                blocked = true; tBlocked = true;
+                            }
+                        }
                         // 规则 + AI 二阶复核
                         if (!whitelisted && !policyPass && !blocked) {
                             DetectionResult dr = detectWithAiReview(pipeline, ai, req);

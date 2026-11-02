@@ -1,0 +1,15 @@
+[Unit]
+Description=NovaWAF kernel-level connection limits (nftables)
+Documentation=file:/etc/novawaf/nft/nova-syslimits.nft
+Wants=network-pre.target
+After=network-pre.target
+Before=network.target novawaf-engine.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/novawaf/nft/nova-syslimits.nft
+ExecStop=/usr/sbin/nft destroy table inet nova-syslimits
+
+[Install]
+WantedBy=multi-user.target
