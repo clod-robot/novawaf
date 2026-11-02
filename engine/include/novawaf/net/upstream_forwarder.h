@@ -8,6 +8,7 @@
 #include "novawaf/core/traffic_sink.h"
 #include "novawaf/core/waf_mode.h"
 #include "novawaf/net/upstream_pool.h"
+#include "novawaf/protect/behavior_guard.h"
 #include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 
@@ -203,6 +204,7 @@ private:
             writeAll(ctx.clientFd, outResp);
             relay(ctx.clientFd, ufd);
             connPool_.discard(ufd);
+            BehaviorGuard::instance().noteStatus(ctx.clientIp, respStatus(outResp));
             if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
             finishClient(ctx);
             return;
@@ -216,6 +218,7 @@ private:
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
         setResponseConnection(outResp, ctx.keepAlive);
         normalizeServerHeader(outResp);
+        BehaviorGuard::instance().noteStatus(ctx.clientIp, respStatus(outResp));
         if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
         finishClient(ctx);

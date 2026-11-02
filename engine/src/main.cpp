@@ -20,6 +20,7 @@
 #include "novawaf/av/external_intel.h"
 #include "novawaf/fw/fw_ban.h"
 #include "novawaf/protect/cc_guard.h"
+#include "novawaf/protect/behavior_guard.h"
 #include "novawaf/protect/bot_guard.h"
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
@@ -619,7 +620,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
     }();
     static const int64_t kSlowReqMs = [] {
         const char* e = getenv("NOVA_SLOW_REQ_MS");
-        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)15000;  // 默认 15s（绝对时长上限）
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)10000;  // 默认 10s（绝对时长上限）
     }();
     static const size_t kJsonMaxDepth = [] {
         const char* e = getenv("NOVA_JSON_MAX_DEPTH");
@@ -769,10 +770,13 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
               bool keepOpen = true;
               bool draining = false;  // 响应进入 outQ 由 EPOLLOUT 异步排空，fd 暂不关闭
               while (keepOpen && g_running) {
-                {   // 空闲超时回收（惰性）
+                {   // 空闲超时回收（惰性）：仅对无在途请求的连接；
+                    // 有未完成请求(inbuf 非空)的连接交给 sweep 慢速判定回 408，
+                    // 否则滴灌 body 到 15s 时会被此处按 idle 静默断连（V6 P0 复现点）。
                     std::lock_guard<std::mutex> lk(busyMtx);
                     auto it = conns.find(fd);
-                    if (it != conns.end() && nowMs() - it->second.lastActiveMs > kKeepAliveIdleMs) {
+                    if (it != conns.end() && it->second.inbuf.empty() &&
+                        nowMs() - it->second.lastActiveMs > kKeepAliveIdleMs) {
                         keepOpen = false; break;
                     }
                 }
@@ -980,6 +984,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &re);
                         }
                         if (app && forwardToUpstream(app->upstreamHost, app->upstreamPort, data, outResp)) {
+                            // 行为识别响应侧记账（404/301 频次信号，同步回退路径）
+                            BehaviorGuard::instance().noteStatus(req.clientIp, respStatus(outResp));
                             // 网页防篡改：同步回退路径同样过基线校验
                             if (data.compare(0, 4, "GET ") == 0) {
                                 if (auto restored = TamperCache::instance().process(
@@ -1067,6 +1073,24 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     false, scannerUa);
                                 shield.recordBlock();
                                 blocked = true; tBlocked = true; tAttack = true;
+                            }
+                        }
+                        // 行为维度异常识别（跨请求关联）：低速 CC/同前缀枚举/路径扫描。
+                        // 规则引擎对"每条合法、整体恶意"无感，此层补行为关联（V6 E 组缺口）。
+                        // 先记账（所有请求，含将被拦截的）再判定；白名单/路径放行豁免。
+                        if (!whitelisted && !policyPass) {
+                            BehaviorGuard::instance().noteRequest(req.clientIp, req.path);
+                            if (!blocked) {
+                                DetectionResult bh = BehaviorGuard::instance().assess(req.clientIp);
+                                if (bh.action != Action::PASS) {
+                                    if (g_debugLog) std::printf("[reactor %d] CHAL Behavior from %s\n", idx, ipstr);
+                                    // 与 CC 一致的 429 限流语义（CHALLENGE → RA30）
+                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
+                                    emitEvt(req.clientIp, "Behavior", "challenge", bh.ruleId,
+                                            bh.matched, req.path, hdrCi(req, "Host"));
+                                    shield.recordBlock();
+                                    blocked = true; tBlocked = true; tAttack = true;
+                                }
                             }
                         }
                         if (!whitelisted && !policyPass && !blocked) {
@@ -1255,19 +1279,40 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
         // 周期空闲连接回收（即使无事件触发也能关闭超时 keep-alive 连接）
         {
             int64_t now = nowMs();
-            std::vector<int> stale;
+            std::vector<std::pair<int, bool>> stale;  // (fd, isSlowReq)
             {
                 std::lock_guard<std::mutex> lk(busyMtx);
                 for (auto& [cfd, st] : conns) {
                     if (busy.count(cfd)) continue;
-                    // 空闲 keep-alive 连接回收
-                    if (now - st.lastActiveMs > kKeepAliveIdleMs) { stale.push_back(cfd); continue; }
-                    // 慢速请求（Slowloris/慢body）回收：首字节后超时仍未凑齐完整请求
-                    if (!st.inbuf.empty() && st.firstByteMs && now - st.firstByteMs > kSlowReqMs)
-                        stale.push_back(cfd);
+                    // 有在途请求的连接只受慢速绝对上限约束（不变式：inbuf 非空则
+                    // firstByteMs 必已设置；防御性回退 lastActiveMs）。
+                    // 慢速判定必须先于 idle 回收：否则 15s idle 会抢在 10s 慢速之前
+                    // 静默断连（lastActiveMs 不随 body 滴灌更新），408 永远发不出。
+                    if (!st.inbuf.empty()) {
+                        int64_t base = st.firstByteMs ? st.firstByteMs : st.lastActiveMs;
+                        if (now - base > kSlowReqMs) stale.push_back({cfd, true});
+                        continue;
+                    }
+                    // 无在途请求的空闲 keep-alive 连接回收
+                    if (now - st.lastActiveMs > kKeepAliveIdleMs) stale.push_back({cfd, false});
                 }
             }  // 先释放锁，再逐个关闭（closeConn 自身会加锁）
-            for (int cfd : stale) closeConn(cfd);
+            for (auto [cfd, slow] : stale) {
+                // 慢速超时回 408 全站人格页（而非直接 RST 断连）：此前直接杀连接会让
+                // 前端 nginx 向客户端回 502 + Server: nginx，绕过 WAF 响应头归一化，
+                // 零载荷慢连接即可拿到真实指纹（V6 P0）。408 + IIS 人格后正常 FIN，
+                // 内核 linger 默认会把已拷贝进发送缓冲的响应发完再断。
+                if (slow) {
+                    std::string r = errResp(408, "Request Timeout");
+                    send(cfd, r.data(), r.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+                    // 先半关闭发 FIN 把 408 交付完毕，再 drain 接收缓冲：残留滴灌字节
+                    // 会让 close 发 RST，对端内核随 RST 丢弃已缓冲的 408（实测丢响应）。
+                    shutdown(cfd, SHUT_WR);
+                    char dbuf[4096];
+                    while (recv(cfd, dbuf, sizeof(dbuf), MSG_DONTWAIT) > 0) {}
+                }
+                closeConn(cfd);
+            }
         }
     }              // end while(g_running)
     close(tfd);
@@ -1524,13 +1569,27 @@ int main(int argc, char** argv) {
     DdosGuard ddos(ddosCfg);
 
     // ---- 应用层防护：CC / Bot / 动态自适应 / 指纹威胁情报 ----
+    // CC 阈值（V6 复测后收紧并文档化，均可由环境变量覆盖）：
+    //   单 IP 120 次/10s（12/s 持续即挑战，正常浏览器复用连接远低于此）
+    //   单 IP+URL 30 次/10s（同 URL 高频刷新突刺）
+    //   全局热点 URL 500 次/10s；429 + Retry-After 处置语义见 CC 判定分支
     CcGuard::Config ccCfg;
-    ccCfg.maxReqPerWindow  = getenv("NOVA_CC_WINDOW") ? atoi(getenv("NOVA_CC_WINDOW")) : 300;   // 单 IP 10s 内（正常浏览远低于此）
-    // 单 URL 突刺/全局热点阈值同样可由环境变量覆盖，便于压测时区分“引擎裸吞吐基线”
-    // 与“CC 防护下性能”；不设置时保持生产安全默认 80/800。
-    ccCfg.burstPerUrl      = getenv("NOVA_CC_BURST_URL") ? atoi(getenv("NOVA_CC_BURST_URL")) : 80;    // 单 IP 刷同 URL 上限
-    ccCfg.hotUrlGlobal     = getenv("NOVA_CC_HOT_URL")   ? atoi(getenv("NOVA_CC_HOT_URL"))   : 800;   // 全局热点 URL 阈值
+    ccCfg.maxReqPerWindow  = getenv("NOVA_CC_WINDOW") ? atoi(getenv("NOVA_CC_WINDOW")) : 120;
+    ccCfg.burstPerUrl      = getenv("NOVA_CC_BURST_URL") ? atoi(getenv("NOVA_CC_BURST_URL")) : 30;
+    ccCfg.hotUrlGlobal     = getenv("NOVA_CC_HOT_URL")   ? atoi(getenv("NOVA_CC_HOT_URL"))   : 500;
     CcGuard cc(ccCfg);
+    // 行为维度识别阈值（低速 CC/枚举/路径扫描，V6 P1 补齐，env 可覆盖）
+    {
+        BehaviorGuard::Config bhCfg;
+        if (getenv("NOVA_BEH_404_MAX"))  bhCfg.notFoundMax    = atoi(getenv("NOVA_BEH_404_MAX"));
+        if (getenv("NOVA_BEH_404_WIN"))  bhCfg.notFoundWinSec = atoi(getenv("NOVA_BEH_404_WIN"));
+        if (getenv("NOVA_BEH_ENUM_MAX")) bhCfg.enumMax        = atoi(getenv("NOVA_BEH_ENUM_MAX"));
+        if (getenv("NOVA_BEH_ENUM_WIN")) bhCfg.enumWinSec     = atoi(getenv("NOVA_BEH_ENUM_WIN"));
+        if (getenv("NOVA_BEH_SLOW_MAX")) bhCfg.slowCcMax      = atoi(getenv("NOVA_BEH_SLOW_MAX"));
+        if (getenv("NOVA_BEH_SLOW_WIN")) bhCfg.slowCcWinSec   = atoi(getenv("NOVA_BEH_SLOW_WIN"));
+        if (getenv("NOVA_BEH_LOCK"))     bhCfg.lockSec        = atoi(getenv("NOVA_BEH_LOCK"));
+        BehaviorGuard::instance().configure(bhCfg);
+    }
     BotGuard bot(BotGuard::Config{});
     DynamicShield shield(DynamicShield::Config{});
 

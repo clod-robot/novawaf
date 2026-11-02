@@ -310,6 +310,9 @@ public:
         for (auto& payload : req.collectPayloads()) {
             std::string norm = Decoder::normalize(payload);
             if (ac_.containsAny(norm)) {
+                // 合法证书分发路径例外：ca.pem 为 RADIUS 业务必需的对客分发
+                // （V6 复测误报项）。精确匹配归一化路径，不影响其它 .pem 探测拦截。
+                if (norm == "/api/radius/config/ca.pem") continue;
                 return {Action::BLOCK, "LEAK-001", "InfoLeak", "Sensitive path / info probing", norm};
             }
         }

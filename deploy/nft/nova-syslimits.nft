@@ -5,11 +5,13 @@
 # priority -200：先于 fw_enforcer 管理的 inet novawaf 表（priority 0）执行，
 # 超限连接在进入 WAF 封禁判定前即在内核层丢弃，避免占用用户态资源。
 # 幂等：destroy 对不存在对象为 no-op，可重复 nft -f 应用。
+# 上限 128：单浏览器常态 6-8 条并发连接，128 约支撑 16-21 并发用户
+# （V6 复测评估 64 对 NAC 场景偏紧）。
 table inet nova-syslimits
 destroy table inet nova-syslimits
 table inet nova-syslimits {
     chain input {
         type filter hook input priority -200; policy accept;
-        tcp dport 443 ct count over 64 counter drop comment "connlimit-443"
+        tcp dport 443 ct count over 128 counter drop comment "connlimit-443"
     }
 }
