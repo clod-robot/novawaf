@@ -11,6 +11,7 @@
 #include "novawaf/protect/behavior_guard.h"
 #include "novawaf/protect/block_page.h"
 #include "novawaf/protect/mimic.h"
+#include "novawaf/protect/response_dlp.h"
 #include "novawaf/protect/tamper_cache.h"
 
 #include <arpa/inet.h>
@@ -220,6 +221,9 @@ private:
         // 复测新增项：上游 nginx 默认错误页（301/404 等）正文改写为全站统一人格
         // 模板（此前只改 Server 头不改体，<center>nginx</center> 透传造成指纹分裂）
         BlockPage::rewriteUpstreamErrorBody(outResp);
+        // 响应侧 DLP：出站敏感数据（身份证/手机号/银行卡/密钥）检测与等长脱敏，
+        // 命中发事件到总线（SIEM/态势自动获得）；默认关闭，NOVA_RESP_DLP=1 启用
+        ResponseDlp::instance().process(outResp, ctx.clientIp, ctx.host, ctx.path);
         setResponseConnection(outResp, ctx.keepAlive);
         normalizeServerHeader(outResp);
         BehaviorGuard::instance().noteStatus(ctx.clientIp, respStatus(outResp));

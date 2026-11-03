@@ -9,11 +9,13 @@
 #include "novawaf/core/redis_client.h"
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/core/event_bus.h"
+#include "novawaf/core/siem_exporter.h"
 #include "novawaf/net/upstream_forwarder.h"
 #include "novawaf/net/request_sanitizer.h"
 #include "novawaf/protect/escalation_guard.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/custom_rules.h"
+#include "novawaf/detect/cve_patch.h"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -1625,6 +1627,41 @@ int main(int argc, char** argv) {
         }
     }).detach();
 
+    // ---- CVE 虚拟补丁：从 Redis 键 novawaf:cve_patch 热加载（JSON 模板数组），
+    //      管理控制台按 CVE 编号批量下发应急防护规则；copy-on-write 与 CustomRules 同通道风格 ----
+    auto cvePatch = std::make_shared<CvePatchDetector>();
+    auto cveVersion = std::make_shared<std::string>("-");
+    auto loadCvePatch = [cvePatch, cveVersion](bool initial) -> size_t {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return initial ? cvePatch->reload("") : (size_t)-1;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db))
+            return initial ? cvePatch->reload("") : (size_t)-1;
+        auto ver = r.get("novawaf:cve_patch:version");
+        std::string cur = ver.value_or("");
+        if (cur == *cveVersion && !initial) return (size_t)-1;  // 版本未变，跳过重解析
+        auto blob = r.get("novawaf:cve_patch");
+        *cveVersion = cur;
+        size_t n = cvePatch->reload(blob.value_or(""));
+        std::printf("  CvePatch: %s %zu patches from redis (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", n, cur.c_str());
+        return n;
+    };
+    loadCvePatch(true);
+    pipeline.addDetector(std::unique_ptr<CvePatchDetector>(
+        static_cast<CvePatchDetector*>(cvePatch->clone().release())));
+    int cveInterval = getenv("NOVA_CVE_PATCH_INTERVAL") ? atoi(getenv("NOVA_CVE_PATCH_INTERVAL")) : 60;
+    std::thread([loadCvePatch, cveInterval]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(cveInterval));
+            if (!g_running) break;
+            loadCvePatch(false);
+        }
+    }).detach();
+
     // ---- 应用表：从 Redis novawaf:apps 热加载（copy-on-write），供按 Host 选上游 ----
     auto applyApps = [](const std::string& blob) {
         auto apps = std::make_shared<AppTable>(app_reg::parseApps(blob));
@@ -1994,9 +2031,11 @@ int main(int argc, char** argv) {
     ai->setCache(aiCache);
     ai->setExecutor(aiPool);
 
-    // ---- 攻击事件总线订阅（观察者模式）：态势落库，后续可扩告警/SIEM ----
+    // ---- 攻击事件总线订阅（观察者模式）：态势落库 + 外部 SIEM 出口 ----
     EventBus<AttackEvent>::instance().subscribe(
         [](const AttackEvent& e) { EventSink::instance().emit(e); });
+    // SIEM 出口（webhook/syslog）：订阅同一总线，异步批量投递，未配置出口时 no-op
+    SiemExporter::instance().start();
 
     // ---- 异步上游转发：独立 IO 线程池 + 连接池，reactor 不再被上游阻塞 ----
     int ioThreads = getenv("NOVA_IO_THREADS") ? std::atoi(getenv("NOVA_IO_THREADS"))
@@ -2065,6 +2104,7 @@ int main(int argc, char** argv) {
     if (g_upstream) g_upstream->stop();  // 排空异步转发任务（ddos 此时仍存活）
     shield.stop();
     TamperCache::instance().stop();      // 停机前把脏基线落盘
+    SiemExporter::instance().stop();     // 停 SIEM 出口线程（排空残留事件）
     EventSink::instance().stop();
     TrafficSink::instance().stop();
     return 0;
