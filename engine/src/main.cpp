@@ -25,6 +25,7 @@
 #include "novawaf/protect/dynamic_shield.h"
 #include "novawaf/protect/fingerprint.h"
 #include "novawaf/protect/geo_filter.h"
+#include "novawaf/protect/honeypot_guard.h"
 #include "novawaf/protect/iplist_filter.h"
 #include "novawaf/protect/path_policy.h"
 #include "novawaf/protect/rmi_guard.h"
@@ -1076,6 +1077,22 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 break;
                             default: break;
                         }
+                        // 蜜罐诱捕：诱饵路径正常流量永不触达（不在站点地图、无页面链接、
+                        // 业务从不引用），任何访问即确定性恶意探测——命中直接 403 阻断
+                        // 并联动防火墙封禁源 IP（发现即阻断）。白名单/路径放行豁免。
+                        if (!whitelisted && !policyPass && !blocked) {
+                            DetectionResult hp = HoneypotGuard::instance().assess(req.path);
+                            if (hp.action == Action::BLOCK) {
+                                if (g_debugLog) std::printf("[reactor %d] BLOCK Honeypot from %s: %s\n",
+                                            idx, ipstr, req.path.c_str());
+                                outResp = blockResp(req.clientIp, "Honeypot", hp.ruleId,
+                                                    hp.matched, req.path, hdrCi(req, "Host"),
+                                                    false, scannerUa);
+                                shield.recordBlock();
+                                FwBanPoster::instance()->enqueue(req.clientIp, "Honeypot", hp.ruleId);
+                                blocked = true; tBlocked = true; tAttack = true;
+                            }
+                        }
                         if (!whitelisted && !policyPass && ti) {
                             auto tr = ti->match(req, ja4, httpFp);
                             if (tr && tr->isBlocked()) {
@@ -1555,6 +1572,40 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             if (!g_running) break;
             loadIpList(false);
+        }
+    }).detach();
+
+    // ---- 蜜罐诱饵路径：从 Redis novawaf:honeypot:paths 热加载（联动控制台，保存即发布）。
+    // 内置默认诱饵集始终生效，Redis 清单为增量补充；COW 原子换表，reactor 热路径无锁读 ----
+    auto loadHoneypot = [](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) {
+            if (initial)
+                std::printf("  Honeypot: loaded defaults=%zu (redis off)\n",
+                            HoneypotGuard::instance().tableCount());
+            return;
+        }
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        static std::string s_ver = "-";
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        auto ver = r.get("novawaf:honeypot:version");
+        std::string cur = ver.value_or("");
+        if (cur == s_ver && !initial) return;
+        auto blob = r.get("novawaf:honeypot:paths");
+        s_ver = cur;
+        size_t n = HoneypotGuard::instance().reload(blob.value_or(""));
+        std::printf("  Honeypot: %s traps=%zu (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", n, cur.c_str());
+    };
+    loadHoneypot(true);
+    std::thread([loadHoneypot]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!g_running) break;
+            loadHoneypot(false);
         }
     }).detach();
 

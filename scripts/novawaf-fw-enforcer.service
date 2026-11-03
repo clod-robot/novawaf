@@ -1,0 +1,19 @@
+[Unit]
+Description=NovaWAF Firewall Enforcer (Redis ban queue -> nftables/iptables)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=NOVA_REDIS_HOST=127.0.0.1
+Environment=NOVA_REDIS_PORT=6379
+# 部署时替换为实际 Redis 密码（与 redis.conf requirepass、引擎 unit 的 NOVA_REDIS_PASS 三方一致）
+Environment=NOVA_REDIS_PASS=CHANGE_ME
+ExecStart=/usr/bin/python3 /home/mao/novawaf/scripts/fw_enforcer.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/fw_enforcer.log
+StandardError=append:/tmp/fw_enforcer.log
+
+[Install]
+WantedBy=multi-user.target
