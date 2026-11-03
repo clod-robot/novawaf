@@ -850,6 +850,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             case 413: txt = "Request Entity Too Large"; break;
                             case 414: txt = "Request-URI Too Large"; break;
                             case 429: txt = "Too Many Requests"; break;
+                            case 502: txt = "Bad Gateway"; break;
+                            case 505: txt = "HTTP Version Not Supported"; break;
                             default:  code = 400; break;
                         }
                         std::string e = errResp(code, txt, code == 429 ? "Retry-After: 30\r\n" : "");
@@ -1657,16 +1659,20 @@ int main(int argc, char** argv) {
     ccCfg.burstPerUrl      = getenv("NOVA_CC_BURST_URL") ? atoi(getenv("NOVA_CC_BURST_URL")) : 30;
     ccCfg.hotUrlGlobal     = getenv("NOVA_CC_HOT_URL")   ? atoi(getenv("NOVA_CC_HOT_URL"))   : 500;
     CcGuard cc(ccCfg);
-    // 行为维度识别阈值（低速 CC/枚举/路径扫描，V6 P1 补齐，env 可覆盖）
+    // 行为维度统计评分（低速CC/枚举/路径扫描：策略信号加权 + 漏桶衰减 +
+    // 长窗低速直判 + 64 片分片锁，V6 行为识别缺口整改，env 可覆盖）
     {
         BehaviorGuard::Config bhCfg;
-        if (getenv("NOVA_BEH_404_MAX"))  bhCfg.notFoundMax    = atoi(getenv("NOVA_BEH_404_MAX"));
-        if (getenv("NOVA_BEH_404_WIN"))  bhCfg.notFoundWinSec = atoi(getenv("NOVA_BEH_404_WIN"));
-        if (getenv("NOVA_BEH_ENUM_MAX")) bhCfg.enumMax        = atoi(getenv("NOVA_BEH_ENUM_MAX"));
-        if (getenv("NOVA_BEH_ENUM_WIN")) bhCfg.enumWinSec     = atoi(getenv("NOVA_BEH_ENUM_WIN"));
-        if (getenv("NOVA_BEH_SLOW_MAX")) bhCfg.slowCcMax      = atoi(getenv("NOVA_BEH_SLOW_MAX"));
-        if (getenv("NOVA_BEH_SLOW_WIN")) bhCfg.slowCcWinSec   = atoi(getenv("NOVA_BEH_SLOW_WIN"));
-        if (getenv("NOVA_BEH_LOCK"))     bhCfg.lockSec        = atoi(getenv("NOVA_BEH_LOCK"));
+        if (getenv("NOVA_BEH_SCORE"))     bhCfg.scoreThreshold = atof(getenv("NOVA_BEH_SCORE"));
+        if (getenv("NOVA_BEH_DECAY"))     bhCfg.decayPerSec    = atof(getenv("NOVA_BEH_DECAY"));
+        if (getenv("NOVA_BEH_W_404"))     bhCfg.wNotFound      = atof(getenv("NOVA_BEH_W_404"));
+        if (getenv("NOVA_BEH_W_ENUM"))    bhCfg.wEnumId        = atof(getenv("NOVA_BEH_W_ENUM"));
+        if (getenv("NOVA_BEH_W_APIENUM")) bhCfg.wApiEnum       = atof(getenv("NOVA_BEH_W_APIENUM"));
+        if (getenv("NOVA_BEH_W_REQ"))     bhCfg.wRequest       = atof(getenv("NOVA_BEH_W_REQ"));
+        if (getenv("NOVA_BEH_ENUM_WIN"))  bhCfg.enumWinSec     = atoi(getenv("NOVA_BEH_ENUM_WIN"));
+        if (getenv("NOVA_BEH_SLOW_MAX"))  bhCfg.slowMax        = atoi(getenv("NOVA_BEH_SLOW_MAX"));
+        if (getenv("NOVA_BEH_SLOW_WIN"))  bhCfg.slowWinSec     = atoi(getenv("NOVA_BEH_SLOW_WIN"));
+        if (getenv("NOVA_BEH_LOCK"))      bhCfg.lockSec        = atoi(getenv("NOVA_BEH_LOCK"));
         BehaviorGuard::instance().configure(bhCfg);
     }
     BotGuard bot(BotGuard::Config{});
