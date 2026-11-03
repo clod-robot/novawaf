@@ -64,6 +64,10 @@ export const api = {
   wafRules: () => http.get('/waf/rules'),
   saveRules: (json) => http.post('/waf/rules', { json }),
   reloadRules: () => http.post('/waf/rules/reload'),
+  // CVE 虚拟补丁：应急漏洞热防护，引擎 60s 内热加载
+  cvePatchGet: () => http.get('/waf/cve-patch'),
+  cvePatchSave: (json) => http.post('/waf/cve-patch', { json }),
+  cvePatchReload: () => http.post('/waf/cve-patch/reload'),
   wafIoc: () => http.get('/waf/ioc'),
   // 黑白名单(联动 GeoIP)
   ipList: (type, q) => http.get('/waf/iplist', { params: { type, q } }),

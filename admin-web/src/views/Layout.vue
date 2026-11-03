@@ -62,6 +62,7 @@ const all = [
   { path: '/waf/app', title: '防护应用', perm: 'waf:app:list', icon: 'Grid' },
   { path: '/waf/log', title: '日志管理', perm: 'waf:log:list', icon: 'Document' },
   { path: '/waf/rule', title: '规则管理', perm: 'waf:rule:list', icon: 'Setting' },
+  { path: '/waf/cve-patch', title: 'CVE虚拟补丁', perm: 'waf:rule:list', icon: 'FirstAidKit' },
   { path: '/waf/ioc', title: '威胁情报', perm: 'waf:ioc:list', icon: 'Warning' },
   { path: '/waf/iplist', title: '黑白名单', perm: 'waf:iplist:list', icon: 'Lock' },
   { path: '/waf/tamper', title: '网页防篡改', perm: 'waf:tamper:list', icon: 'DocumentChecked' },

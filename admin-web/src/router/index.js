@@ -11,6 +11,7 @@ const routes = [
       { path: 'waf/app', component: () => import('../views/Apps.vue'), meta: { perm: 'waf:app:list', title: '防护应用' } },
       { path: 'waf/log', component: () => import('../views/Logs.vue'), meta: { perm: 'waf:log:list', title: '日志管理' } },
       { path: 'waf/rule', component: () => import('../views/Rules.vue'), meta: { perm: 'waf:rule:list', title: '规则管理' } },
+      { path: 'waf/cve-patch', component: () => import('../views/CvePatch.vue'), meta: { perm: 'waf:rule:list', title: 'CVE虚拟补丁' } },
       { path: 'waf/ioc', component: () => import('../views/Ioc.vue'), meta: { perm: 'waf:ioc:list', title: '威胁情报' } },
       { path: 'waf/iplist', component: () => import('../views/Iplist.vue'), meta: { perm: 'waf:iplist:list', title: '黑白名单' } },
       { path: 'waf/tamper', component: () => import('../views/Tamper.vue'), meta: { perm: 'waf:tamper:list', title: '网页防篡改' } },

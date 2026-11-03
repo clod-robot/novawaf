@@ -121,6 +121,28 @@ public class WafController {
         return Result.ok();
     }
 
+    // ---------- CVE 虚拟补丁(应急漏洞热防护, 复用规则权限) ----------
+    @RequirePerms("waf:rule:list")
+    @GetMapping("/cve-patch")
+    public Result<Map<String, Object>> cvePatch() {
+        return Result.ok(waf.cvePatch());
+    }
+
+    @RequirePerms("waf:rule:list")
+    @PostMapping("/cve-patch")
+    public Result<Map<String, Object>> saveCvePatch(@RequestBody RulesReq req) {
+        waf.saveCvePatch(req.getJson());
+        audit.record(UserContext.get().getUsername(), "waf", "下发CVE虚拟补丁", "POST", null, 1, null, 0);
+        return Result.ok(waf.cvePatch());
+    }
+
+    @RequirePerms("waf:rule:list")
+    @PostMapping("/cve-patch/reload")
+    public Result<Void> reloadCvePatch() {
+        waf.bumpCvePatchVersion();
+        return Result.ok();
+    }
+
     // ---------- IOC ----------
     @RequirePerms("waf:ioc:list")
     @GetMapping("/ioc")

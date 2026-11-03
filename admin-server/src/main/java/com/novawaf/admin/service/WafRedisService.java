@@ -634,6 +634,131 @@ public class WafRedisService {
         return salt.substring(salt.length() - 4);
     }
 
+    /* ---------- CVE 虚拟补丁（应急漏洞热防护） ---------- */
+
+    private static final String CVE_KEY = "novawaf:cve_patch";
+    private static final String CVE_VER_KEY = "novawaf:cve_patch:version";
+    private static final int CVE_MAX_PATCHES = 500;
+    private static final java.util.regex.Pattern CVE_NO =
+            java.util.regex.Pattern.compile("^[A-Za-z]{2,6}-[0-9A-Za-z-]{2,30}$");
+
+    /** 补丁列表 + 版本号 + 引擎生效条数口径(禁用项不下发) */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> cvePatch() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        Object arr = parse(redis.opsForValue().get(CVE_KEY));
+        m.put("patches", arr instanceof List ? (List<Object>) arr : List.of());
+        m.put("version", toLong(redis.opsForValue().get(CVE_VER_KEY)));
+        return m;
+    }
+
+    /**
+     * 保存整包补丁 JSON：服务端校验并规范化（未知字段丢弃），写 novawaf:cve_patch 并 bump 版本号，
+     * 引擎 60s 轮询热加载（与 CvePatchDetector.loadFromJson 字段口径一一对应）。
+     */
+    @SuppressWarnings("unchecked")
+    public synchronized void saveCvePatch(String json) {
+        Object root = parse(json);
+        if (!(root instanceof List))
+            throw new BusinessException(400, "补丁格式错误: 顶层必须是 JSON 数组 [{...}, ...]");
+        List<Object> in = (List<Object>) root;
+        if (in.size() > CVE_MAX_PATCHES)
+            throw new BusinessException(400, "补丁数量超限: 最多 " + CVE_MAX_PATCHES + " 条, 当前 " + in.size());
+        List<Map<String, Object>> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        int idx = 0;
+        for (Object o : in) {
+            idx++;
+            if (!(o instanceof Map))
+                throw new BusinessException(400, "第 " + idx + " 条不是对象");
+            Map<String, Object> src = (Map<String, Object>) o;
+            String cve = str(src.get("cve")).trim();
+            if (cve.isEmpty())
+                throw new BusinessException(400, "第 " + idx + " 条缺少必填字段 cve");
+            if (cve.length() > 64 || !CVE_NO.matcher(cve).matches())
+                throw new BusinessException(400, "第 " + idx + " 条 cve 编号格式非法: " + cve
+                        + " (应为 CVE-2024-12345 / CNVD-2024-12345 形式)");
+            if (!seen.add(cve.toUpperCase()))
+                throw new BusinessException(409, "CVE 编号重复: " + cve);
+            String match = str(src.get("match"));
+            if (match.isEmpty())
+                throw new BusinessException(400, cve + " 缺少必填字段 match(匹配串)");
+            if (match.length() > 512)
+                throw new BusinessException(400, cve + " 的 match 超长(>512)");
+
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("cve", cve);
+            String name = str(src.get("name")).trim();
+            if (!name.isEmpty()) p.put("name", name);
+            p.put("enabled", !Boolean.FALSE.equals(src.get("enabled")));
+            String action = str(src.get("action")).trim().toLowerCase();
+            if (!action.isEmpty() && !List.of("block", "log", "pass").contains(action))
+                throw new BusinessException(400, cve + " action 非法: " + action + " (可选 block/log/pass)");
+            p.put("action", action.isEmpty() ? "block" : action);
+            String severity = str(src.get("severity")).trim().toLowerCase();
+            if (!severity.isEmpty() && !List.of("critical", "high", "medium", "low").contains(severity))
+                throw new BusinessException(400, cve + " severity 非法: " + severity + " (可选 critical/high/medium/low)");
+            p.put("severity", severity.isEmpty() ? "high" : severity);
+            if (src.get("methods") != null) {
+                if (!(src.get("methods") instanceof List))
+                    throw new BusinessException(400, cve + " methods 必须是数组");
+                List<String> ms = new ArrayList<>();
+                for (Object mo : (List<Object>) src.get("methods")) {
+                    String mm = str(mo).trim().toUpperCase();
+                    if (mm.isEmpty()) continue;
+                    if (!mm.matches("^[A-Z]{2,10}$"))
+                        throw new BusinessException(400, cve + " methods 含非法方法名: " + mm);
+                    if (!ms.contains(mm)) ms.add(mm);
+                }
+                if (!ms.isEmpty()) p.put("methods", ms);
+            }
+            String uri = str(src.get("uri")).trim();
+            if (!uri.isEmpty()) p.put("uri", uri);
+            if (src.get("scope") != null) {
+                if (!(src.get("scope") instanceof List))
+                    throw new BusinessException(400, cve + " scope 必须是数组");
+                List<String> sc = new ArrayList<>();
+                for (Object so : (List<Object>) src.get("scope")) {
+                    String s = str(so).trim().toLowerCase();
+                    if (!List.of("uri", "args", "headers", "body").contains(s))
+                        throw new BusinessException(400, cve + " scope 非法项: " + s
+                                + " (可选 uri/args/headers/body)");
+                    if (!sc.contains(s)) sc.add(s);
+                }
+                if (!sc.isEmpty()) p.put("scope", sc);
+            }
+            if (src.get("headers") != null) {
+                if (!(src.get("headers") instanceof Map))
+                    throw new BusinessException(400, cve + " headers 必须是对象 {头名:子串}");
+                Map<String, String> hc = new LinkedHashMap<>();
+                for (Map.Entry<String, Object> e : ((Map<String, Object>) src.get("headers")).entrySet()) {
+                    String hn = e.getKey() == null ? "" : e.getKey().trim().toLowerCase();
+                    String hv = str(e.getValue());
+                    if (hn.isEmpty() || hv.isEmpty()) continue;
+                    if (!hn.matches("^[a-z0-9-]{1,64}$"))
+                        throw new BusinessException(400, cve + " headers 含非法头名: " + hn);
+                    hc.put(hn, hv);
+                }
+                if (!hc.isEmpty()) p.put("headers", hc);
+            }
+            p.put("match", match);
+            out.add(p);
+        }
+        try {
+            redis.opsForValue().set(CVE_KEY, om.writeValueAsString(out));
+            redis.opsForValue().increment(CVE_VER_KEY);
+        } catch (BusinessException be) {
+            throw be;
+        } catch (Exception e) {
+            throw new BusinessException(500, "写入 CVE 补丁失败: " + e.getMessage());
+        }
+    }
+
+    /** bump 补丁版本号触发引擎热加载 */
+    public void bumpCvePatchVersion() {
+        redis.opsForValue().increment(CVE_VER_KEY);
+    }
+
     /* ---------- 规则版本管理 ---------- */
 
     /** 规则版本信息：版本号(单调递增)/规则条数/最近更新时间/规则集来源 */
