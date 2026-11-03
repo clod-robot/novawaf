@@ -10,6 +10,8 @@
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/core/event_bus.h"
 #include "novawaf/net/upstream_forwarder.h"
+#include "novawaf/net/request_sanitizer.h"
+#include "novawaf/protect/escalation_guard.h"
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/threat_intel.h"
@@ -844,7 +846,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 }
                 if (nr < 0) { keepOpen = false; break; }  // 协议错误
                 bool keepAlive = false;
-                const std::string data = rawReq;   // 检测/转发使用的完整请求字节
+                std::string data = rawReq;   // 检测/转发使用的完整请求字节（转发前做代理头清洗，故非 const）
                 {
                     ReactorReqScope _rs{idx};
                     uint64_t _mk[8]; int _mi=0;
@@ -911,9 +913,11 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         req.clientIp = _cs.peerIp;
                     }
                     const char* ipstr = req.clientIp.c_str();
+                    const std::string peerIp = req.clientIp;  // 直连对端（XFF 解析前）
+                    const bool trustedPeer = isTrustedProxy(ipstr);
                     // 防绕过：仅当直连对端是可信反向代理(NOVA_TRUSTED_PROXIES)时，才采信
                     // X-Forwarded-For/X-Real-IP 的最左原始 IP；否则忽略客户端伪造头，用真实对端 IP。
-                    if (isTrustedProxy(ipstr)) {
+                    if (trustedPeer) {
                         for (auto& [k, v] : req.headers) {
                             std::string lk = k;
                             for (auto& c : lk) c = (char)tolower((unsigned char)c);
@@ -927,6 +931,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             }
                         }
                     }
+                    // 转发头清洗：剥离客户端可自报的代理族头（X-Client-IP/Forwarded/
+                    // X-Forwarded-Host 等），防其穿透至上游应用被采信；检测模型
+                    // req.headers 不受影响（含 X-Original-* 伪造取证头仍可检测）。
+                    RequestSanitizer::sanitizeForwardHeaders(data, peerIp, trustedPeer);
 
                     // 会话：无 novasid 则生成，响应时注入 Set-Cookie（用于 UV 去重）
                     std::string sid = getCookieSid(req.headers);
@@ -1321,7 +1329,11 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     dr.matched, req.path, hdrCi(req, "Host"),
                                                     false, scannerUa);
                                 shield.recordBlock();
-                                tBlocked = true; tAttack = true; fwEscalate = true;
+                                tBlocked = true; tAttack = true;
+                                // 分级处置：单笔命中仅阻断当次请求；同 IP 滑窗内累计
+                                // N 次规则命中才升级 fw L3 封禁（误报/单探针不封全站）
+                                fwEscalate = EscalationGuard::instance().noteHit(req.clientIp)
+                                             >= EscalationGuard::escalateN();
                             } else {
                                 asyncHandled = forwardToApp();
                             }

@@ -131,7 +131,7 @@ public:
         int status = std::atoi(resp.c_str() + 9);
         switch (status) {
             case 301: case 302: case 400: case 403: case 404: case 405:
-            case 500: case 502: case 503: case 504: break;
+            case 500: case 502: case 503: case 504: case 505: break;
             default: return;
         }
         size_t he = resp.find("\r\n\r\n");
