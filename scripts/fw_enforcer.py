@@ -166,11 +166,21 @@ def main():
         if item:
             payload = item[1] if isinstance(item, list) and len(item) > 1 else None
             if payload:
-                ip = payload.split("|", 1)[0]
+                # 载荷：ip|ts|category|ruleId|count|ttl —— ttl 由引擎信誉模型计算
+                # （首封 × 2^(n-1)，封顶 2×信誉半衰期，破"解封即再封"死循环）；
+                # 旧版载荷无 ttl 字段则回退环境变量 TTL。
+                parts = payload.split("|")
+                ip = parts[0]
+                ttl = TTL
+                if len(parts) >= 6:
+                    try:
+                        ttl = max(10, min(int(parts[5]), 86400))
+                    except ValueError:
+                        pass
                 if not is_whitelisted(ip) and ip not in bans:
                     fw.ban(ip)
-                    bans[ip] = time.time() + TTL
-                    print(f"[fw] BAN {ip} reason={payload} ttl={TTL}s", flush=True)
+                    bans[ip] = time.time() + ttl
+                    print(f"[fw] BAN {ip} reason={payload} ttl={ttl}s", flush=True)
 
         # 定时解封过期 IP
         if time.time() - last_sweep >= SWEEP:

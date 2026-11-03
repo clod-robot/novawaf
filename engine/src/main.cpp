@@ -630,7 +630,14 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
     }();
     static const int64_t kSlowReqMs = [] {
         const char* e = getenv("NOVA_SLOW_REQ_MS");
-        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)10000;  // 默认 10s（绝对时长上限）
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)10000;  // 默认 10s（头部阶段绝对上限）
+    }();
+    // body 阶段最小速率（字节/秒）：body 时限与大小独立挂钩，预算 = 头时限 + CL/最小速率。
+    // 4MB @ 1KB/s = 4096s 合法慢传不被绝对上限误杀；零进度滴灌由 front nginx
+    // client_body_timeout(12s 空闲) + 本时限双层切断。
+    static const int64_t kSlowMinBps = [] {
+        const char* e = getenv("NOVA_SLOW_MIN_BPS");
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)1024;   // 默认 1KB/s
     }();
     static const size_t kJsonMaxDepth = [] {
         const char* e = getenv("NOVA_JSON_MAX_DEPTH");
@@ -1369,13 +1376,27 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 std::lock_guard<std::mutex> lk(busyMtx);
                 for (auto& [cfd, st] : conns) {
                     if (busy.count(cfd)) continue;
-                    // 有在途请求的连接只受慢速绝对上限约束（不变式：inbuf 非空则
-                    // firstByteMs 必已设置；防御性回退 lastActiveMs）。
-                    // 慢速判定必须先于 idle 回收：否则 15s idle 会抢在 10s 慢速之前
+                    // 有在途请求的连接：头部阶段受绝对上限约束（Slowloris 防御不变式：
+                    // inbuf 非空则 firstByteMs 必已设置；防御性回退 lastActiveMs）。
+                    // body 阶段时限与大小独立计算：预算 = 头时限 + Content-Length/最小速率，
+                    // 合法慢速大上传（4MB @ 1KB/s = 4096s）不被绝对上限误杀。
+                    // 慢速判定必须先于 idle 回收：否则 15s idle 会抢在慢速之前
                     // 静默断连（lastActiveMs 不随 body 滴灌更新），408 永远发不出。
                     if (!st.inbuf.empty()) {
                         int64_t base = st.firstByteMs ? st.firstByteMs : st.lastActiveMs;
-                        if (now - base > kSlowReqMs) stale.push_back({cfd, true});
+                        int64_t budget = kSlowReqMs;
+                        size_t he = st.inbuf.find("\r\n\r\n");
+                        if (he != std::string::npos && kSlowMinBps > 0) {
+                            // 头已齐：从头部解析 Content-Length（大小写不敏感）计算 body 时限
+                            std::string head = st.inbuf.substr(0, he);
+                            for (auto& c : head) c = (char)std::tolower((unsigned char)c);
+                            size_t p = head.find("content-length:");
+                            if (p != std::string::npos) {
+                                long long cl = std::atoll(head.c_str() + p + 15);
+                                if (cl > 0) budget += cl * 1000LL / kSlowMinBps;
+                            }
+                        }
+                        if (now - base > budget) stale.push_back({cfd, true});
                         continue;
                     }
                     // 无在途请求的空闲 keep-alive 连接回收

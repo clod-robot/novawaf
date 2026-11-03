@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -29,6 +30,10 @@ public:
     FwBanPoster() {
         const char* dis = std::getenv("NOVA_FW_BAN_DISABLE");
         disabled_ = dis && *dis == '1';
+        const char* hl = std::getenv("NOVA_REP_HALFLIFE_SEC");
+        halfLifeSec_ = (hl && *hl) ? std::atof(hl) : 300.0;  // 信誉半衰期（秒）
+        const char* fb = std::getenv("NOVA_FW_FIRST_BAN");
+        firstBanSec_ = (fb && *fb) ? std::atoi(fb) : 120;    // 首封时长（秒）
         if (disabled_) return;
         thread_ = std::thread([this] { run(); });
     }
@@ -39,30 +44,39 @@ public:
     bool disabled() const { return disabled_; }
 
     // 热路径：投递一个待封禁 IP（同 IP 在去重窗口内只投一次，避免刷屏）。
-    // 累犯分级：维护 IP 违规次数，随消息一起投递，由 fw_enforcer 据此决定分级 TTL
-    //   （首次短封、累犯递增），使封禁行为可预期且对重复攻击者更严厉。
+    // 信誉分模型（取代旧的 1h 扁平计数——旧模型无衰减，解封后信誉不清，
+    // "解封即再封"死循环）：每次违规先按半衰期指数衰减再 +1，
+    // 封禁时长 = 首封 × 2^(n-1) 且封顶 2×半衰期——解封时刻信誉必然已衰减
+    // ≥2 个半衰期至 ≤1/4，累犯加重有界、初犯快速回归。
     void enqueue(const std::string& ip, const std::string& category, const std::string& ruleId) {
         if (disabled_ || ip.empty()) return;
         if (ip == "127.0.0.1" || ip == "::1") return;  // 绝不封本机
         std::lock_guard<std::mutex> lk(mtx_);
-        int64_t now = std::time(nullptr);
+        double now = (double)std::time(nullptr);
         auto it = lastSent_.find(ip);
         if (it != lastSent_.end() && now - it->second < kDedupSec) return;  // 去重窗口
         lastSent_[ip] = now;
-        // 累犯计数：1 小时内重复违规递增，超时重置为首次
-        int count = 1;
-        auto cit = offenseCount_.find(ip);
-        if (cit != offenseCount_.end() && now - cit->second.second < kOffenseWindow) {
-            count = cit->second.first + 1;
+        double sc = 1.0;
+        auto rit = rep_.find(ip);
+        if (rit != rep_.end()) {
+            double dt = now - rit->second.last;
+            if (dt < 0) dt = 0;
+            sc = rit->second.score * std::pow(0.5, dt / halfLifeSec_) + 1.0;
+            if (sc > 64) sc = 64;  // 数值保险
         }
-        offenseCount_[ip] = {count, now};
-        queue_.push_back(ip + "|" + std::to_string(now) + "|" + category + "|" + ruleId +
-                           "|" + std::to_string(count));
+        rep_[ip] = {sc, now};
+        int count = (int)std::ceil(sc);
+        // 时长阶梯：首封 × 2^(n-1)，硬顶 2×半衰期（用户公式：封禁时长 ≤ 2×信誉半衰期）
+        int cap = (int)(2.0 * halfLifeSec_);
+        int ttl = firstBanSec_;
+        for (int i = 1; i < count && ttl < cap; ++i) ttl *= 2;
+        if (ttl > cap) ttl = cap;
+        queue_.push_back(ip + "|" + std::to_string((int64_t)now) + "|" + category + "|" + ruleId +
+                           "|" + std::to_string(count) + "|" + std::to_string(ttl));
     }
 
 private:
     static constexpr int kDedupSec = 60;
-    static constexpr int64_t kOffenseWindow = 3600;  // 累犯计数窗口（秒），超时重置为首次
     void run() {
         RedisClient r;
         bool connected = false;
@@ -85,14 +99,18 @@ private:
             if (!batch.empty() && ensureConn()) {
                 r.rpushMulti("novawaf:fw:ban", batch);
             }
-            // 清理过期累犯计数，防止内存无限增长
+            // 清理信誉衰减殆尽（<0.25 ≈ 2 个半衰期无违规）的记录，防内存增长
             {
                 std::lock_guard<std::mutex> lk(mtx_);
-                int64_t now = std::time(nullptr);
-                for (auto it = offenseCount_.begin(); it != offenseCount_.end();) {
-                    if (now - it->second.second >= kOffenseWindow)
-                        it = offenseCount_.erase(it);
+                double now = (double)std::time(nullptr);
+                for (auto it = rep_.begin(); it != rep_.end();) {
+                    double dt = now - it->second.last;
+                    if (dt > 0 && it->second.score * std::pow(0.5, dt / halfLifeSec_) < 0.25)
+                        it = rep_.erase(it);
                     else ++it;
+                }
+                for (auto it = lastSent_.begin(); it != lastSent_.end();) {
+                    if (now - it->second > 3600) it = lastSent_.erase(it); else ++it;
                 }
             }
             for (int i = 0; i < 5 && running_; ++i)
@@ -102,11 +120,14 @@ private:
 
     std::atomic<bool> running_{true};
     bool disabled_ = false;
+    double halfLifeSec_ = 300.0;
+    int firstBanSec_ = 120;
     std::thread thread_;
     std::mutex mtx_;
     std::vector<std::string> queue_;
     std::unordered_map<std::string, int64_t> lastSent_;  // IP -> 上次投递时间，去重
-    std::unordered_map<std::string, std::pair<int, int64_t>> offenseCount_;  // IP -> {违规次数, 末次时间}
+    struct Rep { double score; double last; };
+    std::unordered_map<std::string, Rep> rep_;  // IP -> 信誉分（指数半衰期衰减）
 };
 
 }  // namespace novawaf
