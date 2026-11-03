@@ -281,11 +281,19 @@ static std::vector<std::string> loadDataLines(const char* redisKey,
         }
         // 连接失败：回退文件，保证可用性
     }
+    // 文件回退分支：以 mtime+size 作为签名短路。60s 轮询场景下文件几乎不变，
+    // 无此短路则每轮全量重读重解析并打印 hot-reloaded 日志（日志刷屏根因）。
+    struct stat fst{};
+    if (::stat(filePath.c_str(), &fst) != 0) return {};  // 文件不存在
+    std::string fsig = "F:" + std::to_string((long long)fst.st_mtime) +
+                       ":" + std::to_string((long long)fst.st_size);
+    if (fsig == inoutCksum) return {};  // 内容未变，跳过重解析
     std::ifstream in(filePath);
     if (!in) return {};
     std::vector<std::string> lines;
     std::string ln;
     while (std::getline(in, ln)) lines.push_back(ln);
+    inoutCksum = fsig;
     return lines;
 }
 
