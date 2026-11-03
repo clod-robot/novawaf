@@ -10,8 +10,10 @@
 
 #include "novawaf/protect/mimic.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <sys/random.h>
@@ -117,8 +119,60 @@ public:
         return resp;
     }
 
+    // 上游默认错误页正文改写（复测新增项：301/404 只改了 Server 头没改体，
+    // <center>nginx</center> 默认页经 WAF 透传造成人格分裂）。
+    // 判定特征：状态码在典型错误集合内 且 body 含 nginx 默认页签名；
+    // 命中则以全站统一 IIS 人格模板重建 body，保留 Location/Date 等业务头，
+    // 重写 Server/Content-Type/Content-Length。非错误页或业务自有错误页不动。
+    static void rewriteUpstreamErrorBody(std::string& resp) {
+        // 状态码解析
+        if (resp.compare(0, 9, "HTTP/1.1 ") != 0 && resp.compare(0, 9, "HTTP/1.0 ") != 0)
+            return;
+        int status = std::atoi(resp.c_str() + 9);
+        switch (status) {
+            case 301: case 302: case 400: case 403: case 404: case 405:
+            case 500: case 502: case 503: case 504: break;
+            default: return;
+        }
+        size_t he = resp.find("\r\n\r\n");
+        if (he == std::string::npos) return;
+        // nginx 默认页签名：<center>nginx（页脚版权行；真实页为 <center>nginx/1.30.5</center>
+        // 带版本号，按前缀匹配），只扫前 4KB 防大body误伤
+        std::string head = resp.substr(0, he);
+        size_t probeLen = resp.size() - he < 4096 ? resp.size() - he : 4096;
+        if (resp.find("<center>nginx", he) == std::string::npos ||
+            resp.find("<center>nginx", he) > he + probeLen)
+            return;
+        // 状态短语取原状态行（保持与状态码一致）；RFC 允许无短语，兜底 "Error"
+        size_t eol = head.find("\r\n");
+        std::string statusLine = head.substr(0, eol);
+        std::string st = statusLine.size() > 13 ? statusLine.substr(13) : std::string("Error");
+        std::string body = iisHtml(status, st.c_str());
+        // 头区重建：剔除 Server/Content-Type/Content-Length，其余原样保留
+        std::string out = statusLine + "\r\n";
+        size_t pos = eol + 2;
+        while (pos < head.size()) {
+            size_t le = head.find("\r\n", pos);
+            std::string line = (le == std::string::npos) ? head.substr(pos)
+                                                         : head.substr(pos, le - pos);
+            std::string low = line;
+            for (auto& c : low) c = (char)tolower((unsigned char)c);
+            if (low.compare(0, 7, "server:") != 0 &&
+                low.compare(0, 13, "content-type:") != 0 &&
+                low.compare(0, 15, "content-length:") != 0) {
+                out += line;
+                out += "\r\n";
+            }
+            if (le == std::string::npos) break;
+            pos = le + 2;
+        }
+        out += "Server: " + MimicDefense::siteBanner() + "\r\n"
+               "Content-Type: text/html\r\n"
+               "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+        resp = std::move(out);
+    }
+
 private:
-    // IIS 10 风格通用错误页（状态码/短语参数化，与 tpl=2 的 403 页同一模板语言）
     static std::string iisHtml(int status, const char* statusText) {
         std::string code = std::to_string(status);
         std::string title = code + " - " + statusText;

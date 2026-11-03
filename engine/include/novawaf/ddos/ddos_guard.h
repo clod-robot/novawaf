@@ -107,6 +107,18 @@ public:
         return true;
     }
 
+    // 封禁剩余秒数（未封禁/已到期返回 0）；用于 429 响应携带真实 Retry-After，
+    // 取代硬编码值（复测 P0：RA 恒 30，实际封禁 300s，客户端被误导反复重试）。
+    int bannedRemainSec(const std::string& ip) {
+        auto& s = shard(ip);
+        std::lock_guard<std::mutex> lk(s.mtx);
+        auto it = s.banned.find(ip);
+        if (it == s.banned.end()) return 0;
+        int64_t remain = it->second - nowMs();
+        if (remain <= 0) { s.banned.erase(it); return 0; }
+        return (int)((remain + 999) / 1000);
+    }
+
     // 手动封禁/解封（管理面调用）
     void ban(const std::string& ip, int seconds) {
         auto& s = shard(ip);

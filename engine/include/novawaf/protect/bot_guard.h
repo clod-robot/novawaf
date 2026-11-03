@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "novawaf/detect/http_model.h"
+#include "novawaf/protect/mimic.h"
 
 namespace novawaf {
 
@@ -87,6 +88,28 @@ private:
     }
 };
 
+// 扫描器 UA 特征（nuclei/sqlmap/nikto 等，复测新增项：Nuclei UA 此前未参与处置）
+// 复用 MimicDefense 的扫描器特征表，命中给高分——确定性工具指纹，非猜测。
+class ScannerUaSignature : public IBotStrategy {
+public:
+    int score(const HttpRequest& req, const std::string&, std::string& reason) const override {
+        std::string ua = getHeader(req, "user-agent");
+        if (MimicDefense::looksLikeScanner(ua)) {
+            reason = "scanner-ua";
+            return 40;
+        }
+        return 0;
+    }
+private:
+    static std::string getHeader(const HttpRequest& req, const char* key) {
+        for (auto& [k, v] : req.headers) {
+            std::string lk = k; for (auto& c : lk) c = (char)std::tolower((unsigned char)c);
+            if (lk == key) return v;
+        }
+        return {};
+    }
+};
+
 // Bot 防护：聚合所有策略评分
 class BotGuard {
 public:
@@ -97,6 +120,7 @@ public:
     explicit BotGuard(const Config& cfg) : cfg_(cfg) {
         strategies_.push_back(std::make_unique<MissingBrowserHeaders>());
         strategies_.push_back(std::make_unique<UaMismatchHeaders>());
+        strategies_.push_back(std::make_unique<ScannerUaSignature>());
     }
     // 允许注入自定义策略（开放扩展点）
     void addStrategy(std::unique_ptr<IBotStrategy> s) { strategies_.push_back(std::move(s)); }
@@ -112,7 +136,9 @@ public:
         Action a = Action::PASS;
         if (total >= cfg_.scoreToBlock) a = Action::BLOCK;
         else if (total >= cfg_.scoreToChallenge) a = Action::CHALLENGE;
-        return {a, "BOT-001", "Bot", "Automated / non-browser behavior", reason};
+        DetectionResult res{a, "BOT-001", "Bot", "Automated / non-browser behavior", reason};
+        res.score = total;  // 透出原始分：上层折算 CC 配额系数（指纹降权，非一票否决）
+        return res;
     }
 
 private:

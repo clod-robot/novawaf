@@ -26,6 +26,7 @@
 #include "novawaf/protect/fingerprint.h"
 #include "novawaf/protect/geo_filter.h"
 #include "novawaf/protect/honeypot_guard.h"
+#include "novawaf/protect/honeypot_decoy.h"
 #include "novawaf/protect/iplist_filter.h"
 #include "novawaf/protect/path_policy.h"
 #include "novawaf/protect/rmi_guard.h"
@@ -693,7 +694,16 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     char ipstr[32] = {0};
                     inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
                     if (!isTrustedProxy(ipstr) && !ddos.onConnect(ipstr)) {
-                        close(cfd);  // 直接丢弃，不消耗应用层资源
+                        // 复测 P1：封禁期黑洞（accept 后静默关闭，客户端只能等 8s
+                        // 超时）。已封禁 IP 连接级即回 429 + 真实 Retry-After
+                        // （封禁剩余秒数），快速失败且给出可信恢复时间；
+                        // 纯并发超限仍快速关闭，不消耗应用层资源。
+                        if (ddos.isBanned(ipstr)) {
+                            std::string resp = errResp(429, "Too Many Requests",
+                                "Retry-After: " + std::to_string(std::max(1, ddos.bannedRemainSec(ipstr))) + "\r\n");
+                            ::send(cfd, resp.data(), resp.size(), MSG_NOSIGNAL);
+                        }
+                        close(cfd);
                         continue;
                     }
                     // 读保持非阻塞(ET 边沿触发需 drain 到 EAGAIN)；写响应时临时切阻塞以发完整
@@ -956,6 +966,10 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                "Content-Length: " + std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
                     }();
                     bool tBlocked = false, tAttack = false;
+                    // fw L3 封禁上报闸门：仅真实攻击命中（黑名单/TI/Geo/规则管线）置位。
+                    // 限流族（CC/端点分级/行为锁/DDoS/慢速）为自愈型 429 语义，不升级 L3 封禁，
+                    // 否则会出现 RA 失真、封禁递增、封禁期黑洞（复测 P0/P1 根因）。
+                    bool fwEscalate = false;
 
                     std::string outResp;
                     bool asyncHandled = false;  // 异步转发器接管后，reactor 跳过回写与关闭
@@ -1031,6 +1045,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &re);
                         }
                         if (app && forwardToUpstream(app->upstreamHost, app->upstreamPort, data, outResp)) {
+                            // 复测新增项：上游 nginx 默认错误页正文人格化（同步回退路径）
+                            BlockPage::rewriteUpstreamErrorBody(outResp);
                             // 行为识别响应侧记账（404/301 频次信号，同步回退路径）
                             BehaviorGuard::instance().noteStatus(req.clientIp, respStatus(outResp));
                             // 网页防篡改：同步回退路径同样过基线校验
@@ -1053,17 +1069,23 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         outResp = kMaint;
                         injectServerLine(outResp);
                     } else if (!ddos.onRequest(req.clientIp)) {
-                        // 请求速率超限 → 触发封禁链路，返回 429 + Retry-After
-                        outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
+                        // 请求速率超限 → 429 + 真实 Retry-After。
+                        // 复测 P0 根因：此处曾联动 fw L3 封禁——限流本为秒级自愈，
+                        // 却触发 120/240/480s 阶梯黑洞（RA 恒 30/60，实测恢复
+                        // 210–469s，偏差 7–16 倍）。限流不再上报 fw 封禁，
+                        // fw 保留给真实攻击（蜜罐升级/WAF 规则命中）。
+                        int ra = ddos.isBanned(req.clientIp)
+                               ? std::max(1, ddos.bannedRemainSec(req.clientIp)) : 1;
+                        outResp = errResp(429, "Too Many Requests",
+                                          "Retry-After: " + std::to_string(ra) + "\r\n");
                         shield.recordBlock();
                         emitEvt(req.clientIp, "DDoS", "block", "", "conn/rate limit", req.path, hdrCi(req, "Host"));
-                        FwBanPoster::instance()->enqueue(req.clientIp, "DDoS", "rate");
                         tBlocked = true;
                     } else if (!limiter.allow(req.clientIp)) {
-                        outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
+                        // 令牌桶 50/s 回充，最坏 1s 后必有可用令牌
+                        outResp = errResp(429, "Too Many Requests", "Retry-After: 1\r\n");
                         shield.recordBlock();
                         emitEvt(req.clientIp, "RateLimit", "block", "", "rate limit", req.path, hdrCi(req, "Host"));
-                        FwBanPoster::instance()->enqueue(req.clientIp, "RateLimit", "rate");
                         tBlocked = true;
                     } else {
                         _mark();  // [2] 限流通过，进入指纹/威胁情报
@@ -1091,24 +1113,44 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     std::string("blacklisted ip ") + req.clientIp,
                                                     req.path, hdrCi(req, "Host"), false, scannerUa);
                                 shield.recordBlock();
-                                blocked = true; tBlocked = true; tAttack = true;
+                                blocked = true; tBlocked = true; tAttack = true; fwEscalate = true;
                                 break;
                             default: break;
                         }
-                        // 蜜罐诱捕：诱饵路径正常流量永不触达（不在站点地图、无页面链接、
-                        // 业务从不引用），任何访问即确定性恶意探测——命中直接 403 阻断
-                        // 并联动防火墙封禁源 IP（发现即阻断）。白名单/路径放行豁免。
+                        // 蜜罐诱捕（观察模式，复测设计评审整改）：诱饵路径正常流量
+                        // 永不触达（不在站点地图、无页面链接、业务从不引用），访问即
+                        // 恶意探测——但「命中即封禁」让攻击者立刻知晓被处置、取证链
+                        // 中断，且命中响应与 WAF 拦截页同构、无诱饵特征。改为：
+                        //   记录（observe 事件）+ 打标（按不同诱饵滑窗计数）+ 诱饵放行
+                        //   （返回仿真 .git/.env/wp-login 内容，诱使攻击者深入）；
+                        //   窗口内触达 ≥N 个不同诱饵（NOVA_HONEY_ESCALATE_N，默认 3，
+                        //   正常用户数学上不可能踩中多个无链接路径）才升级 403+fw 封禁。
                         if (!whitelisted && !policyPass && !blocked) {
-                            DetectionResult hp = HoneypotGuard::instance().assess(req.path);
-                            if (hp.action == Action::BLOCK) {
-                                if (g_debugLog) std::printf("[reactor %d] BLOCK Honeypot from %s: %s\n",
-                                            idx, ipstr, req.path.c_str());
-                                outResp = blockResp(req.clientIp, "Honeypot", hp.ruleId,
-                                                    hp.matched, req.path, hdrCi(req, "Host"),
-                                                    false, scannerUa);
-                                shield.recordBlock();
-                                FwBanPoster::instance()->enqueue(req.clientIp, "Honeypot", hp.ruleId);
-                                blocked = true; tBlocked = true; tAttack = true;
+                            std::string bait = HoneypotGuard::instance().keyFor(req.path);
+                            if (!bait.empty()) {
+                                int distinct = HoneypotGuard::instance().noteHit(req.clientIp, bait);
+                                if (distinct >= HoneypotGuard::escalateN()) {
+                                    // 升级：触达足够多不同诱饵 → 确定性扫描器，封禁
+                                    if (g_debugLog) std::printf("[reactor %d] BLOCK Honeypot(escalate %d) from %s: %s\n",
+                                                idx, distinct, ipstr, req.path.c_str());
+                                    outResp = blockResp(req.clientIp, "Honeypot", "HONEYPOT-001",
+                                                        bait + " x" + std::to_string(distinct),
+                                                        req.path, hdrCi(req, "Host"), false, scannerUa);
+                                    shield.recordBlock();
+                                    FwBanPoster::instance()->enqueue(req.clientIp, "Honeypot", "HONEYPOT-001");
+                                    blocked = true; tBlocked = true; tAttack = true;
+                                } else {
+                                    // 观察：记录事件 + 放行仿真诱饵内容（不阻断、不封禁）
+                                    if (g_debugLog) std::printf("[reactor %d] OBSERVE Honeypot(%d/%d) from %s: %s\n",
+                                                idx, distinct, HoneypotGuard::escalateN(), ipstr, req.path.c_str());
+                                    emitEvt(req.clientIp, "Honeypot", "observe", "HONEYPOT-001",
+                                            bait + " x" + std::to_string(distinct),
+                                            req.path, hdrCi(req, "Host"));
+                                    outResp = HoneypotDecoy::render(req.path, MimicDefense::siteBanner());
+                                    setRespConnection(outResp, keepAlive);
+                                    shield.recordRequest();
+                                    blocked = true;  // 本地已应答，不再转发上游（非拦截语义）
+                                }
                             }
                         }
                         if (!whitelisted && !policyPass && ti) {
@@ -1120,7 +1162,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     tr->matched, req.path, hdrCi(req, "Host"),
                                                     false, scannerUa);
                                 shield.recordBlock();
-                                blocked = true; tBlocked = true; tAttack = true;
+                                blocked = true; tBlocked = true; tAttack = true; fwEscalate = true;
                             }
                         }
                         _mark();  // [3] 指纹+IP名单+威胁情报 结束，进入 CC/Geo/Bot
@@ -1135,7 +1177,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     gr->matched, req.path, hdrCi(req, "Host"),
                                                     false, scannerUa);
                                 shield.recordBlock();
-                                blocked = true; tBlocked = true; tAttack = true;
+                                blocked = true; tBlocked = true; tAttack = true; fwEscalate = true;
                             }
                         }
                         // 行为维度异常识别（跨请求关联）：低速 CC/同前缀枚举/路径扫描。
@@ -1147,8 +1189,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 DetectionResult bh = BehaviorGuard::instance().assess(req.clientIp);
                                 if (bh.action != Action::PASS) {
                                     if (g_debugLog) std::printf("[reactor %d] CHAL Behavior from %s\n", idx, ipstr);
-                                    // 与 CC 一致的 429 限流语义（CHALLENGE → RA30）
-                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
+                                    // 与 CC 一致的 429 限流语义，RA 透出锁定真实剩余
+                                    outResp = errResp(429, "Too Many Requests",
+                                        "Retry-After: " + std::to_string(std::max(1, bh.retryAfterSec)) + "\r\n");
                                     emitEvt(req.clientIp, "Behavior", "challenge", bh.ruleId,
                                             bh.matched, req.path, hdrCi(req, "Host"));
                                     shield.recordBlock();
@@ -1156,23 +1199,46 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 }
                             }
                         }
+                        // Bot 指纹评分前置（复测 P0 整改：原实现裸头首请求即 429，
+                        // 判定几乎全压指纹——复制一套浏览器头即拿 38 倍配额）。
+                        // 改为配额系数：指纹不再一票否决，只收紧 CC 配额
+                        // （<15 全量 / 15–29 减半 / ≥30 四分之一），可疑流量仍有
+                        // 非零配额，头部复制收益收敛到 4 倍以内；分数同时透出供观察。
+                        double botQuotaFactor = 1.0;
+                        int botScore = 0;
+                        std::string botReason;
+                        if (!whitelisted && !policyPass && !blocked && !isApiPath(req.path)) {
+                            DetectionResult br = bot.assess(req, ja4);
+                            botScore = br.score;
+                            botReason = br.matched;
+                            if (botScore >= 30) botQuotaFactor = 0.25;
+                            else if (botScore >= 15) botQuotaFactor = 0.5;
+                            if (botScore >= 30)  // 高可疑：观察事件（scanner-ua/裸头组合）
+                                emitEvt(req.clientIp, "Bot", "observe", br.ruleId,
+                                        botReason + " score=" + std::to_string(botScore),
+                                        req.path, hdrCi(req, "Host"));
+                        }
                         if (!whitelisted && !policyPass && !blocked) {
-                            DetectionResult cr = cc.assess(req.clientIp, req.path);
+                            DetectionResult cr = cc.assess(req.clientIp, req.path, botQuotaFactor);
                             if (cr.action != Action::PASS) {
                                 if (g_debugLog) std::printf("[reactor %d] %s CC from %s: %s\n",
                                             idx, cr.action == Action::BLOCK ? "BLOCK" : "CHAL",
                                             ipstr, cr.matched.c_str());
+                                // 限流语义 429 + Retry-After 真实恢复时间（窗口内最早
+                                // 过量请求老化出窗的时刻），取代恒 30/60——复测实测
+                                // 恢复 210–469s 与 RA30 偏差 7–16 倍的根因修复之一。
+                                int cra = std::max(1, cr.retryAfterSec);
                                 if (cr.action == Action::BLOCK) {
-                                    // 限流语义用 429 + Retry-After（而非 403），
-                                    // 避免攻击者把限流与规则拦截混为一谈做差异探测
-                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 60\r\n");
+                                    outResp = errResp(429, "Too Many Requests",
+                                        "Retry-After: " + std::to_string(cra) + "\r\n");
                                     emitEvt(req.clientIp, "CC", "block", cr.ruleId, cr.matched,
                                             req.path, hdrCi(req, "Host"));
                                     shield.recordBlock();
                                 } else {
                                     // CHALLENGE 与 BLOCK 统一 429 限流语义：复测证实先 503 后 429
                                     // 的混合出栈会被读作"后端过载"，且 503 拟态页不携带重试信息。
-                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
+                                    outResp = errResp(429, "Too Many Requests",
+                                        "Retry-After: " + std::to_string(cra) + "\r\n");
                                     emitEvt(req.clientIp, "CC", "challenge", cr.ruleId, cr.matched,
                                             req.path, hdrCi(req, "Host"));
                                     shield.recordBlock();
@@ -1225,28 +1291,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true;
                             }
                         }
-                        // Bot 行为防护（跳过 /api/ 接口：JS 挑战对 API 客户端无意义，避免误杀脚本化调用）
-                        if (!whitelisted && !policyPass && !blocked && !isApiPath(req.path)) {
-                            DetectionResult br = bot.assess(req, ja4);
-                            if (br.action != Action::PASS) {
-                                if (g_debugLog) std::printf("[reactor %d] %s Bot from %s: %s\n",
-                                            idx, br.action == Action::BLOCK ? "BLOCK" : "CHAL",
-                                            ipstr, br.matched.c_str());
-                                if (br.action == Action::BLOCK) {
-                                    outResp = blockResp(req.clientIp, "Bot", br.ruleId, br.matched,
-                                                        req.path, hdrCi(req, "Host"), false, scannerUa);
-                                    shield.recordBlock();
-                                } else {
-                                    // CHALLENGE 统一 429 限流语义（与 CC 一致）：原 503 拟态页
-                                    // 会被读作后端过载，且不携带重试信息（复测 C3 项）
-                                    outResp = errResp(429, "Too Many Requests", "Retry-After: 30\r\n");
-                                    emitEvt(req.clientIp, "Bot", "challenge", br.ruleId, br.matched,
-                                            req.path, hdrCi(req, "Host"));
-                                    shield.recordBlock();
-                                }
-                                blocked = true; tBlocked = true; tAttack = true;
-                            }
-                        }
+                        // Bot 指纹处置已前置（CC 配额系数 + observe 事件），
+                        // 此处不再二次评估、不再直接 429。
                         _mark();  // [4] Geo/CC/Bot 结束，进入规则+AI 检测流水线
                         // JSON 嵌套深度结构护栏：超深 JSON 按 400 拒绝（结构性限制，
                         // tAttack 保持 false —— 不记攻击、不封禁、不上报 FwBan，
@@ -1275,7 +1321,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                                     dr.matched, req.path, hdrCi(req, "Host"),
                                                     false, scannerUa);
                                 shield.recordBlock();
-                                tBlocked = true; tAttack = true;
+                                tBlocked = true; tAttack = true; fwEscalate = true;
                             } else {
                                 asyncHandled = forwardToApp();
                             }
@@ -1296,8 +1342,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         keepOpen = false;
                         break;
                     }
-                    // 确认攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁）
-                    if (tAttack && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
+                    // 确认真实攻击命中 → 投递防火墙联动封禁（观察模式 / 路径仅记录：只记录不封禁；
+                    // 限流族 429 不自检 fwEscalate，蜜罐升级分支已自行 enqueue，均不在此重复上报）
+                    if (fwEscalate && appMode != 1 && !policyLog) FwBanPoster::instance()->enqueue(req.clientIp, "WAF", "attack");
                     // 会话 cookie（UV 去重）。指纹三态：公开=novasid 品牌名；隐藏=全站固定
                     // 人格（默认 ASP.NET_SessionId，与 banner/拦截页一致，避免分裂指纹）；关闭=不注入。
                     if (newSess && !outResp.empty() && wafMode != WafMode::OFF)

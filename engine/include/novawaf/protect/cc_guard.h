@@ -40,13 +40,19 @@ public:
         factor_.store(f, std::memory_order_release);
     }
 
-    // 评估请求，返回处置结果（PASS/CHALLENGE/BLOCK）
-    DetectionResult assess(const std::string& ip, const std::string& path) {
+    // 评估请求，返回处置结果（PASS/CHALLENGE/BLOCK）。
+    // quotaFactor：外部维度（如 Bot 指纹可信度）折算的配额系数 [0,1]——
+    // 可疑客户端获得收紧但非零的配额，避免"裸头首请求即 429"的 0 容忍
+    // （复测 P0：判定全压指纹上，复制一套浏览器头即可拿 38 倍配额）。
+    // 命中限流时 retryAfterSec 填真实恢复秒数（窗口内最早过量请求的老化时间），
+    // 取代硬编码 Retry-After（复测 P0：恒 30 与真实恢复 210-469s 偏差 7-16 倍）。
+    DetectionResult assess(const std::string& ip, const std::string& path,
+                           double quotaFactor = 1.0) {
         int64_t now = nowMs();
-        double f = factor_.load(std::memory_order_acquire);
+        double f = factor_.load(std::memory_order_acquire) * quotaFactor;
         int baseMax = (int)(cfg_.maxReqPerWindow * f);
         int baseBurst = (int)(cfg_.burstPerUrl * f);
-        int hot = (int)(cfg_.hotUrlGlobal * f);
+        int hot = (int)(cfg_.hotUrlGlobal * factor_.load(std::memory_order_acquire));
         // 阈值抖动：按 IP 生成稳定的 ±15% 偏移（进程启动种子固定），
         // 使攻击者无法通过探测摸清统一阈值，而正常用户阈值稳定不影响体验。
         int maxReq = jitterFor(ip, baseMax);
@@ -55,6 +61,7 @@ public:
         if (burst < 3) burst = 3;
         int score = 0;
         std::string reason;
+        int64_t retryMs = 0;  // 真实恢复耗时（各触发维度取最大——瓶颈维度决定恢复期）
 
         // 维度1+3：单 IP 速率 & 单 IP+URL 突刺（按 IP 分片，锁粒度小）
         {
@@ -69,12 +76,18 @@ public:
             if (total > maxReq) {
                 score += 40 + (total - maxReq);
                 reason = "ip-rate";
+                // 恢复点：最旧的 (total-maxReq) 条老化出窗后计数回落到阈值
+                int64_t t = st.hits[total - maxReq - 1] + cfg_.windowMs - now;
+                if (t > retryMs) retryMs = t;
             }
             // 单 IP 刷同一 URL
             int urlc = st.urlHits[path];
             if (urlc > burst) {
                 score += 35 + (urlc - burst);
                 if (reason.empty()) reason = "ip-url-burst";
+                // urlHits 随窗口起点整体重置，恢复点即窗口翻页时刻
+                int64_t t = st.windowStart + cfg_.windowMs - now;
+                if (t > retryMs) retryMs = t;
             }
         }
 
@@ -90,13 +103,19 @@ public:
             if (g > hot) {
                 score += 25;
                 if (reason.empty()) reason = "hot-url";
+                int64_t t = v[g - hot - 1] + cfg_.windowMs - now;
+                if (t > retryMs) retryMs = t;
             }
         }
 
         Action a = Action::PASS;
         if (score >= cfg_.scoreToBlock) a = Action::BLOCK;
         else if (score >= cfg_.scoreToChallenge) a = Action::CHALLENGE;
-        return {a, "CC-001", "CC", "HTTP flood / application-layer abuse", reason};
+        DetectionResult r{a, "CC-001", "CC", "HTTP flood / application-layer abuse", reason};
+        if (a != Action::PASS && retryMs > 0)
+            r.retryAfterSec = (int)((retryMs + 999) / 1000);  // 向上取整，宁多不少
+        r.score = score;
+        return r;
     }
 
 private:

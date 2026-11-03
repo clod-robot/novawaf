@@ -9,6 +9,7 @@
 #include "novawaf/core/waf_mode.h"
 #include "novawaf/net/upstream_pool.h"
 #include "novawaf/protect/behavior_guard.h"
+#include "novawaf/protect/block_page.h"
 #include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 
@@ -216,6 +217,9 @@ private:
                 outResp = std::move(*restored);
         }
         if (ctx.newSess) injectHeader(outResp, "Set-Cookie: " + sessCookieName() + "=" + ctx.sid + "; Path=/; HttpOnly");
+        // 复测新增项：上游 nginx 默认错误页（301/404 等）正文改写为全站统一人格
+        // 模板（此前只改 Server 头不改体，<center>nginx</center> 透传造成指纹分裂）
+        BlockPage::rewriteUpstreamErrorBody(outResp);
         setResponseConnection(outResp, ctx.keepAlive);
         normalizeServerHeader(outResp);
         BehaviorGuard::instance().noteStatus(ctx.clientIp, respStatus(outResp));

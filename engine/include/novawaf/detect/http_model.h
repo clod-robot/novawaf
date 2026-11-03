@@ -49,6 +49,8 @@ struct DetectionResult {
     std::string category;   // SQLi/XSS/RCE/...
     std::string description;
     std::string matched;    // 命中的片段
+    int retryAfterSec = 0;  // 限流/挑战语义下的真实恢复秒数（0=未提供，上层用兜底值）
+    int score = 0;          // 评分制组件透出原始分（Bot 等，供上层换算配额系数）
 
     bool isBlocked() const { return action == Action::BLOCK; }
 };

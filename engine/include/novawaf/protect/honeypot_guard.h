@@ -11,7 +11,10 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +54,55 @@ public:
                     "honeypot prefix touched", path};
         }
         return {};
+    }
+
+    // 命中路径对应的诱饵键（精确诱饵=路径本身；前缀诱饵=命中的前缀）。
+    // 未命中返回空串。供「按不同诱饵计数」的升级判定使用（/.git/config 与
+    // /.git/HEAD 同属 "/.git/*" 一个诱饵，避免同一诱饵翻文件刷计数）。
+    std::string keyFor(const std::string& path) const {
+        auto tbl = table_.load();
+        if (!tbl) return {};
+        if (tbl->exact.count(path)) return path;
+        const TrieNode* node = &tbl->trieRoot;
+        const TrieNode* lastTerm = nullptr;
+        size_t depth = 0, termDepth = 0;
+        for (char c : path) {
+            auto it = node->ch.find(c);
+            if (it == node->ch.end()) break;
+            node = it->second.get();
+            ++depth;
+            if (node->terminal) { lastTerm = node; termDepth = depth; }
+        }
+        if (!lastTerm) return {};
+        return path.substr(0, termDepth) + "*";
+    }
+
+    // 命中记账：滑窗（默认 600s，NOVA_HONEY_WIN_SEC）内不同诱饵计数。
+    // 返回该 IP 窗口内已触达的不同诱饵数——达到升级阈值（NOVA_HONEY_ESCALATE_N，
+    // 默认 3）后由上层升级为封禁。设计依据（复测设计评审）：「命中即封禁」让
+    // 攻击者立刻知晓被处置、取证链中断；改为「记录+打标+诱饵放行」，触达 N 个
+    // 不同诱饵（扫描器踩点特征，正常用户数学上不可能触达多个无链接路径）再升级。
+    int noteHit(const std::string& ip, const std::string& baitKey) {
+        int64_t now = (int64_t)time(nullptr);
+        auto& sh = hitShards_[std::hash<std::string>{}(ip) & (kHitShards - 1)];
+        std::lock_guard<std::mutex> lk(sh.mtx);
+        auto& st = sh.hits[ip];
+        if (now - st.winStart >= winSec_) { st.winStart = now; st.baits.clear(); }
+        st.baits.insert(baitKey);
+        // 惰性回收：单片超 512 时清理窗口外 IP，防内存增长
+        if (sh.hits.size() > 512) {
+            for (auto it = sh.hits.begin(); it != sh.hits.end();) {
+                if (now - it->second.winStart >= winSec_) it = sh.hits.erase(it);
+                else ++it;
+            }
+        }
+        return (int)st.baits.size();
+    }
+
+    // 升级阈值（不同诱饵数），供上层判定
+    static int escalateN() {
+        const char* e = std::getenv("NOVA_HONEY_ESCALATE_N");
+        return (e && *e) ? std::atoi(e) : 3;
     }
 
     // 热加载诱饵清单（后台线程调用）。文本格式：每行一条路径；
@@ -132,6 +184,22 @@ private:
 
     // COW 发布点：C++20 std::atomic<shared_ptr> 原子读写，热路径无锁
     std::atomic<std::shared_ptr<const Table>> table_;
+
+    // 命中记账（升级判定用）：分片锁，IP → 窗口起点 + 已触达诱饵集合
+    struct HitState {
+        int64_t winStart = 0;
+        std::unordered_set<std::string> baits;
+    };
+    struct HitShard {
+        std::mutex mtx;
+        std::unordered_map<std::string, HitState> hits;
+    };
+    static constexpr size_t kHitShards = 16;
+    HitShard hitShards_[kHitShards];
+    const int64_t winSec_ = [] {
+        const char* e = std::getenv("NOVA_HONEY_WIN_SEC");
+        return (e && *e) ? (int64_t)std::atoll(e) : (int64_t)600;
+    }();
 };
 
 }  // namespace novawaf

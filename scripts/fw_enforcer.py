@@ -101,17 +101,28 @@ class FwBackend:
                 "{ type filter hook input priority -100; }")
 
     def ban(self, ip):
+        # 复测 P1：封禁期黑洞——DROP 让 SYN 静默丢弃，客户端只能等 8s+ 超时。
+        # 改 REJECT：TCP 立即回 RST（快速失败），其余协议回 ICMP 不可达。
+        # 两条规则：TCP 专用 tcp-reset，兜底通用 reject。
         if self.kind == "iptables":
             # 已存在则跳过（-C 检查），避免重复
-            if not run("iptables", "-C", "NOVAWAF", "-s", ip, "-j", "DROP"):
-                run("iptables", "-I", "NOVAWAF", "1", "-s", ip, "-j", "DROP")
+            if not run("iptables", "-C", "NOVAWAF", "-s", ip, "-p", "tcp",
+                       "-j", "REJECT", "--reject-with", "tcp-reset"):
+                run("iptables", "-I", "NOVAWAF", "1", "-s", ip, "-p", "tcp",
+                    "-j", "REJECT", "--reject-with", "tcp-reset")
+            if not run("iptables", "-C", "NOVAWAF", "-s", ip, "-j", "REJECT"):
+                run("iptables", "-I", "NOVAWAF", "2", "-s", ip, "-j", "REJECT")
         elif self.kind == "nft":
             run("nft", "add", "rule", "inet", "novawaf", "input",
-                f"ip saddr {ip} drop")
+                f"ip saddr {ip} meta l4proto tcp reject with tcp reset")
+            run("nft", "add", "rule", "inet", "novawaf", "input",
+                f"ip saddr {ip} reject")
 
     def unban(self, ip):
         if self.kind == "iptables":
-            run("iptables", "-D", "NOVAWAF", "-s", ip, "-j", "DROP")
+            run("iptables", "-D", "NOVAWAF", "-s", ip, "-p", "tcp",
+                "-j", "REJECT", "--reject-with", "tcp-reset")
+            run("iptables", "-D", "NOVAWAF", "-s", ip, "-j", "REJECT")
         elif self.kind == "nft":
             # nft 无按内容删除的简便命令，先 flush 重建链（量小可接受）
             pass  # 见 sweep：nft 下用整链 flush 后重建

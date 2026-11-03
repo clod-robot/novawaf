@@ -44,16 +44,22 @@ public:
     }
     void configure(const Config& c) { cfg_ = c; }
 
-    // 请求准入判定：锁定期内 → CHALLENGE（上层统一出 429 + Retry-After）
+    // 请求准入判定：锁定期内 → CHALLENGE（上层统一出 429 + Retry-After）。
+    // retryAfterSec 透出锁定真实剩余秒数（取代硬编码 RA30——复测 P0：
+    // 恒 30 与实际锁定 120s+ 严重失真，客户端按失真值重试只会反复碰壁）。
     DetectionResult assess(const std::string& ip) {
         if (ip.empty()) return {};
         Shard& sh = shardOf(ip);
         std::lock_guard<std::mutex> lk(sh.mtx);
         auto it = sh.locked.find(ip);
         if (it == sh.locked.end()) return {};
-        if (it->second.first > nowSec())
-            return {Action::CHALLENGE, "BEH-001", "Behavior",
-                    "abnormal behavior pattern", it->second.second};
+        int64_t remain = it->second.first - nowSec();
+        if (remain > 0) {
+            DetectionResult r{Action::CHALLENGE, "BEH-001", "Behavior",
+                              "abnormal behavior pattern", it->second.second};
+            r.retryAfterSec = (int)remain;
+            return r;
+        }
         sh.locked.erase(it);  // 锁定到期
         return {};
     }
