@@ -143,6 +143,28 @@ public class WafController {
         return Result.ok();
     }
 
+    // ---------- 正则虚拟补丁(复杂指纹, 与字面量补丁互补) ----------
+    @RequirePerms("waf:rule:list")
+    @GetMapping("/regex-patch")
+    public Result<Map<String, Object>> regexPatch() {
+        return Result.ok(waf.regexPatch());
+    }
+
+    @RequirePerms("waf:rule:list")
+    @PostMapping("/regex-patch")
+    public Result<Map<String, Object>> saveRegexPatch(@RequestBody RulesReq req) {
+        waf.saveRegexPatch(req.getJson());
+        audit.record(UserContext.get().getUsername(), "waf", "下发正则虚拟补丁", "POST", null, 1, null, 0);
+        return Result.ok(waf.regexPatch());
+    }
+
+    @RequirePerms("waf:rule:list")
+    @PostMapping("/regex-patch/reload")
+    public Result<Void> reloadRegexPatch() {
+        waf.bumpRegexPatchVersion();
+        return Result.ok();
+    }
+
     // ---------- IOC ----------
     @RequirePerms("waf:ioc:list")
     @GetMapping("/ioc")

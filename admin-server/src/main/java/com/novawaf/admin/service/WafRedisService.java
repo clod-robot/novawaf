@@ -638,11 +638,18 @@ public class WafRedisService {
 
     private static final String CVE_KEY = "novawaf:cve_patch";
     private static final String CVE_VER_KEY = "novawaf:cve_patch:version";
+    private static final String REGEX_KEY = "novawaf:regex_patch";
+    private static final String REGEX_VER_KEY = "novawaf:regex_patch:version";
     private static final int CVE_MAX_PATCHES = 500;
+    private static final int REGEX_MAX_PATCHES = 100;
+    private static final int REGEX_MAX_PATTERN = 256;
     private static final java.util.regex.Pattern CVE_NO =
             java.util.regex.Pattern.compile("^[A-Za-z]{2,6}-[0-9A-Za-z-]{2,30}$");
+    // 典型 ReDoS 形态：组内含量词且组外再叠量词，与引擎端 regex_patch.h 护栏一致
+    private static final java.util.regex.Pattern NESTED_QUANT =
+            java.util.regex.Pattern.compile("\\([^()]*[+*{][^()]*\\)[+*{]");
 
-    /** 补丁列表 + 版本号 + 引擎生效条数口径(禁用项不下发) */
+    /** 补丁列表 + 版本号（字面量） */
     @SuppressWarnings("unchecked")
     public Map<String, Object> cvePatch() {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -652,18 +659,40 @@ public class WafRedisService {
         return m;
     }
 
+    /** 补丁列表 + 版本号（正则） */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> regexPatch() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        Object arr = parse(redis.opsForValue().get(REGEX_KEY));
+        m.put("patches", arr instanceof List ? (List<Object>) arr : List.of());
+        m.put("version", toLong(redis.opsForValue().get(REGEX_VER_KEY)));
+        return m;
+    }
+
+    /** 字面量补丁整包下发 */
+    public synchronized void saveCvePatch(String json) {
+        savePatch(json, CVE_KEY, CVE_VER_KEY, false);
+    }
+
+    /** 正则补丁整包下发 */
+    public synchronized void saveRegexPatch(String json) {
+        savePatch(json, REGEX_KEY, REGEX_VER_KEY, true);
+    }
+
     /**
-     * 保存整包补丁 JSON：服务端校验并规范化（未知字段丢弃），写 novawaf:cve_patch 并 bump 版本号，
-     * 引擎 60s 轮询热加载（与 CvePatchDetector.loadFromJson 字段口径一一对应）。
+     * 保存整包补丁 JSON：服务端校验并规范化（未知字段丢弃），写 Redis 并 bump 版本号，
+     * 引擎 60s 轮询热加载（字段口径与 CvePatchSet/RegexPatchSet::loadFromJson 一一对应）。
+     * regexMode 下 match 按正则校验：≤256 字符、可编译、拒绝嵌套量词 ReDoS 形态。
      */
     @SuppressWarnings("unchecked")
-    public synchronized void saveCvePatch(String json) {
+    private void savePatch(String json, String dataKey, String verKey, boolean regexMode) {
         Object root = parse(json);
         if (!(root instanceof List))
             throw new BusinessException(400, "补丁格式错误: 顶层必须是 JSON 数组 [{...}, ...]");
         List<Object> in = (List<Object>) root;
-        if (in.size() > CVE_MAX_PATCHES)
-            throw new BusinessException(400, "补丁数量超限: 最多 " + CVE_MAX_PATCHES + " 条, 当前 " + in.size());
+        int maxPatches = regexMode ? REGEX_MAX_PATCHES : CVE_MAX_PATCHES;
+        if (in.size() > maxPatches)
+            throw new BusinessException(400, "补丁数量超限: 最多 " + maxPatches + " 条, 当前 " + in.size());
         List<Map<String, Object>> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         int idx = 0;
@@ -682,9 +711,20 @@ public class WafRedisService {
                 throw new BusinessException(409, "CVE 编号重复: " + cve);
             String match = str(src.get("match"));
             if (match.isEmpty())
-                throw new BusinessException(400, cve + " 缺少必填字段 match(匹配串)");
-            if (match.length() > 512)
+                throw new BusinessException(400, cve + " 缺少必填字段 match(" + (regexMode ? "正则表达式" : "匹配串") + ")");
+            if (regexMode) {
+                if (match.length() > REGEX_MAX_PATTERN)
+                    throw new BusinessException(400, cve + " 的正则超长(>" + REGEX_MAX_PATTERN + ")");
+                if (NESTED_QUANT.matcher(match).find())
+                    throw new BusinessException(400, cve + " 的正则含嵌套量词 (x+)+ 形态, 有 ReDoS 风险, 请改写");
+                try {
+                    java.util.regex.Pattern.compile(match);
+                } catch (Exception e) {
+                    throw new BusinessException(400, cve + " 的正则无法编译: " + e.getMessage());
+                }
+            } else if (match.length() > 512) {
                 throw new BusinessException(400, cve + " 的 match 超长(>512)");
+            }
 
             Map<String, Object> p = new LinkedHashMap<>();
             p.put("cve", cve);
@@ -745,18 +785,23 @@ public class WafRedisService {
             out.add(p);
         }
         try {
-            redis.opsForValue().set(CVE_KEY, om.writeValueAsString(out));
-            redis.opsForValue().increment(CVE_VER_KEY);
+            redis.opsForValue().set(dataKey, om.writeValueAsString(out));
+            redis.opsForValue().increment(verKey);
         } catch (BusinessException be) {
             throw be;
         } catch (Exception e) {
-            throw new BusinessException(500, "写入 CVE 补丁失败: " + e.getMessage());
+            throw new BusinessException(500, "写入" + (regexMode ? "正则" : "CVE") + "补丁失败: " + e.getMessage());
         }
     }
 
-    /** bump 补丁版本号触发引擎热加载 */
+    /** bump 字面量补丁版本号触发引擎热加载 */
     public void bumpCvePatchVersion() {
         redis.opsForValue().increment(CVE_VER_KEY);
+    }
+
+    /** bump 正则补丁版本号触发引擎热加载 */
+    public void bumpRegexPatchVersion() {
+        redis.opsForValue().increment(REGEX_VER_KEY);
     }
 
     /* ---------- 规则版本管理 ---------- */

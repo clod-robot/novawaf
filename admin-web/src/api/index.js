@@ -68,6 +68,10 @@ export const api = {
   cvePatchGet: () => http.get('/waf/cve-patch'),
   cvePatchSave: (json) => http.post('/waf/cve-patch', { json }),
   cvePatchReload: () => http.post('/waf/cve-patch/reload'),
+  // 正则虚拟补丁：复杂指纹，ECMAScript 正则，同通道热加载
+  regexPatchGet: () => http.get('/waf/regex-patch'),
+  regexPatchSave: (json) => http.post('/waf/regex-patch', { json }),
+  regexPatchReload: () => http.post('/waf/regex-patch/reload'),
   wafIoc: () => http.get('/waf/ioc'),
   // 黑白名单(联动 GeoIP)
   ipList: (type, q) => http.get('/waf/iplist', { params: { type, q } }),

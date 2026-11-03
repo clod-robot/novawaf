@@ -1,7 +1,7 @@
 <template>
   <div class="mecha-panel p">
     <div class="bar">
-      <span class="hud-title">// CVE 虚拟补丁 · 应急漏洞热防护 (引擎热加载, Redis: novawaf:cve_patch)</span>
+      <span class="hud-title">// CVE 虚拟补丁 · 应急漏洞热防护 (引擎热加载)</span>
       <div class="ops">
         <el-button size="small" @click="fmtVisible = true">补丁格式</el-button>
         <el-button type="primary" size="small" @click="openEdit(null)">新增补丁</el-button>
@@ -10,6 +10,15 @@
         <el-button type="success" size="small" :disabled="!dirty" @click="save">下发保存</el-button>
         <el-button size="small" @click="reload">热加载</el-button>
       </div>
+    </div>
+
+    <el-tabs v-model="mode" class="mtabs" @tab-change="load">
+      <el-tab-pane label="字面量补丁 (AC 多模, 推荐)" name="literal" />
+      <el-tab-pane label="正则补丁 (复杂指纹)" name="regex" />
+    </el-tabs>
+    <div v-if="mode === 'regex'" class="regex-tip">
+      正则模式：match 为 ECMAScript 正则（icase，作用于归一化文本），单条 ≤256 字符、总数 ≤100，
+      禁止嵌套量词 (x+)+ 形态防 ReDoS，body 仅扫前 16KB。能用工整字面量表达的特征请优先用「字面量补丁」（更快）。
     </div>
 
     <div class="stats">
@@ -91,8 +100,9 @@
             <el-radio-button value="pass">pass 放行</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item label="匹配串" required>
-          <el-input v-model="form.match" placeholder='如 ${jndi:  （引擎按归一化后子串匹配）' class="mono" />
+        <el-form-item :label="isRegex ? '正则表达式' : '匹配串'" required>
+          <el-input v-model="form.match" class="mono"
+            :placeholder="isRegex ? '如 \\$\\{jndi:(ldap|rmi)://[^/]+/  （作用于归一化文本，icase）' : '如 ${jndi:  （引擎按归一化后子串匹配）'" />
         </el-form-item>
         <el-form-item label="HTTP 方法">
           <el-select v-model="form.methods" multiple clearable placeholder="缺省匹配所有方法" class="wfull">
@@ -160,8 +170,12 @@
           <tr><td class="mono">scope</td><td>否</td><td>检测范围数组，子集 ["uri","args","headers","body"]；缺省全域</td></tr>
           <tr><td class="mono">headers</td><td>否</td><td>对象 {"头名":"包含子串"}，全部满足才命中，如 {"x-api-version":"v1"}</td></tr>
         </table>
-        <p class="dim">匹配逻辑：所有补丁的 match 构建单棵 AC 自动机，各 scope 文本每请求仅扫描一次；
+        <p class="dim">匹配逻辑（字面量补丁）：所有补丁的 match 构建单棵 AC 自动机，各 scope 文本每请求仅扫描一次；
           命中后回验 methods/uri/headers/scope 条件，首条全满足的补丁胜出。</p>
+        <p class="dim"><b>正则补丁（本页「正则补丁」标签页）</b>：同 JSON 结构，唯 match 为 ECMAScript 正则
+          （icase，作用于归一化文本，引擎逐条 regex_search，首条全条件命中胜出）。
+          护栏：总数 ≤100、单条 ≤256 字符、禁嵌套量词 (x+)+、body 仅扫前 16KB。
+          存于 Redis <code>novawaf:regex_patch</code>，版本键 <code>novawaf:regex_patch:version</code>。</p>
         <pre class="ex">[{
   "cve": "CVE-2021-44228",
   "name": "Log4Shell JNDI",
@@ -188,6 +202,8 @@ const list = ref([])
 const version = ref(0)
 const dirty = ref(false)
 const kw = ref('')
+const mode = ref('literal')
+const isRegex = computed(() => mode.value === 'regex')
 
 const editVisible = ref(false)
 const editIdx = ref(-1)
@@ -210,7 +226,7 @@ function sevType(s) { return { critical: 'danger', high: 'warning', medium: '', 
 
 onMounted(load)
 async function load() {
-  const r = await api.cvePatchGet()
+  const r = await (isRegex.value ? api.regexPatchGet() : api.cvePatchGet())
   list.value = Array.isArray(r.patches) ? r.patches : []
   version.value = r.version || 0
   dirty.value = false
@@ -252,8 +268,12 @@ function textToHeaders(t) {
 function validatePatch(p, existingIdx = -1) {
   if (!/^[A-Za-z]{2,6}-[0-9A-Za-z-]{2,30}$/.test(p.cve))
     return 'CVE 编号格式非法（应为 CVE-2024-12345 / CNVD-2024-12345 形式）'
-  if (!p.match) return '匹配串 match 不能为空'
-  if (p.match.length > 512) return '匹配串超长(>512)'
+  if (!p.match) return isRegex.value ? '正则表达式 match 不能为空' : '匹配串 match 不能为空'
+  if (isRegex.value) {
+    if (p.match.length > 256) return '正则超长(>256)'
+    if (/\([^()]*[+*{][^()]*\)[+*{]/.test(p.match)) return '正则含嵌套量词 (x+)+ 形态，有 ReDoS 风险'
+    try { new RegExp(p.match) } catch (e) { return '正则无法编译: ' + e.message }
+  } else if (p.match.length > 512) return '匹配串超长(>512)'
   if (list.value.some((x, i) => i !== existingIdx && String(x.cve).toUpperCase() === p.cve.toUpperCase()))
     return 'CVE 编号重复: ' + p.cve
   return null
@@ -309,23 +329,30 @@ function exportJson() {
   const blob = new Blob([JSON.stringify(list.value, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
-  a.download = 'cve_patch.json'
+  a.download = isRegex.value ? 'regex_patch.json' : 'cve_patch.json'
   a.click()
   URL.revokeObjectURL(a.href)
 }
 
 async function save() {
-  const r = await api.cvePatchSave(JSON.stringify(list.value))
+  const r = await (isRegex.value
+    ? api.regexPatchSave(JSON.stringify(list.value))
+    : api.cvePatchSave(JSON.stringify(list.value)))
   list.value = Array.isArray(r.patches) ? r.patches : list.value
   version.value = r.version || version.value
   dirty.value = false
   ElMessage.success('已下发并触发热加载，引擎 60s 内生效')
 }
-async function reload() { await api.cvePatchReload(); ElMessage.success('已 bump 版本号，引擎将热加载') }
+async function reload() {
+  await (isRegex.value ? api.regexPatchReload() : api.cvePatchReload())
+  ElMessage.success('已 bump 版本号，引擎将热加载')
+}
 </script>
 
 <style scoped>
 .p { padding: 16px; }
+.mtabs { margin-bottom: 4px; }
+.regex-tip { font-size: 12px; color: #e6a23c; background: rgba(230, 162, 60, .08); border: 1px solid rgba(230, 162, 60, .3); border-radius: 4px; padding: 6px 10px; margin-bottom: 10px; }
 .bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
 .ops { display: flex; gap: 8px; flex-wrap: wrap; }
 .stats { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }

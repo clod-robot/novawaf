@@ -16,6 +16,7 @@
 #include "novawaf/detect/pipeline.h"
 #include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/cve_patch.h"
+#include "novawaf/detect/regex_patch.h"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -1654,11 +1655,39 @@ int main(int argc, char** argv) {
     pipeline.addDetector(std::unique_ptr<CvePatchDetector>(
         static_cast<CvePatchDetector*>(cvePatch->clone().release())));
     int cveInterval = getenv("NOVA_CVE_PATCH_INTERVAL") ? atoi(getenv("NOVA_CVE_PATCH_INTERVAL")) : 60;
-    std::thread([loadCvePatch, cveInterval]() {
+
+    // ---- 正则虚拟补丁：Redis 键 novawaf:regex_patch，与字面量补丁互补（复杂指纹），同通道热更 ----
+    auto regexPatch = std::make_shared<RegexPatchDetector>();
+    auto regexVersion = std::make_shared<std::string>("-");
+    auto loadRegexPatch = [regexPatch, regexVersion](bool initial) -> size_t {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return initial ? regexPatch->reload("") : (size_t)-1;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db))
+            return initial ? regexPatch->reload("") : (size_t)-1;
+        auto ver = r.get("novawaf:regex_patch:version");
+        std::string cur = ver.value_or("");
+        if (cur == *regexVersion && !initial) return (size_t)-1;  // 版本未变，跳过重解析
+        auto blob = r.get("novawaf:regex_patch");
+        *regexVersion = cur;
+        size_t n = regexPatch->reload(blob.value_or(""));
+        std::printf("  RegexPatch: %s %zu patches from redis (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", n, cur.c_str());
+        return n;
+    };
+    loadRegexPatch(true);
+    pipeline.addDetector(std::unique_ptr<RegexPatchDetector>(
+        static_cast<RegexPatchDetector*>(regexPatch->clone().release())));
+
+    std::thread([loadCvePatch, loadRegexPatch, cveInterval]() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(cveInterval));
             if (!g_running) break;
             loadCvePatch(false);
+            loadRegexPatch(false);
         }
     }).detach();
 
