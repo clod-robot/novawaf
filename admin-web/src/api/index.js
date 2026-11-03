@@ -134,6 +134,10 @@ export const api = {
   settingsRulesVersion: () => http.get('/settings/rules-version'),
   settingsMimicGet: () => http.get('/settings/mimic'),
   settingsMimicSave: (d) => http.put('/settings/mimic', d),
-  settingsMimicRotateSalt: () => http.post('/settings/mimic/rotate-salt')
+  settingsMimicRotateSalt: () => http.post('/settings/mimic/rotate-salt'),
+  // 阈值管理：端点分级限流策略（monitor→enforce 分阶段）+ 采集分布
+  rateLimitGet: () => http.get('/settings/ratelimit'),
+  rateLimitSave: (d) => http.put('/settings/ratelimit', d),
+  rateLimitDist: (cls, limit) => http.get('/settings/ratelimit/dist/' + cls, { params: { limit } })
 }
 export default http

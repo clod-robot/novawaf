@@ -35,6 +35,7 @@
 #include "novawaf/protect/mimic.h"
 #include "novawaf/protect/tamper_cache.h"
 #include "novawaf/limit/rate_limiter.h"
+#include "novawaf/limit/endpoint_rate_guard.h"
 #include "novawaf/net/http_parser.h"
 #include "novawaf/ddos/ddos_guard.h"
 #include "novawaf/ai/llm_client.h"
@@ -1172,6 +1173,35 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
+                        // 端点分级限流（read/write/upload/auth/static 五类独立配额）：
+                        // monitor-only 阶段只记账不处置；enforce 阶段超限 429 +
+                        // Retry-After 真实剩余窗口；stage>=3 触发封禁阶梯 L2（URL+方法
+                        // 临时封禁，不开 L4 全端口）。auth 类优先按用户名计数（NAT 友好）。
+                        if (!whitelisted && !policyPass && !blocked) {
+                            std::string uname;
+                            for (auto& [k, v] : req.queryParams)
+                                if (k == "username" || k == "user" || k == "email") { uname = v; break; }
+                            long clen = 0;
+                            std::string clv = hdrCi(req, "Content-Length");
+                            if (!clv.empty()) clen = std::atol(clv.c_str());
+                            auto erd = EndpointRateGuard::instance().assess(
+                                req.clientIp, req.method, req.path, uname,
+                                hdrCi(req, "Content-Type"), clen);
+                            if (erd) {
+                                if (g_debugLog) std::printf("[reactor %d] %s RateLimit(%s) from %s: %s\n",
+                                            idx, erd->l2Ban ? "BAN" : "LIMIT",
+                                            erd->cls.c_str(), ipstr, req.path.c_str());
+                                outResp = errResp(429, "Too Many Requests",
+                                    "Retry-After: " + std::to_string(erd->retryAfterSec) + "\r\n");
+                                emitEvt(req.clientIp, "RateLimit",
+                                        erd->l2Ban ? "block" : "challenge",
+                                        erd->l2Ban ? "RL-L2" : "RL-L1",
+                                        "endpoint quota exceeded: " + erd->cls,
+                                        req.path, hdrCi(req, "Host"));
+                                shield.recordBlock();
+                                blocked = true; tBlocked = true; tAttack = true;
+                            }
+                        }
                         // 认证爆破防护：登录/验证码等认证接口的尝试计数与源 IP 锁定。
                         // 响应侧无法区分成败（业务失败也回 200），故按尝试次数独立限流。
                         if (!whitelisted && !policyPass && !blocked) {
@@ -1644,6 +1674,79 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             if (!g_running) break;
             loadPathPolicy(false);
+        }
+    }).detach();
+
+    // ---- 端点分级限流策略：Redis novawaf:ratelimit:policy 热加载（控制台保存即发布）----
+    // 阈值管理后台写入 policy JSON 并 INCR version；引擎 3s 轮询版本号，变化即 COW 换配置。
+    auto loadRatePolicy = [](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        static std::string s_ver = "-";
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        auto ver = r.get("novawaf:ratelimit:version");
+        std::string cur = ver.value_or("");
+        if (cur == s_ver && !initial) return;
+        auto blob = r.get("novawaf:ratelimit:policy");
+        try {
+            EndpointRateGuard::instance().configure(
+                EndpointRateGuard::parsePolicy(blob.value_or("")));
+            s_ver = cur;
+            std::printf("  RateLimit: %s stage=%d (ver=%s)\n",
+                        initial ? "loaded" : "hot-reloaded",
+                        EndpointRateGuard::instance().stage(), cur.c_str());
+        } catch (...) {
+            if (initial) std::printf("  RateLimit: policy parse failed, using defaults\n");
+        }
+    };
+    loadRatePolicy(true);
+    std::thread([loadRatePolicy]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!g_running) break;
+            loadRatePolicy(false);
+        }
+    }).detach();
+
+    // ---- 限流分布采集上报：每分钟快照每 IP 每类 QPS 分布（P50/P99/P99.9、3s 峰值、
+    // 桶利用率、would-block），写 Redis 供阈值管理标定（7 天 hist，LTRIM 10080 分钟）----
+    std::thread([] {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            if (!g_running) break;
+            const char* rh = getenv("NOVA_REDIS_HOST");
+            if (!rh || !*rh) continue;
+            int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+            const char* pass = getenv("NOVA_REDIS_PASS");
+            int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+            auto dist = EndpointRateGuard::instance().snapshot();
+            long ts = (long)time(nullptr);
+            char mbuf[512];
+            std::snprintf(mbuf, sizeof mbuf,
+                "{\"stage\":%d,\"l1LastMin\":%ld,\"bansLastMin\":%ld,\"ts\":%ld}",
+                EndpointRateGuard::instance().stage(),
+                EndpointRateGuard::instance().l1LastMin(),
+                EndpointRateGuard::instance().bansLastMin(), ts);
+            RedisClient r;
+            if (!r.connect(rh, port, pass ? pass : "", db)) continue;
+            r.set("novawaf:ratelimit:metrics", mbuf);
+            for (auto& d : dist) {
+                char jbuf[768];
+                std::snprintf(jbuf, sizeof jbuf,
+                    "{\"class\":\"%s\",\"ts\":%ld,\"keys\":%d,\"p50\":%.3f,\"p99\":%.3f,"
+                    "\"p999\":%.3f,\"burstP999\":%.3f,\"utilP95\":%.3f,"
+                    "\"suggestQps\":%.3f,\"suggestBurst\":%d,\"wouldBlock1m\":%ld}",
+                    d.cls.c_str(), ts, d.keys, d.p50, d.p99, d.p999, d.burstP999,
+                    d.utilP95, d.suggestQps, d.suggestBurst, d.wouldBlock1m);
+                std::string key = std::string("novawaf:ratelimit:dist:") + d.cls;
+                r.set(key, jbuf);
+                r.rpush(key + ":hist", jbuf);
+                r.ltrim(key + ":hist", 0, 10079);  // 7 天 × 1440 分钟
+            }
         }
     }).detach();
 
