@@ -141,11 +141,28 @@ private:
         }
         // 1) 原始事件批量 RPUSH + LTRIM（近期明细窗口，供时间线展示）
         if (!pendingEvents_.empty()) {
+            // 批内去重：同指纹（ip|action|category|ruleId|matched|uri|host）的重复
+            // 事件合并为一条，重复次数以 count 字段承载（ts 取最后一次）。
+            // 背景：高速扫描器对同一蜜罐/规则的秒级洪峰曾 1s 灌入 304 条相同明细，
+            // 挤占 eventsCap_ 窗口把其它来源明细全部顶掉；合并后时间线/归档/per-IP
+            // 分桶各写一条。统计计数（perIpDelta/tsBuckets）在 drainQueue 已按真实
+            // 次数累计，不受合并影响。
+            std::vector<std::pair<AttackEvent, uint64_t>> merged;
+            merged.reserve(pendingEvents_.size());
+            std::unordered_map<std::string, size_t> fp;
+            fp.reserve(pendingEvents_.size());
+            for (auto& e : pendingEvents_) {
+                std::string k = e.ip + "\x1f" + e.action + "\x1f" + e.category + "\x1f" +
+                                e.ruleId + "\x1f" + e.matched + "\x1f" + e.uri + "\x1f" + e.host;
+                auto [it, inserted] = fp.emplace(std::move(k), merged.size());
+                if (inserted) merged.emplace_back(e, 1);
+                else { merged[it->second].first.ts = e.ts; merged[it->second].second++; }
+            }
             std::vector<std::string> jsons;
             std::unordered_map<std::string, std::vector<std::string>> byIp;
-            jsons.reserve(pendingEvents_.size());
-            for (auto& e : pendingEvents_) {
-                std::string j = eventJson(e);
+            jsons.reserve(merged.size());
+            for (auto& [e, cnt] : merged) {
+                std::string j = eventJson(e, cnt);
                 if (!e.ip.empty()) byIp[e.ip].push_back(j);  // 按 IP 分桶（引用同一条 JSON）
                 jsons.push_back(std::move(j));
             }
@@ -227,7 +244,8 @@ private:
         return o;
     }
 
-    static std::string eventJson(const AttackEvent& e) {
+    // count>1 时输出 "count" 字段（批内去重的重复次数）；消费端按未知字段忽略兼容。
+    static std::string eventJson(const AttackEvent& e, uint64_t count = 1) {
         std::ostringstream o;
         o << "{\"ts\":" << e.ts
           << ",\"ip\":\"" << esc(e.ip) << "\""
@@ -238,6 +256,7 @@ private:
           << ",\"severity\":\"" << esc(e.severity) << "\""
           << ",\"uri\":\"" << esc(e.uri) << "\""
           << ",\"host\":\"" << esc(e.host) << "\"";
+        if (count > 1) o << ",\"count\":" << count;
         if (!e.traceId.empty()) o << ",\"trace\":\"" << esc(e.traceId) << "\"";
         o << "}";
         return o.str();

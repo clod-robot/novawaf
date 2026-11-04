@@ -1142,24 +1142,27 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                         if (!whitelisted && !policyPass && !blocked) {
                             std::string bait = HoneypotGuard::instance().keyFor(req.path);
                             if (!bait.empty()) {
-                                int distinct = HoneypotGuard::instance().noteHit(req.clientIp, bait);
-                                if (distinct >= HoneypotGuard::escalateN()) {
+                                auto hit = HoneypotGuard::instance().noteHit(req.clientIp, bait);
+                                if (hit.distinct >= HoneypotGuard::escalateN()) {
                                     // 升级：触达足够多不同诱饵 → 确定性扫描器，封禁
                                     if (g_debugLog) std::printf("[reactor %d] BLOCK Honeypot(escalate %d) from %s: %s\n",
-                                                idx, distinct, ipstr, req.path.c_str());
+                                                idx, hit.distinct, ipstr, req.path.c_str());
                                     outResp = blockResp(req.clientIp, "Honeypot", "HONEYPOT-001",
-                                                        bait + " x" + std::to_string(distinct),
+                                                        bait + " x" + std::to_string(hit.distinct),
                                                         req.path, hdrCi(req, "Host"), false, scannerUa);
                                     shield.recordBlock();
                                     FwBanPoster::instance()->enqueue(req.clientIp, "Honeypot", "HONEYPOT-001");
                                     blocked = true; tBlocked = true; tAttack = true;
                                 } else {
-                                    // 观察：记录事件 + 放行仿真诱饵内容（不阻断、不封禁）
+                                    // 观察：记录事件 + 放行仿真诱饵内容（不阻断、不封禁）。
+                                    // 仅窗口内首次触达该诱饵记事件——同一攻击者对同一诱饵的
+                                    // 高频重复访问不再逐条刷屏（曾 1s 304 条相同事件灌满事件流）。
                                     if (g_debugLog) std::printf("[reactor %d] OBSERVE Honeypot(%d/%d) from %s: %s\n",
-                                                idx, distinct, HoneypotGuard::escalateN(), ipstr, req.path.c_str());
-                                    emitEvt(req.clientIp, "Honeypot", "observe", "HONEYPOT-001",
-                                            bait + " x" + std::to_string(distinct),
-                                            req.path, hdrCi(req, "Host"));
+                                                idx, hit.distinct, HoneypotGuard::escalateN(), ipstr, req.path.c_str());
+                                    if (hit.isNew)
+                                        emitEvt(req.clientIp, "Honeypot", "observe", "HONEYPOT-001",
+                                                bait + " x" + std::to_string(hit.distinct),
+                                                req.path, hdrCi(req, "Host"));
                                     outResp = HoneypotDecoy::render(req.path, MimicDefense::siteBanner());
                                     setRespConnection(outResp, keepAlive);
                                     shield.recordRequest();

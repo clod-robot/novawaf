@@ -77,18 +77,26 @@ public:
         return path.substr(0, termDepth) + "*";
     }
 
+    // 命中记账的返回：distinct 供升级判定；isNew 标识本次是否窗口内首次触达
+    // 该诱饵，供上层抑制重复观察事件（同一攻击者对同一诱饵的高频重复访问
+    // 只记一条，不再逐条刷屏事件流）。
+    struct HitInfo {
+        int distinct = 0;
+        bool isNew = false;
+    };
+
     // 命中记账：滑窗（默认 600s，NOVA_HONEY_WIN_SEC）内不同诱饵计数。
-    // 返回该 IP 窗口内已触达的不同诱饵数——达到升级阈值（NOVA_HONEY_ESCALATE_N，
-    // 默认 3）后由上层升级为封禁。设计依据（复测设计评审）：「命中即封禁」让
-    // 攻击者立刻知晓被处置、取证链中断；改为「记录+打标+诱饵放行」，触达 N 个
-    // 不同诱饵（扫描器踩点特征，正常用户数学上不可能触达多个无链接路径）再升级。
-    int noteHit(const std::string& ip, const std::string& baitKey) {
+    // distinct 达到升级阈值（NOVA_HONEY_ESCALATE_N，默认 3）后由上层升级为封禁。
+    // 设计依据（复测设计评审）：「命中即封禁」让攻击者立刻知晓被处置、取证链
+    // 中断；改为「记录+打标+诱饵放行」，触达 N 个不同诱饵（扫描器踩点特征，
+    // 正常用户数学上不可能触达多个无链接路径）再升级。
+    HitInfo noteHit(const std::string& ip, const std::string& baitKey) {
         int64_t now = (int64_t)time(nullptr);
         auto& sh = hitShards_[std::hash<std::string>{}(ip) & (kHitShards - 1)];
         std::lock_guard<std::mutex> lk(sh.mtx);
         auto& st = sh.hits[ip];
         if (now - st.winStart >= winSec_) { st.winStart = now; st.baits.clear(); }
-        st.baits.insert(baitKey);
+        bool isNew = st.baits.insert(baitKey).second;
         // 惰性回收：单片超 512 时清理窗口外 IP，防内存增长
         if (sh.hits.size() > 512) {
             for (auto it = sh.hits.begin(); it != sh.hits.end();) {
@@ -96,7 +104,7 @@ public:
                 else ++it;
             }
         }
-        return (int)st.baits.size();
+        return {(int)st.baits.size(), isNew};
     }
 
     // 升级阈值（不同诱饵数），供上层判定
