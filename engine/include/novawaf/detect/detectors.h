@@ -236,28 +236,94 @@ private:
 class SsrfDetector : public IDetector {
 public:
     SsrfDetector() {
+        // 强特征：非常规协议与云元数据——业务输入中几乎不会合法出现，命中即拦
         for (auto& p : {"gopher://", "dict://", "ftp://", "tftp://", "ldap://",
-                         "127.0.0.1", "localhost", "169.254.", "10.0.0.", "192.168.",
-                         "100.100.100.200", "metadata.google", "0.0.0.0", "[::1]"})
-            ac_.addPattern(p);
-        ac_.build();
+                         "100.100.100.200", "metadata.google", "169.254."})
+            acStrong_.addPattern(p);
+        acStrong_.build();
+        // 弱特征：内网地址字面量。裸出现于描述性参数属正常业务——无线 AC Portal
+        // 重定向会携带 wlanuserip/wlanapip 等内网地址（复测确认被 SSRF-001 误杀），
+        // 必须结合「请求目标上下文」二次确认才可判定：前有 scheme://、//、@，
+        // 或处于 URL 类参数（url/redirect/next 等）的值中。
+        for (auto& p : {"127.0.0.1", "localhost", "0.0.0.0", "[::1]",
+                         "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+                         "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+                         "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31."})
+            acWeak_.addPattern(p);
+        acWeak_.build();
     }
     const char* name() const override { return "SSRF"; }
     std::unique_ptr<IDetector> clone() const override { return std::make_unique<SsrfDetector>(); }
     DetectionResult detect(const HttpRequest& req) override {
         // 仅检测用户可控输入（path/query/body/参数），不扫 Host 等头，避免误报正常回环地址
         std::vector<std::string> payloads{req.path, req.query, req.body};
-        for (auto& [k, v] : req.queryParams) { payloads.push_back(k); payloads.push_back(v); }
+        for (auto& [k, v] : req.queryParams) {
+            payloads.push_back(k); payloads.push_back(v);
+            // URL 类参数名 + 内网地址值 → 直接判定（?url=http://内网/、?redirect=//内网 等）
+            std::string vn = Decoder::normalize(v);
+            if (isUrlParam(Decoder::normalize(k)) && containsInternal(vn))
+                return {Action::BLOCK, "SSRF-001", "SSRF", "Server-side request forgery", vn};
+        }
         for (auto& payload : payloads) {
             std::string norm = Decoder::normalize(payload);
-            if (ac_.containsAny(norm)) {
+            if (acStrong_.containsAny(norm)) {
+                return {Action::BLOCK, "SSRF-001", "SSRF", "Server-side request forgery", norm};
+            }
+            // 弱特征需二次确认内网地址处于请求目标上下文
+            if (acWeak_.containsAny(norm) && internalAsTarget(norm)) {
                 return {Action::BLOCK, "SSRF-001", "SSRF", "Server-side request forgery", norm};
             }
         }
         return {};
     }
 private:
-    AcAutomaton ac_;
+    // 常见可被后端当作请求目标使用的 URL 类参数名（小写）。
+    // wlanuserip/wlanapip/clientip/userip 等描述性参数刻意不在列。
+    static bool isUrlParam(const std::string& k) {
+        static const char* names[] = {
+            "url", "uri", "link", "src", "href", "redirect", "redirecturl", "redirecturi",
+            "next", "target", "callback", "return", "returnurl", "continue", "dest",
+            "destination", "site", "load", "fetch", "proxy", "feed", "host", "img",
+            "image", "view", "page", "domain", "remote", "addr", "address", "endpoint",
+            "goto", "forward", "forwardurl", "toredirect", "rurl", "u", "ref"};
+        for (auto n : names) if (k == n) return true;
+        return false;
+    }
+
+    static bool containsInternal(const std::string& s) {
+        static const char* feats[] = {
+            "127.0.0.1", "localhost", "0.0.0.0", "[::1]", "10.", "192.168.",
+            "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+            "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+            "172.28.", "172.29.", "172.30.", "172.31."};
+        for (auto f : feats) if (s.find(f) != std::string::npos) return true;
+        return false;
+    }
+
+    // 内网地址是否处于「请求目标」位置：紧邻前缀为 ://、//、@ 即视为被当作
+    // 请求目标使用（http://内网、//内网、user@内网）；等号/引号/JSON 键值等
+    // 描述性上下文一律放行。
+    static bool internalAsTarget(const std::string& s) {
+        static const char* feats[] = {
+            "127.0.0.1", "localhost", "0.0.0.0", "[::1]", "10.", "192.168.",
+            "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+            "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+            "172.28.", "172.29.", "172.30.", "172.31."};
+        for (auto f : feats) {
+            std::string fs(f);
+            size_t pos = 0;
+            while ((pos = s.find(fs, pos)) != std::string::npos) {
+                if (pos >= 3 && s.compare(pos - 3, 3, "://") == 0) return true;
+                if (pos >= 2 && s.compare(pos - 2, 2, "//") == 0) return true;
+                if (pos >= 1 && s[pos - 1] == '@') return true;
+                pos += fs.size();
+            }
+        }
+        return false;
+    }
+
+    AcAutomaton acStrong_;
+    AcAutomaton acWeak_;
 };
 
 // ---- CRLF 注入 / HTTP 响应拆分 / 请求走私 检测器 ----
