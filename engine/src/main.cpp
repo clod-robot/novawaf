@@ -17,6 +17,9 @@
 #include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/cve_patch.h"
 #include "novawaf/detect/regex_patch.h"
+
+// 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
+#define NOVAWAF_VERSION "1.1.1-rc.1"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -2073,7 +2076,7 @@ int main(int argc, char** argv) {
     g_upstream->setOnDisconnect([&ddos](const std::string& ip) { ddos.onDisconnect(ip); });
     std::printf("  Upstream async forwarder: io_threads=%d (pool + keep-alive reuse)\n", ioThreads);
 
-    std::printf("NovaWAF engine starting on port %d with %d reactors\n", port, threads);
+    std::printf("NovaWAF engine v%s starting on port %d with %d reactors\n", NOVAWAF_VERSION, port, threads);
     std::printf("  DDoS guard: maxConn=%d newConn/s=%d req/s=%d ban=%ds\n",
                 ddosCfg.maxConcurrentPerIp, ddosCfg.newConnPerSec,
                 ddosCfg.reqPerSec, ddosCfg.banSeconds);
