@@ -1289,22 +1289,6 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true; tAttack = true;
                             }
                         }
-                        // 认证爆破防护：登录/验证码等认证接口的尝试计数与源 IP 锁定。
-                        // 响应侧无法区分成败（业务失败也回 200），故按尝试次数独立限流。
-                        if (!whitelisted && !policyPass && !blocked) {
-                            int lockSec = BruteGuard::instance().hit(req.clientIp, req.path);
-                            if (lockSec > 0) {
-                                if (g_debugLog) std::printf("[reactor %d] BLOCK BruteForce from %s: %s\n",
-                                            idx, ipstr, req.path.c_str());
-                                outResp = errResp(429, "Too Many Requests",
-                                                  "Retry-After: " + std::to_string(lockSec) + "\r\n");
-                                shield.recordBlock();
-                                emitEvt(req.clientIp, "BruteForce", "block", "BF-001",
-                                        "auth attempts exceeded, locked", req.path, hdrCi(req, "Host"));
-                                // 本地 429 锁定即可，不上报防火墙全端口封禁（避免误伤 SSH 等管理通道）
-                                blocked = true; tBlocked = true;
-                            }
-                        }
                         // Bot 指纹处置已前置（CC 配额系数 + observe 事件），
                         // 此处不再二次评估、不再直接 429。
                         _mark();  // [4] Geo/CC/Bot 结束，进入规则+AI 检测流水线
@@ -1341,7 +1325,26 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 fwEscalate = EscalationGuard::instance().noteHit(req.clientIp)
                                              >= EscalationGuard::escalateN();
                             } else {
-                                asyncHandled = forwardToApp();
+                                // 认证爆破防护（检测流水线之后、转发上游之前）：
+                                // 登录等认证接口的尝试计数与源 IP 锁定。响应侧无法区分
+                                // 成败（业务失败也回 200），故按尝试次数独立限流。
+                                // 只对通过全部检测的请求计数——此前位于流水线之前，
+                                // 被 CSRF/规则误拦的请求也占窗口，正常用户会被误推入锁定。
+                                int lockSec = BruteGuard::instance().hit(
+                                    req.clientIp, req.path, req.method);
+                                if (lockSec > 0) {
+                                    if (g_debugLog) std::printf("[reactor %d] BLOCK BruteForce from %s: %s\n",
+                                                idx, ipstr, req.path.c_str());
+                                    outResp = errResp(429, "Too Many Requests",
+                                                      "Retry-After: " + std::to_string(lockSec) + "\r\n");
+                                    shield.recordBlock();
+                                    emitEvt(req.clientIp, "BruteForce", "block", "BF-001",
+                                            "auth attempts exceeded, locked", req.path, hdrCi(req, "Host"));
+                                    // 本地 429 锁定即可，不上报防火墙全端口封禁（避免误伤 SSH 等管理通道）
+                                    blocked = true; tBlocked = true;
+                                } else {
+                                    asyncHandled = forwardToApp();
+                                }
                             }
                         }
                         // 白名单 或 路径放行策略：跳过全部检测，直接转发上游

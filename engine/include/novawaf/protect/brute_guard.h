@@ -19,6 +19,7 @@
 #pragma once
 
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -38,8 +39,12 @@ public:
 
     // 请求前调用：返回剩余冷却/锁定秒数（>0 表示应 429 拒绝）；
     // 返回 0 表示未限制且本次尝试已计入。非认证路径恒返回 0 且不计数。
-    int hit(const std::string& ip, const std::string& path) {
+    // 仅改写型方法（POST/PUT/DELETE/PATCH）计入：GET 验证码/会话查询等读取型
+    // 请求永不计数、永不被限（此前 GET /api/auth/captcha 也占窗口，用户刷新
+    // 几次页面就占满软阈值，验证码接口连带被 429，正常用户被锁在门外）。
+    int hit(const std::string& ip, const std::string& path, const std::string& method) {
         if (!isAuthPath(path)) return 0;
+        if (!isWriteMethod(method)) return 0;
         int64_t now = nowSec();
         auto& s = shard(ip);
         std::lock_guard<std::mutex> lk(s.mtx);
@@ -97,6 +102,15 @@ private:
         for (auto& p : paths_)
             if (path.compare(0, p.size(), p) == 0) return true;
         return false;
+    }
+
+    // 改写型方法判定：只有会真正提交凭证的写操作才可能是爆破尝试。
+    // 请求行方法标准客户端恒大写，此处做大小写归一兜底。
+    static bool isWriteMethod(const std::string& m) {
+        std::string u;
+        u.reserve(m.size());
+        for (char c : m) u += (char)std::toupper((unsigned char)c);
+        return u == "POST" || u == "PUT" || u == "DELETE" || u == "PATCH";
     }
 
     static int64_t nowSec() {
