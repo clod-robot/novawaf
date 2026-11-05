@@ -72,7 +72,8 @@ const all = [
     { path: '/common/ipgroup', title: 'IP 组', perm: 'waf:ipgroup:list', icon: 'Location' },
     { path: '/common/accel', title: '硬件加速', perm: 'system:accel:list', icon: 'Cpu' },
     { title: '防护策略', icon: 'Lock', children: [
-      { path: '/common/protect/api-policy', title: 'API防护策略', perm: 'waf:apipolicy:list', icon: 'Connection' }
+      { path: '/common/protect/api-policy', title: 'API防护策略', perm: 'waf:apipolicy:list', icon: 'Connection' },
+      { path: '/common/protect/api-assets', title: 'API资产与防护', perm: 'waf:apiasset:list', icon: 'DataLine' }
     ] }
   ] },
   { path: '/system/user', title: '用户管理', perm: 'sys:user:list', icon: 'User' },

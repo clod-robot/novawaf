@@ -146,6 +146,36 @@ export const api = {
   // 阈值管理：端点分级限流策略（monitor→enforce 分阶段）+ 采集分布
   rateLimitGet: () => http.get('/settings/ratelimit'),
   rateLimitSave: (d) => http.put('/settings/ratelimit', d),
-  rateLimitDist: (cls, limit) => http.get('/settings/ratelimit/dist/' + cls, { params: { limit } })
+  rateLimitDist: (cls, limit) => http.get('/settings/ratelimit/dist/' + cls, { params: { limit } }),
+  // API 资产自动发现：目录(影子/僵尸)、概览、登记清单 CRUD、一键登记、CSV 导入
+  apiAssetList: (p) => http.get('/waf/api-assets/list', { params: p }),
+  apiAssetStats: () => http.get('/waf/api-assets/stats'),
+  apiAssetInventory: () => http.get('/waf/api-assets/inventory'),
+  apiAssetAdd: (d) => http.post('/waf/api-assets/inventory', d),
+  apiAssetUpdate: (d) => http.put('/waf/api-assets/inventory', d),
+  apiAssetToggle: (id, enabled) => http.put('/waf/api-assets/inventory/' + id + '/enabled', { enabled }),
+  apiAssetDelete: (id) => http.delete('/waf/api-assets/inventory/' + id),
+  apiAssetPromote: (items) => http.post('/waf/api-assets/inventory/promote', items),
+  apiAssetImport: (fd) => http.post('/waf/api-assets/inventory/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  apiAssetTemplate: () => http.get('/waf/api-assets/inventory/template', { responseType: 'blob' }),
+  // API 级别防护：限流策略 / 全局配置(Token校验+脱敏) / 令牌白名单
+  apiGuardList: () => http.get('/waf/api-guard/list'),
+  apiGuardCreate: (d) => http.post('/waf/api-guard', d),
+  apiGuardUpdate: (d) => http.put('/waf/api-guard', d),
+  apiGuardToggle: (id, enabled) => http.put('/waf/api-guard/' + id + '/enabled', { enabled }),
+  apiGuardDelete: (id) => http.delete('/waf/api-guard/' + id),
+  apiGuardConfig: () => http.get('/waf/api-guard/config'),
+  apiGuardSaveConfig: (d) => http.put('/waf/api-guard/config', d),
+  apiGuardStats: () => http.get('/waf/api-guard/stats'),
+  apiGuardTokens: () => http.get('/waf/api-guard/tokens'),
+  apiGuardAddToken: (d) => http.post('/waf/api-guard/tokens', d),
+  apiGuardUpdateToken: (d) => http.put('/waf/api-guard/tokens', d),
+  apiGuardToggleToken: (id, enabled) => http.put('/waf/api-guard/tokens/' + id + '/enabled', { enabled }),
+  apiGuardDeleteToken: (id) => http.delete('/waf/api-guard/tokens/' + id),
+  // Agentic AI 引擎：配置下发 + 研判轨迹
+  agenticConfig: () => http.get('/waf/agentic/config'),
+  agenticSaveConfig: (d) => http.put('/waf/agentic/config', d),
+  agenticTraces: (limit) => http.get('/waf/agentic/traces', { params: { limit } }),
+  agenticClearTraces: () => http.delete('/waf/agentic/traces')
 }
 export default http

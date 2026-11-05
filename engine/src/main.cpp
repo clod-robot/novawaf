@@ -19,7 +19,7 @@
 #include "novawaf/detect/regex_patch.h"
 
 // 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
-#define NOVAWAF_VERSION "1.1.1-rc.1"
+#define NOVAWAF_VERSION "1.1.1-rc.2"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -50,6 +50,9 @@
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
 #include "novawaf/ai/http_transport.h"
+#include "novawaf/api/api_asset.h"
+#include "novawaf/api/api_guard.h"
+#include "novawaf/ai/agentic_engine.h"
 #include "novawaf/accel/accel_runtime.h"
 
 #include <fstream>
@@ -991,6 +994,8 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     // 接口/XHR 调用保持 502，避免客户端拿到 HTML 跳转页而解析失败。
                     // 优先用应用配置的登录页，未配置则退化到同源 /login。
                     std::string failRedirect;
+                    // API 资产键（观测登记后填充）：同步与异步转发路径都用它回写响应状态码
+                    std::string apiAssetKey;
                     {
                         std::string acc = hdrCi(req, "Accept");
                         bool navReq = req.method == "GET" &&
@@ -1023,6 +1028,7 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             ctx.path = req.path; ctx.referer = hdrCi(req, "Referer");
                             ctx.country = geo.country(req.clientIp);
                             ctx.policyId = policyId;
+                            ctx.apiAssetKey = apiAssetKey;
                             ctx.keepAlive = keepAlive;
                             ctx.failRedirect = failRedirect;
                             // 异步转发完成(在 IO 线程)：keep-alive 则重新挂回 epoll 复用，否则关闭。
@@ -1063,6 +1069,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                             BlockPage::rewriteUpstreamErrorBody(outResp);
                             // 行为识别响应侧记账（404/301 频次信号，同步回退路径）
                             BehaviorGuard::instance().noteStatus(req.clientIp, respStatus(outResp));
+                            // API 资产状态码记账（同步回退路径）
+                            if (!apiAssetKey.empty())
+                                ApiAssetRegistry::instance().noteStatus(apiAssetKey, respStatus(outResp));
                             // 网页防篡改：同步回退路径同样过基线校验
                             if (data.compare(0, 4, "GET ") == 0) {
                                 if (auto restored = TamperCache::instance().process(
@@ -1130,6 +1139,100 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                                 blocked = true; tBlocked = true; tAttack = true; fwEscalate = true;
                                 break;
                             default: break;
+                        }
+                        // ---- API 资产自动发现 + API 级防护（Token 合法性 / 频率限制）----
+                        // 顺序：资产登记（影子 API 首次发现）→ Token 校验 → API 限流 → Agentic 威胁索引。
+                        // 全部 fail-open：策略未下发/Redis 不可用时规则表为空即放行。
+                        bool apiShadow = false;
+                        bool apiTokenIssue = false;
+                        std::string apiTokenState;
+                        std::string apiCtype = hdrCi(req, "Content-Type");
+                        if (!whitelisted && !policyPass) {
+                            ApiAssetRegistry::ObserveIn oi;
+                            oi.appId = appId;
+                            oi.method = req.method;
+                            oi.contentType = apiCtype;
+                            oi.hasAuth = !hdrCi(req, "Authorization").empty();
+                            oi.hasCookie = !hdrCi(req, "Cookie").empty();
+                            oi.query = &req.queryParams;
+                            oi.paramCount = req.queryParams.size();
+                            oi.ipHash = ((uint64_t)ipU(req.clientIp) * 0x9E3779B97F4A7C15ULL) >> 40;
+                            apiAssetKey = ApiAssetRegistry::instance().observe(oi, req.path);
+                            apiShadow = !ApiAssetRegistry::instance().isRegisteredPath(
+                                appId, req.method, req.path);
+
+                            // 令牌提取：Authorization: Bearer > X-API-Token/X-API-Key > 查询参数（泄露信号）
+                            std::string apiToken;
+                            bool tokenFromQuery = false;
+                            {
+                                std::string auth = hdrCi(req, "Authorization");
+                                if (!auth.empty()) {
+                                    size_t p = auth.find("Bearer ");
+                                    apiToken = (p == std::string::npos) ? auth : auth.substr(p + 7);
+                                }
+                                if (apiToken.empty()) apiToken = hdrCi(req, "X-API-Token");
+                                if (apiToken.empty()) apiToken = hdrCi(req, "X-API-Key");
+                                if (apiToken.empty()) {
+                                    static const char* kQN[] = {"access_token", "token", "jwt",
+                                                                "id_token", "apikey", "api_key"};
+                                    for (auto& [k, v] : req.queryParams) {
+                                        std::string lk;
+                                        lk.reserve(k.size());
+                                        for (char c : k) lk.push_back((char)std::tolower((unsigned char)c));
+                                        bool hit = false;
+                                        for (auto* n : kQN) if (lk == n) { hit = true; break; }
+                                        if (hit && !v.empty()) { apiToken = v; tokenFromQuery = true; break; }
+                                    }
+                                }
+                            }
+                            auto apiDec = ApiRateGuard::instance().assess(
+                                req.clientIp, appId, req.method, req.path, apiToken, tokenFromQuery);
+                            if (apiDec && apiDec->status == 401) {
+                                apiTokenIssue = true;
+                                apiTokenState = apiDec->reason;
+                                outResp = errResp(401, "Unauthorized",
+                                                  "WWW-Authenticate: Bearer realm=\"api\"\r\n");
+                                emitEvt(req.clientIp, "APIAuth", "block", apiDec->ruleId,
+                                        apiDec->detail, req.path, hdrCi(req, "Host"));
+                                shield.recordBlock();
+                                blocked = true; tBlocked = true; tAttack = true;
+                            } else if (apiDec && apiDec->status == 429) {
+                                outResp = errResp(429, "Too Many Requests",
+                                                  "Retry-After: " +
+                                                      std::to_string(apiDec->retryAfterSec) + "\r\n");
+                                emitEvt(req.clientIp, "APILimit", "block", apiDec->ruleId,
+                                        apiDec->detail, req.path, hdrCi(req, "Host"));
+                                shield.recordBlock();
+                                blocked = true; tBlocked = true;
+                            } else if (AgenticAiEngine::instance().threatKnown(
+                                           AgenticAiEngine::assetSig(appId, req.method, req.path))) {
+                                // Agentic AI 异步研判结论落到威胁索引 → 同步拒绝同类后续请求
+                                outResp = blockResp(req.clientIp, "AgenticAI", "API-AGENTIC-KNOWN",
+                                                    "agentic-confirmed threat",
+                                                    req.path, hdrCi(req, "Host"));
+                                shield.recordBlock();
+                                blocked = true; tBlocked = true; tAttack = true; fwEscalate = true;
+                                emitEvt(req.clientIp, "AgenticAI", "block", "API-AGENTIC-KNOWN",
+                                        "async verdict hit", req.path, hdrCi(req, "Host"));
+                            }
+                            // Agentic AI 异步研判：热路径只入队（候选判定过滤普通流量）
+                            if (AgenticAiEngine::instance().enabled()) {
+                                AgenticAiEngine::Signal sg;
+                                sg.ip = req.clientIp;
+                                sg.appId = appId;
+                                sg.method = req.method;
+                                sg.path = req.path.size() > 1024 ? req.path.substr(0, 1024) : req.path;
+                                sg.query = req.query.size() > 1024 ? req.query.substr(0, 1024) : req.query;
+                                sg.body = req.body.size() > 1024 ? req.body.substr(0, 1024) : req.body;
+                                sg.ua = hdrCi(req, "User-Agent");
+                                sg.contentType = apiCtype;
+                                sg.tokenState = apiTokenState;
+                                sg.tokenIssue = apiTokenIssue;
+                                sg.shadow = apiShadow;
+                                sg.ts = (int64_t)std::time(nullptr);
+                                if (AgenticAiEngine::candidate(sg, apiShadow))
+                                    AgenticAiEngine::instance().submit(sg);
+                            }
                         }
                         // 蜜罐诱捕（观察模式，复测设计评审整改）：诱饵路径正常流量
                         // 永不触达（不在站点地图、无页面链接、业务从不引用），访问即
@@ -2039,6 +2142,151 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             if (!g_running) break;
             loadGeoPolicy(false);
+        }
+    }).detach();
+
+    // ---- API 资产自动发现 / API 级防护 / Agentic AI：配置热加载 + 周期快照 ----
+    // Redis 契约（管理端写入、引擎读取；均带 :version 版本键，变化才重载）：
+    //   novawaf:api:inventory  已登记 API 清单 {"items":[{"appId","method","path"}]}
+    //   novawaf:api:guard      API 限流 / Token 校验 / 脱敏开关策略
+    //   novawaf:api:tokens     不透明令牌白名单 ["token", ...]
+    //   novawaf:ai:agentic     Agentic AI 引擎（模型端点、阈值、预算、熔断）
+    //   novawaf:dlp:config     响应敏感数据脱敏动作
+    // 引擎写出：novawaf:api:assets（资产目录快照）、novawaf:ai:agentic:traces（研判轨迹）
+    int apiZombieDays = getenv("NOVA_API_ZOMBIE_DAYS") ? std::atoi(getenv("NOVA_API_ZOMBIE_DAYS")) : 30;
+    if (apiZombieDays < 1) apiZombieDays = 1;
+    AgenticAiEngine::instance().start(2);
+    if (const char* ae = getenv("NOVA_AGENTIC_ENABLE")) {
+        if (std::string(ae) == "1") {
+            // 环境变量兜底配置（Redis 未下发时生效）：模型端点复用 NOVAAI_* 变量
+            std::string llmOn = (getenv("NOVAAI_ENABLE") && std::string(getenv("NOVAAI_ENABLE")) == "1")
+                                    ? "true" : "false";
+            std::string js = "{\"enabled\":true,\"block\":false,\"threshold\":0.6,"
+                             "\"budgetPerMin\":20,\"llm\":{\"enabled\":" + llmOn +
+                             ",\"endpoint\":\"" + (getenv("NOVAAI_ENDPOINT") ? getenv("NOVAAI_ENDPOINT") : "") +
+                             "\",\"apiKey\":\"" + (getenv("NOVAAI_APIKEY") ? getenv("NOVAAI_APIKEY") : "") +
+                             "\",\"model\":\"" + (getenv("NOVAAI_MODEL") ? getenv("NOVAAI_MODEL") : "") +
+                             "\",\"timeoutMs\":1500}}";
+            AgenticAiEngine::instance().configure(js);
+        }
+    }
+    auto loadApiConfigs = [](bool initial) {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) return;
+        int port = getenv("NOVA_REDIS_PORT") ? std::atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? std::atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return;
+        // 首轮：从上次快照还原资产目录（避免重启后影子/僵尸资产清空）
+        static bool assetsRestored = false;
+        if (initial && !assetsRestored) {
+            assetsRestored = true;
+            auto snap = r.get("novawaf:api:assets");
+            if (snap && !snap->empty()) {
+                ApiAssetRegistry::instance().restore(*snap);
+                std::printf("  APIAsset: restored %zu assets from snapshot\n",
+                            ApiAssetRegistry::instance().size());
+            }
+        }
+        static std::string invVer = "-", guardVer = "-", tokenVer = "-", agentVer = "-", dlpVer = "-";
+        auto reload = [&r, initial](const char* verKey, std::string& last, const char* dataKey) -> bool {
+            auto v = r.get(verKey);
+            std::string cur = v.value_or("");
+            if (!initial && cur == last) return false;
+            last = cur;
+            auto b = r.get(dataKey);
+            if (!b || b->empty()) return false;
+            (void)dataKey;
+            return true;
+        };
+        if (reload("novawaf:api:inventory:version", invVer, "novawaf:api:inventory")) {
+            auto b = r.get("novawaf:api:inventory");
+            if (b) {
+                ApiAssetRegistry::instance().configureInventory(*b);
+                std::printf("  APIAsset: inventory %s, registered=%zu\n",
+                            initial ? "loaded" : "hot-reloaded",
+                            ApiAssetRegistry::instance().inventorySize());
+            }
+        }
+        if (reload("novawaf:api:guard:version", guardVer, "novawaf:api:guard")) {
+            auto b = r.get("novawaf:api:guard");
+            if (b) {
+                try {
+                    auto pol = ApiRateGuard::parsePolicy(*b);
+                    TokenGuard::instance().configure(pol->token);
+                    ApiRateGuard::instance().configure(pol);
+                    std::printf("  APIGuard: %s rules=%zu token=%d stage=%d\n",
+                                initial ? "loaded" : "hot-reloaded", pol->rules.size(),
+                                pol->token.enabled ? 1 : 0, pol->stage);
+                } catch (...) {
+                    std::printf("  APIGuard: invalid policy json, keep previous\n");
+                }
+            }
+        }
+        if (reload("novawaf:api:tokens:version", tokenVer, "novawaf:api:tokens")) {
+            auto b = r.get("novawaf:api:tokens");
+            if (b) {
+                std::vector<std::string> toks;
+                try {
+                    JsonValue root = parseJson(*b);
+                    if (root.isArray())
+                        for (auto& e : root.arr)
+                            if (e.isString() && !e.str.empty()) toks.push_back(e.str);
+                } catch (...) {}
+                TokenGuard::instance().setWhitelist(toks);
+                std::printf("  APIToken: whitelist %s, size=%zu\n",
+                            initial ? "loaded" : "hot-reloaded",
+                            TokenGuard::instance().whitelistSize());
+            }
+        }
+        if (reload("novawaf:ai:agentic:version", agentVer, "novawaf:ai:agentic")) {
+            auto b = r.get("novawaf:ai:agentic");
+            if (b) {
+                AgenticAiEngine::instance().configure(*b);
+                auto ac = AgenticAiEngine::instance().config();
+                std::printf("  AgenticAI: %s enabled=%d block=%d threshold=%.2f llm=%d\n",
+                            initial ? "loaded" : "hot-reloaded", ac->enabled ? 1 : 0,
+                            ac->block ? 1 : 0, ac->threshold, ac->llm.enabled ? 1 : 0);
+            }
+        }
+        if (reload("novawaf:dlp:config:version", dlpVer, "novawaf:dlp:config")) {
+            auto b = r.get("novawaf:dlp:config");
+            if (b) {
+                ResponseDlp::instance().configure(*b);
+                std::printf("  ResponseDLP: %s action=%d maxBytes=%zu\n",
+                            initial ? "loaded" : "hot-reloaded",
+                            ResponseDlp::instance().action(), ResponseDlp::instance().maxBytes());
+            }
+        }
+    };
+    loadApiConfigs(true);
+    std::thread([loadApiConfigs]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (!g_running) break;
+            loadApiConfigs(false);
+        }
+    }).detach();
+    // 资产目录周期快照（60s；首轮 10s 让管理端尽快看到数据）+ Agentic 轨迹落 Redis
+    std::thread([apiZombieDays]() {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        int interval = 10;
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(interval));
+            if (!g_running) break;
+            interval = 60;
+            std::string snap = ApiAssetRegistry::instance().snapshotJson(apiZombieDays, true);
+            auto traces = AgenticAiEngine::instance().drainTraces(200);
+            if (!rh || !*rh) continue;
+            int port = getenv("NOVA_REDIS_PORT") ? std::atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+            const char* pass = getenv("NOVA_REDIS_PASS");
+            int db = getenv("NOVA_REDIS_DB") ? std::atoi(getenv("NOVA_REDIS_DB")) : 0;
+            RedisClient r;
+            if (!r.connect(rh, port, pass ? pass : "", db)) continue;
+            r.set("novawaf:api:assets", snap);
+            for (auto& t : traces) r.rpush("novawaf:ai:agentic:traces", t);
+            if (!traces.empty()) r.ltrim("novawaf:ai:agentic:traces", 0, 1999);
         }
     }).detach();
     // 观察者：态势升级 → 收紧 CC 阈值

@@ -17,6 +17,7 @@ const routes = [
       { path: 'waf/tamper', component: () => import('../views/Tamper.vue'), meta: { perm: 'waf:tamper:list', title: '网页防篡改' } },
       { path: 'waf/trace', component: () => import('../views/Trace.vue'), meta: { perm: 'waf:trace:list', title: '溯源分析' } },
       { path: 'common/protect/api-policy', component: () => import('../views/ApiPolicy.vue'), meta: { perm: 'waf:apipolicy:list', title: 'API防护策略' } },
+      { path: 'common/protect/api-assets', component: () => import('../views/ApiAssets.vue'), meta: { perm: 'waf:apiasset:list', title: 'API资产与防护' } },
       { path: 'common/deploy', component: () => import('../views/Deploy.vue'), meta: { perm: 'system:deploy:view', title: '部署方式' } },
       { path: 'common/ipgroup', component: () => import('../views/IpGroup.vue'), meta: { perm: 'waf:ipgroup:list', title: 'IP 组' } },
       { path: 'common/accel', component: () => import('../views/Accel.vue'), meta: { perm: 'system:accel:list', title: '硬件加速' } },

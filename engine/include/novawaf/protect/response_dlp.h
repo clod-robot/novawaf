@@ -19,10 +19,12 @@
 
 #include "novawaf/core/event_bus.h"
 #include "novawaf/core/event_sink.h"   // AttackEvent
+#include "novawaf/core/json.h"
 #include "novawaf/core/waf_mode.h"
 #include "novawaf/protect/block_page.h"
 #include "novawaf/protect/mimic.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -43,16 +45,27 @@ public:
     enum Action : int { ACT_OFF = 0, ACT_MASK = 1, ACT_LOG = 2, ACT_BLOCK = 3 };
 
     // 主入口：就地处理响应（head+body 完整字节流）。命中按配置动作处理并上报事件。
+    // 分块（Transfer-Encoding: chunked）响应先解帧再扫描，命中后按单块重新分帧，
+    // 保持原始帧语义与 keep-alive（Spring/Tomcat 等流式 JSON 常态为 chunked）。
     void process(std::string& resp, const std::string& ip,
                  const std::string& host, const std::string& path) {
         if (act_ == ACT_OFF) return;
         size_t he = resp.find("\r\n\r\n");
         if (he == std::string::npos) return;
-        if (resp.size() - (he + 4) == 0) return;
-        if (resp.size() - (he + 4) > maxBytes_) return;
-        if (!textualAndPlain(resp, he)) return;  // 跳过 chunked/压缩/二进制
+        size_t bl = resp.size() - (he + 4);
+        if (bl == 0 || bl > maxBytes_) return;
+        if (!textualHead(resp, he)) return;   // 跳过压缩/二进制
 
-        std::string body = resp.substr(he + 4);
+        bool chunked = isChunked(resp, he);
+        std::string body;
+        if (chunked) {
+            // 帧损坏/超长：保守跳过（宁可漏脱敏也不破坏帧边界）
+            if (!dechunk(resp.substr(he + 4), body)) return;
+        } else {
+            body = resp.substr(he + 4);
+        }
+        if (body.size() > maxBytes_) return;
+
         HitStat stat;
         scanBody(body, stat);  // 就地脱敏（等长替换）
         int total = stat.mobile + stat.idcard + stat.bankcard + stat.secret + stat.privkey;
@@ -90,13 +103,41 @@ public:
         }
         e.action = (act_ == ACT_LOG) ? "log" : "mask";
         EventBus<AttackEvent>::instance().publish(e);
-        if (act_ == ACT_MASK)
-            resp = resp.substr(0, he + 4) + body;  // 等长替换：Content-Length 无需重建
+        if (act_ == ACT_MASK) {
+            if (chunked)
+                resp = resp.substr(0, he + 4) + chunkedFrame(body);
+            else
+                resp = resp.substr(0, he + 4) + body;  // 等长替换：Content-Length 无需重建
+        }
     }
 
     // 当前配置摘要（启动日志/测试探针用）
-    int action() const { return act_; }
-    size_t maxBytes() const { return maxBytes_; }
+    int action() const { return act_.load(); }
+    size_t maxBytes() const { return maxBytes_.load(); }
+
+    // 管理端热更新（Redis novawaf:dlp:config）：enabled / action / maxBytes。
+    // 解析失败保持旧配置（fail-safe），非法动作回落到 mask。
+    void configure(const std::string& blob) {
+        if (blob.empty()) return;
+        JsonValue root;
+        try {
+            root = parseJson(blob);
+        } catch (...) {
+            return;
+        }
+        if (root.type != JsonValue::OBJECT) return;
+        const JsonValue& en = root.at("enabled");
+        if (en.type == JsonValue::BOOL && !en.b) { act_.store(ACT_OFF); return; }
+        const JsonValue& a = root.at("action");
+        std::string act = a.type == JsonValue::STRING ? a.str : "mask";
+        int v = ACT_MASK;
+        if (act == "off") v = ACT_OFF;
+        else if (act == "log") v = ACT_LOG;
+        else if (act == "block") v = ACT_BLOCK;
+        act_.store(v);
+        const JsonValue& mb = root.at("maxBytes");
+        if (mb.type == JsonValue::NUMBER && mb.num > 0) maxBytes_.store((size_t)mb.num);
+    }
 
 private:
     ResponseDlp() {
@@ -116,16 +157,13 @@ private:
 
     struct HitStat { int mobile = 0, idcard = 0, bankcard = 0, secret = 0, privkey = 0; };
 
-    // 仅处理「文本且未压缩且非 chunked」的响应：
-    //   - Transfer-Encoding: chunked → 跳过分块帧（改写会破坏帧边界）
+    // 仅处理「文本且未压缩」的响应：
     //   - Content-Encoding（gzip/br/deflate）→ 压缩体不可扫描/脱敏
     //   - Content-Type 显式为二进制族（image/ video/ audio/ octet-stream pdf zip font）→ 跳过；
     //     其余（text/*、json、xml、javascript、缺失）按文本处理
-    static bool textualAndPlain(const std::string& resp, size_t he) {
+    static bool textualHead(const std::string& resp, size_t he) {
         std::string head = resp.substr(0, he);
         for (auto& c : head) c = (char)tolower((unsigned char)c);
-        if (head.find("transfer-encoding:") != std::string::npos &&
-            head.find("chunked") != std::string::npos) return false;
         if (head.find("content-encoding:") != std::string::npos) return false;
         auto ct = head.find("content-type:");
         if (ct == std::string::npos) return true;  // 缺失按文本处理（宽松检出）
@@ -135,6 +173,52 @@ private:
         for (auto* b : kBinary)
             if (head.find(b, ct) != std::string::npos) return false;
         return true;
+    }
+
+    // Transfer-Encoding: chunked 判定
+    static bool isChunked(const std::string& resp, size_t he) {
+        std::string head = resp.substr(0, he);
+        for (auto& c : head) c = (char)tolower((unsigned char)c);
+        return head.find("transfer-encoding:") != std::string::npos &&
+               head.find("chunked") != std::string::npos;
+    }
+
+    // 分块解帧：失败（截断/非法长度/超上限）返回 false，调用方保守跳过
+    static bool dechunk(const std::string& in, std::string& out) {
+        out.clear();
+        out.reserve(in.size());
+        size_t p = 0;
+        while (true) {
+            size_t e = in.find("\r\n", p);
+            if (e == std::string::npos) return false;
+            std::string sz = in.substr(p, e - p);
+            size_t sc = sz.find(';');   // 忽略 chunk 扩展
+            if (sc != std::string::npos) sz.resize(sc);
+            if (sz.empty() || sz.size() > 8) return false;
+            size_t n = 0;
+            for (char c : sz) {
+                int d = (c >= '0' && c <= '9') ? (c - '0')
+                        : (c >= 'a' && c <= 'f') ? (c - 'a' + 10)
+                        : (c >= 'A' && c <= 'F') ? (c - 'A' + 10) : -1;
+                if (d < 0) return false;
+                n = n * 16 + (size_t)d;
+                if (n > (size_t)(1 << 24)) return false;   // 单块 16MB 上限
+            }
+            p = e + 2;
+            if (n == 0) return true;                        // 结束块（忽略 trailer）
+            if (p + n > in.size()) return false;
+            out.append(in, p, n);
+            p += n;
+            if (in.compare(p, 2, "\r\n") != 0) return false;
+            p += 2;
+        }
+    }
+
+    // 单块重编码（保持 Transfer-Encoding: chunked 语义）
+    static std::string chunkedFrame(const std::string& body) {
+        char hdr[32];
+        std::snprintf(hdr, sizeof(hdr), "%zx", body.size());
+        return std::string(hdr) + "\r\n" + body + "\r\n0\r\n\r\n";
     }
 
     // ---- 确定性校验算法 ----
@@ -266,8 +350,8 @@ private:
         }
     }
 
-    int act_ = ACT_OFF;
-    size_t maxBytes_ = 1 << 20;  // 默认 1MB
+    std::atomic<int> act_{ACT_OFF};
+    std::atomic<size_t> maxBytes_{1 << 20};  // 默认 1MB
 };
 
 }  // namespace novawaf

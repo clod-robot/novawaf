@@ -4,6 +4,7 @@
 // 池满/未初始化时 submit 返回 false，调用方应回退到同步转发（保证不丢请求）。
 #pragma once
 
+#include "novawaf/api/api_asset.h"
 #include "novawaf/core/thread_pool.h"
 #include "novawaf/core/traffic_sink.h"
 #include "novawaf/core/waf_mode.h"
@@ -53,6 +54,7 @@ public:
         std::string referer;
         std::string country;
         std::string policyId;      // 命中的 API 防护策略 ID（按策略统计访问/拦截/放行次数）
+        std::string apiAssetKey;   // API 资产键：回写响应状态码到资产目录（IO 线程记账）
         bool        keepAlive = false;   // 客户端连接是否复用(keep-alive)
         // 上游不可达时的劫持跳转地址（通常是应用登录页）。非空则返回 302 而非 502，
         // 用于「访问不了的页面直接跳到对应应用登录页」的兜底体验。
@@ -227,6 +229,9 @@ private:
         setResponseConnection(outResp, ctx.keepAlive);
         normalizeServerHeader(outResp);
         BehaviorGuard::instance().noteStatus(ctx.clientIp, respStatus(outResp));
+        // API 资产目录：响应状态码分桶（404/5xx 占比是僵尸/异常接口的重要判据）
+        if (!ctx.apiAssetKey.empty())
+            ApiAssetRegistry::instance().noteStatus(ctx.apiAssetKey, respStatus(outResp));
         if (ctx.statsEnabled || !ctx.policyId.empty()) emitStat(ctx, respStatus(outResp), false);
         writeAll(ctx.clientFd, outResp);
         finishClient(ctx);

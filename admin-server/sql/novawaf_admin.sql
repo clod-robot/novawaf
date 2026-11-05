@@ -148,6 +148,107 @@ CREATE TABLE IF NOT EXISTS waf_geo_policy (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='GeoIP 地域访问策略(单行)';
 
+-- ---------- API 资产登记清单(引擎经 Redis novawaf:api:inventory 热加载；未登记=影子，长期无流量=僵尸) ----------
+CREATE TABLE IF NOT EXISTS waf_api_asset (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  app_id      VARCHAR(32)  DEFAULT NULL COMMENT '所属应用ID(NULL=全部应用)',
+  method      VARCHAR(16)  NOT NULL DEFAULT 'ANY' COMMENT '请求方法，ANY发布时展开全部方法',
+  path        VARCHAR(255) NOT NULL COMMENT '路径模板，支持 {id} 占位与末尾*通配',
+  name        VARCHAR(128) DEFAULT NULL COMMENT '资产名称',
+  owner       VARCHAR(64)  DEFAULT NULL COMMENT '责任人',
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否纳入已登记清单',
+  remark      VARCHAR(255) DEFAULT NULL COMMENT '备注',
+  create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_api_asset (app_id, method, path),
+  KEY idx_api_asset_app (app_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='API资产登记清单';
+
+-- ---------- API 级别限流/令牌策略(引擎经 Redis novawaf:api:guard 热加载) ----------
+CREATE TABLE IF NOT EXISTS waf_api_guard_rule (
+  id             BIGINT       NOT NULL AUTO_INCREMENT,
+  name           VARCHAR(64)  NOT NULL COMMENT '策略名称',
+  app_id         VARCHAR(32)  DEFAULT NULL COMMENT '所属应用ID(NULL=全部应用)',
+  method         VARCHAR(16)  NOT NULL DEFAULT 'ANY' COMMENT '请求方法，ANY=全部',
+  path           VARCHAR(255) NOT NULL COMMENT '路径，末尾*为前缀通配',
+  qps            INT          NOT NULL DEFAULT 10 COMMENT '每秒令牌数',
+  burst          INT          NOT NULL DEFAULT 20 COMMENT '突发桶容量',
+  scope          VARCHAR(16)  NOT NULL DEFAULT 'ip' COMMENT 'ip按IP/token按令牌/global全局',
+  action         VARCHAR(16)  NOT NULL DEFAULT '429' COMMENT 'monitor仅记录/429限流/ban封禁',
+  ban_sec        INT          NOT NULL DEFAULT 60 COMMENT '封禁秒数',
+  token_required TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否要求合法令牌',
+  enabled        TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用',
+  remark         VARCHAR(255) DEFAULT NULL,
+  create_time    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_api_guard (app_id, method, path),
+  KEY idx_api_guard_app (app_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='API级别限流策略';
+
+-- ---------- API 防护全局配置(单行 id=1；发布 novawaf:api:guard + novawaf:dlp:config) ----------
+CREATE TABLE IF NOT EXISTS waf_api_guard_config (
+  id                   BIGINT       NOT NULL COMMENT '固定为 1',
+  enabled              TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '限流总开关',
+  stage                VARCHAR(16)  NOT NULL DEFAULT 'monitor' COMMENT 'monitor观察期/enforce正式',
+  token_enabled        TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '令牌校验开关',
+  token_enforce        TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '严格拒绝(0=灰度只记录)',
+  token_mode           VARCHAR(16)  NOT NULL DEFAULT 'any' COMMENT 'jwt/opaque/any',
+  token_alg            VARCHAR(64)  DEFAULT 'HS256' COMMENT '允许算法，逗号分隔',
+  token_secret         VARCHAR(512) DEFAULT NULL COMMENT 'JWT HMAC 密钥(空=不校验签名)',
+  token_max_age        INT          NOT NULL DEFAULT 86400 COMMENT '令牌最大有效期(秒)',
+  token_require_iat    TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '是否强制 iat',
+  token_reuse_window   INT          NOT NULL DEFAULT 60 COMMENT '令牌复用检测窗口(秒)',
+  token_reuse_max_ips  INT          NOT NULL DEFAULT 8 COMMENT '窗口内最大来源IP数',
+  token_enforce_reuse  TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '复用异常是否直接401',
+  dlp_enabled          TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '响应脱敏开关',
+  dlp_action           VARCHAR(16)  NOT NULL DEFAULT 'mask' COMMENT 'mask脱敏/log记录/block拦截/off关闭',
+  dlp_max_bytes        BIGINT       NOT NULL DEFAULT 1048576 COMMENT '脱敏处理响应体上限(字节)',
+  update_time          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='API防护全局配置(单行)';
+
+-- ---------- 不透明令牌白名单(发布 Redis novawaf:api:tokens) ----------
+CREATE TABLE IF NOT EXISTS waf_api_token (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  name        VARCHAR(64)  NOT NULL COMMENT '令牌名称',
+  token       VARCHAR(512) NOT NULL COMMENT '完整令牌值',
+  app_id      VARCHAR(32)  DEFAULT NULL COMMENT '限定应用(NULL=全部)',
+  enabled     TINYINT(1)   NOT NULL DEFAULT 1 COMMENT '是否启用',
+  expire_time DATETIME     DEFAULT NULL COMMENT '过期时间(NULL=永久)',
+  remark      VARCHAR(255) DEFAULT NULL,
+  create_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  update_time DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_api_token (token)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='不透明令牌白名单';
+
+-- ---------- Agentic AI 引擎配置(单行 id=1；发布 novawaf:ai:agentic) ----------
+CREATE TABLE IF NOT EXISTS waf_agentic_config (
+  id               BIGINT       NOT NULL COMMENT '固定为 1',
+  enabled          TINYINT(1)   NOT NULL DEFAULT 0 COMMENT 'Agentic引擎开关',
+  block            TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1=拦截 0=仅告警',
+  threshold        DOUBLE       NOT NULL DEFAULT 0.6 COMMENT '判定阈值 0~1',
+  max_steps        INT          NOT NULL DEFAULT 4 COMMENT '代理循环最大步数',
+  budget_per_min   INT          NOT NULL DEFAULT 20 COMMENT '每分钟大模型调用预算',
+  cache_ttl_sec    INT          NOT NULL DEFAULT 300 COMMENT '指纹判定缓存TTL(秒)',
+  trace_max        INT          NOT NULL DEFAULT 2000 COMMENT '审计轨迹保留条数',
+  llm_enabled      TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '大模型接入开关',
+  llm_endpoint     VARCHAR(255) DEFAULT NULL COMMENT '大模型API完整地址',
+  llm_api_key      VARCHAR(512) DEFAULT NULL COMMENT 'API Key(接口返回脱敏)',
+  llm_model        VARCHAR(64)  DEFAULT NULL COMMENT '模型名',
+  llm_timeout_ms   INT          NOT NULL DEFAULT 8000 COMMENT '调用超时(毫秒)',
+  llm_max_retries  INT          NOT NULL DEFAULT 1 COMMENT '失败重试次数',
+  llm_max_tokens   INT          NOT NULL DEFAULT 512 COMMENT '最大输出token',
+  update_time      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agentic AI引擎配置(单行)';
+
+-- 单行配置初始种子：默认全部关闭，避免上线即拦截
+INSERT INTO waf_api_guard_config (id) VALUES (1) ON DUPLICATE KEY UPDATE id=id;
+INSERT INTO waf_agentic_config (id) VALUES (1) ON DUPLICATE KEY UPDATE id=id;
+
 -- ============================================================
 -- 初始数据: admin / Admin@2026 (BCrypt)
 -- ============================================================
@@ -181,13 +282,14 @@ INSERT INTO sys_menu (id, parent_id, menu_name, perms, type, path, component, so
  (13,10,'部署方式','system:deploy:view',2,'/common/deploy','common/Deploy',2),
  (14,10,'IP 组','waf:ipgroup:list',2,'/common/ipgroup','common/IpGroup',3),
  (15,10,'硬件加速','system:accel:list',2,'/common/accel','common/Accel',4),
- (16,15,'加速配置修改','system:accel:edit',3,NULL,NULL,1)
+ (16,15,'加速配置修改','system:accel:edit',3,NULL,NULL,1),
+ (17,11,'API资产与防护','waf:apiasset:list',2,'/common/protect/api-assets','common/ApiAssets',2)
  ON DUPLICATE KEY UPDATE menu_name=VALUES(menu_name);
 
 -- admin 全部菜单; auditor 只读(1,3,5,9); operator 规则/ioc
 -- 部署方式(13)/IP 组(14)/硬件加速(15,16) 仅授予 admin：HA 编辑、地域拦截与加速开关均属高危运维操作
 INSERT INTO sys_role_menu (role_id, menu_id) VALUES
- (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),(1,10),(1,11),(1,12),(1,13),(1,14),(1,15),(1,16),
+ (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),(1,10),(1,11),(1,12),(1,13),(1,14),(1,15),(1,16),(1,17),
  (2,1),(2,3),(2,5),(2,9),
  (3,1),(3,4),(3,5)
  ON DUPLICATE KEY UPDATE menu_id=VALUES(menu_id);

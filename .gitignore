@@ -33,3 +33,4 @@ __pycache__/
 # 前端构建产物
 admin-web/dist/
 
+release-staging/
