@@ -1,0 +1,17 @@
+<!-- WinSW 服务描述符（由 install.ps1 替换占位符后写入安装目录） -->
+<service>
+  <id>{{SERVICE_NAME}}</id>
+  <name>{{SERVICE_NAME}}</name>
+  <description>NovaWAF 管理控制台 (1.1.2-rc.1) — 内嵌前端，单 jar 提供 API + Web UI</description>
+  <executable>{{JAVA_EXE}}</executable>
+  <arguments>-Xms256m -Xmx1024m -jar "{{INSTALL_DIR}}\novawaf-admin.jar" --server.port={{PORT}} --spring.config.additional-location=file:{{INSTALL_DIR}}\config\</arguments>
+  <workingdirectory>{{INSTALL_DIR}}</workingdirectory>
+  <logmode>rotate</logmode>
+  <logpath>{{INSTALL_DIR}}\logs</logpath>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="15 sec"/>
+  <onfailure action="none"/>
+  <serviceaccount>
+    <username>LocalSystem</username>
+  </serviceaccount>
+</service>

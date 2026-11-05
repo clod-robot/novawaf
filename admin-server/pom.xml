@@ -13,7 +13,7 @@
 
     <groupId>com.novawaf</groupId>
     <artifactId>novawaf-admin</artifactId>
-    <version>1.1.1-rc.2</version>
+    <version>1.1.2-rc.1</version>
     <packaging>jar</packaging>
     <name>novawaf-admin</name>
     <description>NovaWAF management console (Spring Boot 3 / JDK21)</description>
@@ -100,6 +100,29 @@
     <build>
         <finalName>novawaf-admin</finalName>
         <plugins>
+            <!-- 将 admin-web/dist 打入 jar 的 BOOT-INF/classes/static，单 jar 即可同时提供 API 与前端，
+                 便于 Windows 部署（无需 nginx）。dist 不存在时跳过，不影响 Linux 分离部署。 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>embed-frontend</id>
+                        <phase>process-resources</phase>
+                        <goals><goal>copy-resources</goal></goals>
+                        <configuration>
+                            <outputDirectory>${project.build.outputDirectory}/static</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/../admin-web/dist</directory>
+                                    <filtering>false</filtering>
+                                </resource>
+                            </resources>
+                            <includeEmptyDirs>false</includeEmptyDirs>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>

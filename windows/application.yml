@@ -1,0 +1,49 @@
+# NovaWAF 管理端 Windows 配置模板（由 install.ps1 生成到 <install>\config\application.yml）
+server:
+  port: 18081
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: novawaf-admin
+  datasource:
+    url: jdbc:mysql://{{MYSQL_HOST}}:{{MYSQL_PORT}}/{{MYSQL_DB}}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: {{MYSQL_USER}}
+    password: {{MYSQL_PASSWORD}}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 2
+  data:
+    redis:
+      host: {{REDIS_HOST}}
+      port: {{REDIS_PORT}}
+      password: {{REDIS_PASSWORD}}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+nova:
+  jwt:
+    secret: {{JWT_SECRET}}
+    expire-minutes: 120
+  admin:
+    init-password: Admin@2026
+  cors:
+    allowed-origins: "*"
+  deploy:
+    detect-script: ""
+  ipgroup:
+    threat-script: ""
+    fetch-script: ""
+
+logging:
+  level:
+    com.novawaf: INFO

@@ -40,9 +40,15 @@ public class SseStreamService {
 
     @PostConstruct
     public void start() {
-        // 初始化游标：启动时已存在的事件不再补发，只推之后新增的
-        Long len = redis.opsForList().size("novawaf:events");
-        lastEventIdx = len == null ? 0 : len;
+        // 初始化游标：启动时已存在的事件不再补发，只推之后新增的。
+        // Redis 暂不可用时不阻塞管理端启动（Windows 安装场景下 Redis 可能稍后就绪），
+        // 后续广播循环会自然恢复游标。
+        try {
+            Long len = redis.opsForList().size("novawaf:events");
+            lastEventIdx = len == null ? 0 : len;
+        } catch (Exception e) {
+            lastEventIdx = 0;
+        }
         pool = Executors.newScheduledThreadPool(1, r -> {
             Thread t = new Thread(r, "sse-broadcaster");
             t.setDaemon(true);

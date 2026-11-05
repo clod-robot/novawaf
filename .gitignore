@@ -33,4 +33,7 @@ __pycache__/
 # 前端构建产物
 admin-web/dist/
 
+# Windows 发行包构建产物
+dist-windows/
+
 release-staging/
