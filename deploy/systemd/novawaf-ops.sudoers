@@ -1,0 +1,3 @@
+# NovaWAF 管理端(mao) 仅允许以 root 执行引擎运维脚本（固定路径，无通配符、免密）
+# 安装: install -m 0440 -o root -g root novawaf-ops.sudoers /etc/sudoers.d/novawaf-ops
+mao ALL=(root) NOPASSWD: /opt/novawaf/bin/engine_ops.sh

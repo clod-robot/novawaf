@@ -1,19 +1,28 @@
 [Unit]
-Description=NovaWAF Detection Engine
-After=network.target
+Description=NovaWAF Engine (reverse-proxy WAF on :8099, master/worker supervise)
+After=network-online.target redis.service
+Wants=network-online.target
+# 永远不让它因反复失败被 systemd 放弃
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=root
-# 可信反向代理(网关)IP/CIDR，逗号分隔；仅命中才采信 X-Forwarded-For/X-Real-IP。网关与引擎同机填 127.0.0.1
-Environment=NOVA_TRUSTED_PROXIES=127.0.0.1
-# 密钥（NOVA_REDIS_PASS 等）统一由环境文件注入（权限600，勿入库）
-EnvironmentFile=-/etc/novawaf/novawaf.env
-ExecStart=/opt/novawaf/novawaf-engine 8080
+User=mao
+Group=mao
+WorkingDirectory=/home/mao/novawaf/engine
+# 引擎环境变量集中在此文件（密钥不入库，权限 root:mao 0640）：
+#   NOVA_REDIS_HOST/NOVA_REDIS_PASS/NOVA_TRUSTED_PROXIES/NOVA_SLOW_REQ_MS/
+#   NOVA_YARA_RULES/NOVA_STATS_FLUSH_MS/NOVA_RMI_GUARD_*/NOVA_RUN_DIR 等
+EnvironmentFile=-/etc/novawaf/novawaf-engine.env
+# current 为版本符号链接（/opt/novawaf/engine/current -> versions/<ver>/novawaf-engine）。
+# --supervise = nginx 式 master/worker：SIGUSR2 零停机滚动重启，管理端一键升级/回退依赖它。
+ExecStart=/opt/novawaf/engine/current --supervise 8099 4
 Restart=always
-RestartSec=3
-LimitNOFILE=655350
-# 检测引擎故障自动 Bypass 由网关层 fail-open 保证
+RestartSec=1
+# 资源保护：防异常内存吃光导致整机死机
+MemoryMax=1024M
+MemoryHigh=768M
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

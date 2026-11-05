@@ -23,6 +23,7 @@ const routes = [
       { path: 'common/accel', component: () => import('../views/Accel.vue'), meta: { perm: 'system:accel:list', title: '硬件加速' } },
       { path: 'system/user', component: () => import('../views/Users.vue'), meta: { perm: 'sys:user:list', title: '用户管理' } },
       { path: 'system/log', component: () => import('../views/AuditLog.vue'), meta: { perm: 'sys:log:list', title: '审计日志' } },
+      { path: 'system/ops', component: () => import('../views/SystemOps.vue'), meta: { perm: 'system:ops:view', title: '系统维护' } },
       { path: 'system/settings', component: () => import('../views/Settings.vue'), meta: { perm: 'system:settings:list', title: '系统设置' } }
     ]
   }

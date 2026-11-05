@@ -6,6 +6,11 @@ server:
 spring:
   application:
     name: novawaf-admin
+  servlet:
+    multipart:
+      # 引擎二进制在线上传（系统维护-一键升级）
+      max-file-size: 256MB
+      max-request-size: 256MB
   datasource:
     url: jdbc:mysql://${NOVA_MYSQL_HOST:127.0.0.1}:${NOVA_MYSQL_PORT:3306}/${NOVA_MYSQL_DB:novawaf_admin}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
     username: ${NOVA_MYSQL_USER:novawaf}
@@ -50,6 +55,12 @@ nova:
     # 后台“一键探测”调起的 NAT 探测脚本固定绝对路径(无 shell、带超时、输出封顶)；留空则禁用一键探测
     detect-script: ${NOVA_DETECT_SCRIPT:/opt/novawaf/scripts/detect_nat.py}
     detect-timeout-ms: 10000
+  ops:
+    # 引擎版本化运维脚本（固定 argv 经 sudo 免密调用；版本目录/符号链接状态的唯一真值源）
+    script: ${NOVA_OPS_SCRIPT:/opt/novawaf/bin/engine_ops.sh}
+    root: ${NOVA_ENGINE_ROOT:/opt/novawaf/engine}
+    sudo: ${NOVA_OPS_SUDO:true}
+    max-upload-mb: 256
   ipgroup:
     # 威胁情报收集器（12 个公开源汇总，支持 -o 输出文件）与自定义源拉取脚本；均固定 argv 受控执行
     threat-script: ${NOVA_THREAT_SCRIPT:/opt/novawaf/scripts/collect_malicious_ips.py}

@@ -88,18 +88,38 @@ if (-not $NotesOnly) {
         }
         Write-Host '[2] sources uploaded'
 
-        $r = Invoke-SSHCommand -SessionId $s.SessionId -TimeOut 600 -Command 'cd /home/mao/novawaf/engine && g++ -std=c++20 -O2 -Wno-unused-parameter -pthread -I include src/main.cpp -o /tmp/novawaf-engine.new -ldl -lyara 2>&1 | tail -10 && cd /home/mao/novawaf/admin-server && mvn -q package -DskipTests 2>&1 | tail -4 && echo BUILD_OK'
+        $r = Invoke-SSHCommand -SessionId $s.SessionId -TimeOut 600 -Command 'cd /home/mao/novawaf/engine && g++ -std=c++20 -O2 -Wno-unused-parameter -pthread -I include src/main.cpp -o /tmp/novawaf-engine.new -ldl -lyara -lnghttp2 -lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lssl -lcrypto -rdynamic 2>&1 | tail -10 && cd /home/mao/novawaf/admin-server && mvn -q package -DskipTests 2>&1 | tail -4 && echo BUILD_OK'
         $r.Output | ForEach-Object { Write-Host $_ }
         if ($r.Output -notcontains 'BUILD_OK') { throw 'server build failed' }
         Write-Host '[2] server build OK (engine + admin jar)'
 
         if (-not $SkipDeploy) {
+            # 版本化零停机部署：ops 脚本/sudoers/systemd 单元就位 → 安装新版本 →
+            # 已迁移过(current 符号链接存在)走 activate 滚动切换；首迁走 bootstrap。
+            Set-SFTPItem -SessionId $sf.SessionId -Path (Join-Path $repo 'scripts\engine_ops.sh') -Destination '/home/mao' -Force
+            Set-SFTPItem -SessionId $sf.SessionId -Path (Join-Path $repo 'deploy\systemd\novawaf-ops.sudoers') -Destination '/home/mao' -Force
+            Set-SFTPItem -SessionId $sf.SessionId -Path (Join-Path $repo 'deploy\systemd\novawaf-engine.service') -Destination '/home/mao' -Force
             $deploy = @'
-echo "$SUDOPW" | sudo -S -p '' systemctl stop novawaf-engine
-sleep 1
-echo "$SUDOPW" | sudo -S -p '' cp /tmp/novawaf-engine.new /home/mao/novawaf/bin/novawaf-engine
-echo "$SUDOPW" | sudo -S -p '' chown mao:mao /home/mao/novawaf/bin/novawaf-engine
-echo "$SUDOPW" | sudo -S -p '' systemctl start novawaf-engine
+set -e
+echo "$SUDOPW" | sudo -S -p '' mkdir -p /opt/novawaf/bin /opt/novawaf/run /opt/novawaf/engine/versions /opt/novawaf/engine/uploads
+echo "$SUDOPW" | sudo -S -p '' chown mao:mao /opt/novawaf/engine/uploads
+echo "$SUDOPW" | sudo -S -p '' install -m 0755 -o root -g root /home/mao/engine_ops.sh /opt/novawaf/bin/engine_ops.sh
+echo "$SUDOPW" | sudo -S -p '' install -m 0440 -o root -g root /home/mao/novawaf-ops.sudoers /etc/sudoers.d/novawaf-ops
+cp /tmp/novawaf-engine.new /opt/novawaf/engine/uploads/release.bin
+chmod 755 /opt/novawaf/engine/uploads/release.bin
+VER=$(/opt/novawaf/engine/uploads/release.bin --version | head -n1)
+echo "release version: $VER"
+echo "$SUDOPW" | sudo -S -p '' /opt/novawaf/bin/engine_ops.sh install /opt/novawaf/engine/uploads/release.bin
+if [ -L /opt/novawaf/engine/current ]; then
+  echo "$SUDOPW" | sudo -S -p '' /opt/novawaf/bin/engine_ops.sh activate "$VER"
+else
+  # 首次迁移：建立 current 符号链接，换装 master/worker 监管单元
+  echo "$SUDOPW" | sudo -S -p '' ln -sfn /opt/novawaf/engine/versions/$VER/novawaf-engine /opt/novawaf/engine/current
+  echo "$SUDOPW" | sudo -S -p '' install -m 0644 -o root -g root /home/mao/novawaf-engine.service /etc/systemd/system/novawaf-engine.service
+  echo "$SUDOPW" | sudo -S -p '' systemctl daemon-reload
+  echo "$SUDOPW" | sudo -S -p '' systemctl restart novawaf-engine
+  sleep 5
+fi
 echo "$SUDOPW" | sudo -S -p '' systemctl restart novawaf-admin
 sleep 6
 systemctl is-active novawaf-engine
@@ -114,7 +134,7 @@ echo DEPLOY_OK
 
         # artifacts
         New-Item -ItemType Directory -Force -Path $stage | Out-Null
-        Get-SFTPItem -SessionId $sf.SessionId -Path '/home/mao/novawaf/bin/novawaf-engine' -Destination $stage -Force
+        Get-SFTPItem -SessionId $sf.SessionId -Path '/tmp/novawaf-engine.new' -Destination $stage -Force
         Get-SFTPItem -SessionId $sf.SessionId -Path '/home/mao/novawaf/admin-server/target/novawaf-admin.jar' -Destination $stage -Force
         Remove-SFTPSession -SessionId $sf.SessionId | Out-Null
         Remove-SSHSession  -SessionId $s.SessionId  | Out-Null

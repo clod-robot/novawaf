@@ -19,7 +19,7 @@
 #include "novawaf/detect/regex_patch.h"
 
 // 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
-#define NOVAWAF_VERSION "1.1.2-rc.1"
+#define NOVAWAF_VERSION "1.2.0-rc.1"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -46,6 +46,11 @@
 #include "novawaf/limit/rate_limiter.h"
 #include "novawaf/limit/endpoint_rate_guard.h"
 #include "novawaf/net/http_parser.h"
+#include "novawaf/net/tls_context.h"
+#include "novawaf/net/bridge.h"
+#include "novawaf/net/h2_session.h"
+#include "novawaf/net/tls_conn.h"
+#include "novawaf/net/h3_server.h"
 #include "novawaf/ddos/ddos_guard.h"
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
@@ -74,6 +79,8 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
+#include <poll.h>
 
 #include <atomic>
 #include <chrono>
@@ -92,6 +99,11 @@
 using namespace novawaf;
 
 static std::atomic<bool> g_running{true};
+
+// SIGQUIT/SIGTERM/SIGINT 优雅排空请求（drain）：各 reactor 停止接受新连接，
+// 刷完在途响应后退出（零停机滚动重启由 master 先发 SIGQUIT 给旧 worker）。
+static volatile sig_atomic_t g_drainReq = 0;
+static void onDrainSignal(int) { g_drainReq = 1; }
 
 // 热路径调试日志开关：默认关闭。printf 内部持有 libc 全局 stdout 锁，
 // 高并发下每个拦截请求都 printf 会把所有 reactor 串行化，严重损耗多核扩展。
@@ -248,6 +260,11 @@ static bool isTrustedProxy(const std::string& peerIp) {
     return false;
 }
 
+// bridge.h 声明的受信代理判断（单 TU 构建，桥接层回调用）
+namespace novawaf {
+bool novaTrustedProxy(const std::string& ip) { return isTrustedProxy(ip); }
+}
+
 // 把一段文本按行切分（用于 Redis 返回的整文件内容）
 static std::vector<std::string> splitLines(const std::string& blob) {
     std::vector<std::string> lines;
@@ -310,7 +327,7 @@ static std::vector<std::string> loadDataLines(const char* redisKey,
     return lines;
 }
 
-static int createListenFd(int port, int backlog) {
+static int createListenFd(int port, int backlog, const char* bindAddr = nullptr) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int opt = 1;
@@ -320,11 +337,31 @@ static int createListenFd(int port, int backlog) {
     addr.sin_family = AF_INET;
     // NOVA_LISTEN_ADDR 指定绑定地址（默认 0.0.0.0 兼容旧部署）。生产应设 127.0.0.1：
     // 引擎只接受同机 nginx 反代流量，杜绝绕过 443 直连 WAF 端口的暴露面。
-    const char* bindIp = getenv("NOVA_LISTEN_ADDR");
+    // bindAddr 显式指定时优先（TLS 公网监听走 NOVA_TLS_ADDR，不回退 NOVA_LISTEN_ADDR）。
+    const char* bindIp = (bindAddr && *bindAddr) ? bindAddr : getenv("NOVA_LISTEN_ADDR");
     addr.sin_addr.s_addr = (bindIp && *bindIp) ? inet_addr(bindIp) : htonl(INADDR_ANY);
     addr.sin_port = htons(port);
     if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     if (listen(fd, backlog) < 0) { close(fd); return -1; }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    return fd;
+}
+
+// UDP (QUIC/h3) 监听：SO_REUSEPORT 每 reactor 一个套接字，内核对 4 元组分流，
+// 同一会话的数据包稳定落到同一 reactor（连接迁移不做）。
+static int createUdpFd(int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    // h3 是公网入口，默认 0.0.0.0；NOVA_H3_ADDR 可收紧
+    const char* bindIp = getenv("NOVA_H3_ADDR");
+    addr.sin_addr.s_addr = (bindIp && *bindIp) ? inet_addr(bindIp) : htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     return fd;
 }
@@ -513,10 +550,59 @@ static int nextRequest(const std::string& buf, std::string& rawReq, size_t& tota
          p = buf.find("\r\n", p + 2)) ++nHeaders;
     if (nHeaders > maxHeaders) return -3;
     std::string head = buf.substr(0, he);
+    std::string low = head;
+    for (auto& c : low) c = (char)tolower((unsigned char)c);
+    // Transfer-Encoding: chunked 优先于 Content-Length（RFC 9112 §6.3）。
+    // 逐 chunk 扫描出完整帧边界；解码后总长超 maxBody 按 -2 拒绝。
+    bool chunked = false;
+    {
+        size_t p = low.find("transfer-encoding:");
+        if (p != std::string::npos) {
+            size_t e = low.find("\r\n", p);
+            std::string v = low.substr(p + 18, (e == std::string::npos ? low.size() : e) - (p + 18));
+            chunked = v.find("chunked") != std::string::npos;
+        }
+    }
+    if (chunked) {
+        size_t pos = he + 4;
+        size_t decoded = 0;
+        while (true) {
+            size_t eol = buf.find("\r\n", pos);
+            if (eol == std::string::npos) return 0;          // size 行未到齐
+            if (eol == pos || eol - pos > 32) return -1;     // 空/畸形超长 size 行
+            unsigned long long csz = 0;
+            bool any = false;
+            for (size_t i = pos; i < eol; ++i) {
+                char ch = buf[i];
+                if (ch == ';') break;                        // chunk 扩展忽略
+                int d;
+                if (ch >= '0' && ch <= '9') d = ch - '0';
+                else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+                else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+                else if (ch == ' ' || ch == '\t') continue;
+                else return -1;
+                csz = csz * 16 + (unsigned)d;
+                any = true;
+                if (csz > (1ULL << 40)) return -2;           // 防乘法溢出
+            }
+            if (!any) return -1;
+            if (csz == 0) {
+                // 末块后 trailer（可为空）：帧尾 = 首个空行结束
+                size_t t = buf.find("\r\n\r\n", pos);
+                if (t == std::string::npos) return 0;        // trailer 未到齐
+                totalLen = t + 4;
+                rawReq = buf.substr(0, totalLen);
+                return 1;
+            }
+            decoded += (size_t)csz;
+            if (decoded > maxBody) return -2;
+            size_t dataEnd = eol + 2 + (size_t)csz;
+            if (dataEnd + 2 > buf.size()) return 0;          // 数据+尾 CRLF 未到齐
+            pos = dataEnd + 2;
+        }
+    }
     long long bodyLen = -1;
     {   // 解析 Content-Length（大小写不敏感）
-        std::string low = head;
-        for (auto& c : low) c = (char)tolower((unsigned char)c);
         size_t p = low.find("content-length:");
         if (p != std::string::npos) {
             size_t e = low.find("\r\n", p);
@@ -596,8 +682,10 @@ static void setRespConnection(std::string& resp, bool keepAlive) {
     resp = out + "\r\n" + body;
 }
 
-// 单 Reactor 线程：监听 + 读请求 + 检测 + 简单回包（演示版）
-static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
+// 单 Reactor 线程：h1 明文 + TLS(h1/h2) + QUIC(h3) 监听 + 读请求 + 检测 + 回包。
+// TLS/QUIC 请求经 H1Bridge 回环进本 reactor 的 h1 检测端口（唯一检测真值源）。
+static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, SSL_CTX* quicCtx,
+                        int h1Port, DetectionPipeline& pipeline,
                         RateLimiter& limiter, DdosGuard& ddos,
                         const std::shared_ptr<AiDetector>& ai,
                         CcGuard& cc, BotGuard& bot,
@@ -608,6 +696,34 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
     ev.events = EPOLLIN;
     ev.data.fd = listenFd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, listenFd, &ev);
+
+    // TLS (h1/h2) 公网监听：每 reactor SO_REUSEPORT 独立套接字
+    int tlsFd = -1;
+    if (tlsCtx && tlsPort > 0) {
+        const char* ta = getenv("NOVA_TLS_ADDR");
+        tlsFd = createListenFd(tlsPort, 16384, (ta && *ta) ? ta : "0.0.0.0");
+        if (tlsFd >= 0) {
+            epoll_event lev{};
+            lev.events = EPOLLIN;
+            lev.data.fd = tlsFd;
+            epoll_ctl(epfd, EPOLL_CTL_ADD, tlsFd, &lev);
+        } else {
+            std::fprintf(stderr, "[reactor %d] tls listen :%d failed\n", idx, tlsPort);
+        }
+    }
+    // QUIC (h3) 公网 UDP 监听
+    int quicFd = -1;
+    if (quicCtx && h3Port > 0) {
+        quicFd = createUdpFd(h3Port);
+        if (quicFd >= 0) {
+            epoll_event qev{};
+            qev.events = EPOLLIN;
+            qev.data.fd = quicFd;
+            epoll_ctl(epfd, EPOLL_CTL_ADD, quicFd, &qev);
+        } else {
+            std::fprintf(stderr, "[reactor %d] quic udp :%d failed\n", idx, h3Port);
+        }
+    }
 
     std::vector<epoll_event> events(1024);
 
@@ -658,6 +774,16 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now().time_since_epoch()).count(); };
 
+    // ---- TLS/QUIC 桥接层（per-reactor，无锁，仅本线程驱动）----
+    // TLS/QUIC 侧解析出的请求合成为标准 h1 字节，经回环连接池送入本 reactor 的
+    // h1 检测端口（唯一检测真值源），响应按来源协议回帧。bridge 须先声明
+    // （TlsConn/H3Server 持其引用）；回调统一带 weak 存活令牌，任意析构顺序安全。
+    H1Bridge bridge(epfd, (uint16_t)h1Port);
+    std::unordered_map<int, std::unique_ptr<TlsConn>> tlsConns;
+    std::unique_ptr<H3Server> h3;
+    if (quicFd >= 0 && quicCtx)
+        h3 = std::make_unique<H3Server>(quicFd, quicCtx, bridge, kMaxBody);
+
     // 关闭并清理一条客户端连接（reactor 线程与异步完成回调共用，幂等）
     auto closeConn = [&](int cfd) {
         {
@@ -685,8 +811,43 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
 
     std::printf("[reactor %d] started\n", idx);
 
+    // 优雅排空（SIGQUIT/SIGTERM）：停接受新连接 → 刷完在途响应 → 退出（30s 兜底）
+    // 命名 drainMode：内层请求写路径另有局部 draining（EPOLLOUT 背压语义），避免遮蔽。
+    bool drainMode = false;
+    int64_t drainStartMs = 0;
     while (g_running) {
-        int n = epoll_wait(epfd, events.data(), (int)events.size(), 200);
+        if (g_drainReq && !drainMode) {
+            drainMode = true;
+            drainStartMs = nowMs();
+            epoll_ctl(epfd, EPOLL_CTL_DEL, listenFd, nullptr);
+            close(listenFd);
+            listenFd = -1;
+            if (tlsFd >= 0) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, tlsFd, nullptr);
+                close(tlsFd);
+                tlsFd = -1;
+            }
+            // quicFd 只从 epoll 摘除不 close：h3->sweep() 仍需它 sendto 刷写在途响应
+            if (quicFd >= 0) epoll_ctl(epfd, EPOLL_CTL_DEL, quicFd, nullptr);
+            std::printf("[reactor %d] draining\n", idx);
+        }
+        if (drainMode) {
+            bool h1Idle;
+            {
+                std::lock_guard<std::mutex> lk(busyMtx);
+                h1Idle = conns.empty() && busy.empty();
+            }
+            bool drained = h1Idle && tlsConns.empty() && bridge.inFlight() == 0 &&
+                           (!h3 || h3->connCount() == 0);
+            if (drained || nowMs() - drainStartMs > 30000) break;
+        }
+        // epoll 超时向 h3 最近到期时间收敛（QUIC 重传/idle 定时器）
+        int epTimeout = 200;
+        if (h3) {
+            int ms = h3->msToNextExpiry();
+            if (ms >= 0 && ms < epTimeout) epTimeout = ms;
+        }
+        int n = epoll_wait(epfd, events.data(), (int)events.size(), epTimeout);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == tfd) { uint64_t exp; while (read(tfd, &exp, 8) > 0) {} continue; }
@@ -737,6 +898,74 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     { std::lock_guard<std::mutex> lk(busyMtx); conns[cfd].lastActiveMs = nowMs(); }
                 }
                 continue;
+            }
+            // TLS 公网入口 accept：ALPN 协商 h2 / http/1.1，会话委托 TlsConn
+            if (tlsFd >= 0 && fd == tlsFd) {
+                while (true) {
+                    sockaddr_in caddr{};
+                    socklen_t clen = sizeof(caddr);
+                    int cfd = accept(tlsFd, (sockaddr*)&caddr, &clen);
+                    if (cfd < 0) break;
+                    char ipstr[32] = {0};
+                    inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
+                    // 与 h1 accept 对称：受信反代豁免连接级计数（前置代理见 h1 分支注释）
+                    if (!isTrustedProxy(ipstr) && !ddos.onConnect(ipstr)) {
+                        close(cfd);
+                        continue;
+                    }
+                    setNonblock(cfd);
+                    int one = 1;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    SSL* ssl = SSL_new(tlsCtx);
+                    if (!ssl) {
+                        if (!isTrustedProxy(ipstr)) ddos.onDisconnect(ipstr);
+                        close(cfd);
+                        continue;
+                    }
+                    SSL_set_fd(ssl, cfd);
+                    epoll_event ce{};
+                    ce.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+                    ce.data.fd = cfd;
+                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ce) < 0) {
+                        if (!isTrustedProxy(ipstr)) ddos.onDisconnect(ipstr);
+                        SSL_free(ssl);
+                        close(cfd);
+                        continue;
+                    }
+                    auto tc = std::make_unique<TlsConn>(cfd, ssl, epfd, bridge,
+                                                        std::string(ipstr), kMaxBody);
+                    TlsConn* raw = tc.get();
+                    tlsConns[cfd] = std::move(tc);
+                    raw->onEvent(EPOLLIN);  // 触发非阻塞握手（内部按 WANT_READ/WRITE 订阅）
+                    if (raw->closed()) {    // 握手立即失败
+                        if (!isTrustedProxy(ipstr)) ddos.onDisconnect(ipstr);
+                        tlsConns.erase(cfd);
+                    }
+                }
+                continue;
+            }
+            // QUIC 数据报入口（h3）
+            if (quicFd >= 0 && fd == quicFd) {
+                if (h3) h3->onReadable();
+                continue;
+            }
+            // 桥回环连接事件
+            if (bridge.owns(fd)) {
+                bridge.onEvent(fd, events[i].events);
+                continue;
+            }
+            // TLS 会话事件
+            {
+                auto tit = tlsConns.find(fd);
+                if (tit != tlsConns.end()) {
+                    tit->second->onEvent(events[i].events);
+                    if (tit->second->closed()) {
+                        const std::string& pip = tit->second->peerIp();
+                        if (!isTrustedProxy(pip)) ddos.onDisconnect(pip);
+                        tlsConns.erase(tit);
+                    }
+                    continue;
+                }
             }
             // 单连接处理异常护栏：资源耗尽等异常只丢弃该连接，绝不让异常逃逸到
             // reactor 线程触发 std::terminate/abort（保证高并发下进程可用性）。
@@ -1575,6 +1804,9 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                     }
                     // 无在途请求的空闲 keep-alive 连接回收
                     if (now - st.lastActiveMs > kKeepAliveIdleMs) stale.push_back({cfd, false});
+                    // drain 模式：无在途请求的连接立即关闭（不等 15s idle），加速排空
+                    else if (drainMode && st.inbuf.empty() && st.outQ.empty())
+                        stale.push_back({cfd, false});
                 }
             }  // 先释放锁，再逐个关闭（closeConn 自身会加锁）
             for (auto [cfd, slow] : stale) {
@@ -1594,15 +1826,201 @@ static void reactorLoop(int listenFd, DetectionPipeline& pipeline,
                 closeConn(cfd);
             }
         }
+        // 桥回环连接池周期回收（超时在途 + 闲置连接）
+        bridge.sweep(nowMs());
+        // h3 到期处理/刷写/回收（drain 期间 quicFd 已摘出 epoll，此处继续把在途响应发完）
+        if (h3) h3->sweep();
+        // drain 模式：无在途请求的 TLS 空闲连接立即关闭
+        if (drainMode) {
+            for (auto it = tlsConns.begin(); it != tlsConns.end();) {
+                if (it->second->idle()) {
+                    const std::string& pip = it->second->peerIp();
+                    if (!isTrustedProxy(pip)) ddos.onDisconnect(pip);
+                    it = tlsConns.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
     }              // end while(g_running)
+    // 收尾：先关桥（触发在途失败回调，此时 tlsConns/h3 仍存活、回调可安全落地），
+    // 再销毁 TLS/h3 会话；weak 存活令牌兜底任意顺序。
+    bridge.closeAll();
+    tlsConns.clear();
+    h3.reset();
+    if (tlsFd >= 0) close(tlsFd);
+    if (quicFd >= 0) close(quicFd);
     close(tfd);
     close(epfd);
 }
 
-int main(int argc, char** argv) {
-    int port = (argc > 1) ? atoi(argv[1]) : 8080;
-    int threads = (argc > 2) ? atoi(argv[2]) : (int)std::thread::hardware_concurrency();
+// ---- master/worker 监管（nginx 式零停机滚动重启）----
+// master 不监听业务端口：spawn worker（pipe + NOVA_READY_FD 等 "READY"），
+// SIGUSR2 → 滚动重启（先启新 worker，READY 后 SIGQUIT 旧 worker 排空；
+// 新旧 worker 经 SO_REUSEPORT 重叠监听，切换零丢包）；
+// SIGCHLD → worker 意外退出自动拉起；SIGTERM/INT/QUIT → SIGQUIT worker 后退出。
+static pid_t spawnWorker(char** argv, int port, int threads) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        // 子进程：就绪通知写端保留为 NOVA_READY_FD（注意不能用 CLOEXEC）
+        close(pipefd[0]);
+        char fdStr[16];
+        std::snprintf(fdStr, sizeof(fdStr), "%d", pipefd[1]);
+        setenv("NOVA_READY_FD", fdStr, 1);
+        char p[16], t[16];
+        std::snprintf(p, sizeof(p), "%d", port);
+        std::snprintf(t, sizeof(t), "%d", threads);
+        char* args[] = {argv[0], (char*)"--worker", p, t, nullptr};
+        execvp(argv[0], args);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    // 父进程：等 worker 全 reactor 监听就绪（最多 30s）
+    pollfd pfd{};
+    pfd.fd = pipefd[0];
+    pfd.events = POLLIN;
+    int rv = poll(&pfd, 1, 30000);
+    char buf[32] = {0};
+    if (rv > 0 && (pfd.revents & POLLIN)) (void)!read(pipefd[0], buf, sizeof(buf) - 1);
+    close(pipefd[0]);
+    if (std::strstr(buf, "READY") == nullptr) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+        return -1;
+    }
+    return pid;
+}
+
+static int superviseMain(int argc, char** argv) {
+    int port = (argc > 2) ? atoi(argv[2]) : 8080;
+    int threads = (argc > 3) ? atoi(argv[3]) : (int)std::thread::hardware_concurrency();
     signal(SIGPIPE, SIG_IGN);
+
+    // pidfile：ops 脚本/管理端据此发 SIGUSR2（滚动重启）/SIGTERM（停机）。
+    // NOVA_RUN_DIR 显式指定运维目录（生产 /opt/novawaf/run）；缺省回退 $HOME/novawaf/run。
+    const char* rd = getenv("NOVA_RUN_DIR");
+    std::string runDir = (rd && *rd)
+        ? rd
+        : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/novawaf/run";
+    mkdir(runDir.c_str(), 0755);  // 多级目录由部署脚本保证，此处兜底单层
+    std::string pidPath = runDir + "/engine-master.pid";
+    {
+        std::ofstream pf(pidPath);
+        pf << (int)getpid() << "\n";
+    }
+
+    static volatile sig_atomic_t gotUsr2 = 0, gotChld = 0, gotTerm = 0;
+    struct sigaction sa{};
+    sa.sa_handler = [](int) { gotUsr2 = 1; };
+    sigaction(SIGUSR2, &sa, nullptr);
+    sa.sa_handler = [](int) { gotChld = 1; };
+    sigaction(SIGCHLD, &sa, nullptr);
+    sa.sa_handler = [](int) { gotTerm = 1; };
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGQUIT, &sa, nullptr);
+
+    pid_t worker = spawnWorker(argv, port, threads);
+    if (worker < 0) {
+        std::fprintf(stderr, "[master] initial worker spawn failed\n");
+        unlink(pidPath.c_str());
+        return 1;
+    }
+    std::printf("[master] pid=%d worker=%d port=%d threads=%d (SIGUSR2=滚动重启)\n",
+                (int)getpid(), (int)worker, port, threads);
+    std::fflush(stdout);
+
+    pid_t retiring = -1;  // 滚动期被替换、正在排空的旧 worker
+    while (true) {
+        if (gotTerm) {
+            if (worker > 0) kill(worker, SIGQUIT);
+            if (retiring > 0) kill(retiring, SIGQUIT);
+            int st;
+            while (worker > 0 && waitpid(worker, &st, 0) < 0 && errno == EINTR) {}
+            if (retiring > 0)
+                while (waitpid(retiring, &st, 0) < 0 && errno == EINTR) {}
+            unlink(pidPath.c_str());
+            std::printf("[master] shutdown\n");
+            return 0;
+        }
+        if (gotUsr2) {
+            gotUsr2 = 0;
+            std::printf("[master] rolling restart: spawn new worker (old=%d)\n", (int)worker);
+            std::fflush(stdout);
+            pid_t nw = spawnWorker(argv, port, threads);
+            if (nw > 0) {
+                if (retiring > 0) kill(retiring, SIGKILL);  // 上次滚动残留（极端），强杀
+                retiring = worker;
+                worker = nw;
+                kill(retiring, SIGQUIT);  // 旧 worker 排空后自退，由 SIGCHLD 收尸
+                std::printf("[master] rolling: new worker=%d, retiring=%d\n",
+                            (int)worker, (int)retiring);
+                std::fflush(stdout);
+            } else {
+                std::fprintf(stderr, "[master] rolling spawn failed, keep old worker=%d\n",
+                             (int)worker);
+            }
+            continue;
+        }
+        if (gotChld) {
+            gotChld = 0;
+            int st;
+            pid_t p;
+            while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
+                if (p == retiring) {
+                    std::printf("[master] retiring worker %d exited\n", (int)p);
+                    retiring = -1;
+                    continue;
+                }
+                if (p == worker) {
+                    std::fprintf(stderr, "[master] worker %d exited (status=0x%x), respawn\n",
+                                 (int)p, st);
+                    worker = -1;
+                }
+            }
+        }
+        if (worker <= 0) {  // 意外退出自动拉起（失败每秒重试）
+            worker = spawnWorker(argv, port, threads);
+            if (worker > 0)
+                std::printf("[master] worker respawned pid=%d\n", (int)worker);
+            else
+                sleep(1);
+            continue;
+        }
+        sleep(1);
+    }
+}
+
+int main(int argc, char** argv) {
+    // --version 打印退出（升级脚本校验用）；--supervise 进入 master 监管模式；
+    // --worker <port> <threads> 由 master fork+exec 拉起（内部接口）。
+    if (argc > 1 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("%s\n", NOVAWAF_VERSION);
+        return 0;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--supervise") == 0)
+        return superviseMain(argc, argv);
+    int port;
+    int threads;
+    if (argc > 1 && std::strcmp(argv[1], "--worker") == 0) {
+        port = (argc > 2) ? atoi(argv[2]) : 8080;
+        threads = (argc > 3) ? atoi(argv[3]) : (int)std::thread::hardware_concurrency();
+    } else {
+        port = (argc > 1) ? atoi(argv[1]) : 8080;
+        threads = (argc > 2) ? atoi(argv[2]) : (int)std::thread::hardware_concurrency();
+    }
+    signal(SIGPIPE, SIG_IGN);
+    // SIGQUIT/SIGTERM/SIGINT → 各 reactor 优雅排空后退出（drain，30s 兜底）
+    signal(SIGQUIT, onDrainSignal);
+    signal(SIGTERM, onDrainSignal);
+    signal(SIGINT, onDrainSignal);
 
 // region debug-point segv-bt
     // SIGSEGV/SIGBUS 自取证：崩溃瞬间把带时间戳的符号化栈回溯追加到 /tmp/novawaf-crash.log，
@@ -2377,14 +2795,58 @@ int main(int argc, char** argv) {
             }
         }).detach();
     }
+    // ---- TLS / HTTP/3 配置 ----
+    // NOVA_TLS_CERT + NOVA_TLS_KEY 同时设置才启用；NOVA_TLS_PORT 默认 8443。
+    // NOVA_H3_PORT 默认同 TLS 端口（UDP），显式设 0 禁用 h3。证书加载失败降级仅明文 h1。
+    int tlsPort = 0, h3Port = 0;
+    SSL_CTX* tlsCtx = nullptr;
+    SSL_CTX* quicCtx = nullptr;
+    {
+        const char* cert = getenv("NOVA_TLS_CERT");
+        const char* key = getenv("NOVA_TLS_KEY");
+        if (cert && *cert && key && *key) {
+            tlsPort = getenv("NOVA_TLS_PORT") ? atoi(getenv("NOVA_TLS_PORT")) : 8443;
+            if (TlsContext::instance().initTcp(cert, key)) {
+                tlsCtx = TlsContext::instance().tcp();
+                std::printf("  TLS: port=%d ALPN=h2,http/1.1 cert=%s\n", tlsPort, cert);
+            } else {
+                std::fprintf(stderr, "  [tls] init failed, TLS disabled\n");
+                tlsPort = 0;
+            }
+            const char* h3p = getenv("NOVA_H3_PORT");
+            h3Port = h3p ? atoi(h3p) : tlsPort;
+            if (h3Port > 0 && tlsCtx) {
+                if (TlsContext::instance().initQuic(cert, key)) {
+                    quicCtx = TlsContext::instance().quic();
+                    std::printf("  HTTP/3: udp port=%d ALPN=h3\n", h3Port);
+                } else {
+                    std::fprintf(stderr, "  [h3] quic init failed, h3 disabled\n");
+                    h3Port = 0;
+                }
+            } else {
+                h3Port = 0;
+            }
+        }
+    }
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
         int lfd = createListenFd(port, backlog);
         if (lfd < 0) { std::perror("listen"); return 1; }
-        reactors.emplace_back(reactorLoop, lfd, std::ref(pipeline),
+        reactors.emplace_back(reactorLoop, lfd, tlsPort, h3Port, tlsCtx, quicCtx, port,
+                              std::ref(pipeline),
                               std::ref(limiter), std::ref(ddos), ai,
                               std::ref(cc), std::ref(bot), threatIntel,
                               std::ref(shield), std::ref(geo), i);
+    }
+    // master 监管模式：全部 reactor 监听就绪后通知 master（pipe 写 "READY"）
+    {
+        const char* rfd = getenv("NOVA_READY_FD");
+        if (rfd && *rfd) {
+            int wfd = atoi(rfd);
+            const char* msg = "READY\n";
+            if (write(wfd, msg, strlen(msg)) > 0) {}
+            close(wfd);
+        }
     }
     for (auto& t : reactors) t.join();
     if (g_upstream) g_upstream->stop();  // 排空异步转发任务（ddos 此时仍存活）

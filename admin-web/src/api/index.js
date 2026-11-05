@@ -172,6 +172,12 @@ export const api = {
   apiGuardUpdateToken: (d) => http.put('/waf/api-guard/tokens', d),
   apiGuardToggleToken: (id, enabled) => http.put('/waf/api-guard/tokens/' + id + '/enabled', { enabled }),
   apiGuardDeleteToken: (id) => http.delete('/waf/api-guard/tokens/' + id),
+  // 系统维护：引擎在线一键升级 / 版本回退 / 零停机滚动重启（升级回退最长 120s，放宽超时）
+  sysOpsGet: () => http.get('/system/ops'),
+  sysOpsUpload: (fd) => http.post('/system/ops/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 300000 }),
+  sysOpsUpgrade: (version) => http.post('/system/ops/upgrade', { version }, { timeout: 150000 }),
+  sysOpsRollback: () => http.post('/system/ops/rollback', {}, { timeout: 150000 }),
+  sysOpsRestart: () => http.post('/system/ops/restart', {}, { timeout: 150000 }),
   // Agentic AI 引擎：配置下发 + 研判轨迹
   agenticConfig: () => http.get('/waf/agentic/config'),
   agenticSaveConfig: (d) => http.put('/waf/agentic/config', d),

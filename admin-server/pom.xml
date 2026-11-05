@@ -13,7 +13,7 @@
 
     <groupId>com.novawaf</groupId>
     <artifactId>novawaf-admin</artifactId>
-    <version>1.1.2-rc.1</version>
+    <version>1.2.0-rc.1</version>
     <packaging>jar</packaging>
     <name>novawaf-admin</name>
     <description>NovaWAF management console (Spring Boot 3 / JDK21)</description>

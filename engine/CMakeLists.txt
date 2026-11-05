@@ -27,7 +27,13 @@ add_compile_options(-O2 -Wall -Wextra -Wno-unused-parameter -pthread)
 # ---- Linux 检测引擎可执行文件 ----
 if(UNIX AND NOT APPLE)
     add_executable(novawaf-engine src/main.cpp)
-    target_link_libraries(novawaf-engine pthread ${CMAKE_DL_LIBS})
+    # TLS 终结(OpenSSL) + HTTP/2(nghttp2) + HTTP/3(ngtcp2+ngtcp2_crypto_ossl+nghttp3)
+    # + YARA(文件特征检测)。TLS/QUIC 请求经 H1Bridge 回环复用 h1 检测管线。
+    target_link_libraries(novawaf-engine
+        pthread ${CMAKE_DL_LIBS}
+        yara nghttp2 ngtcp2 ngtcp2_crypto_ossl nghttp3 ssl crypto)
+    # 崩溃自取证（backtrace_symbols_fd 符号解析）
+    target_link_options(novawaf-engine PRIVATE -rdynamic)
     if(NOVA_FORCE_SCALAR)
         target_compile_definitions(novawaf-engine PRIVATE NOVA_FORCE_SCALAR=1)
     endif()
