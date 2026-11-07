@@ -1,0 +1,21 @@
+#!/usr/sbin/nft -f
+# NovaWAF - SSH 虚拟补丁（CVE-2026-123158 "sshole" 密码认证绕过）
+#
+# 漏洞本体：OpenSSH <10.6p2 在 musl libc + 无 PAM 环境下，对 /etc/shadow 密码字段为 "*"
+#           的账户输入 256-1024 字符任意密码即可绕过认证（CVSS 8.1）。
+# 本服务器为 glibc(Ubuntu) + UsePAM=yes，不受该 CVE 直接影响；本规则作为纵深防御的
+# 网络层虚拟补丁，抑制 SSH 暴力破解/预认证连接洪泛（该 CVE 的通用利用前置动作）。
+#
+# 策略（priority -190，先于业务表执行）：
+#   1. 单源 IP 新建 SSH 连接速率 > 6/分钟（burst 10）→ drop（爆破抑制，meter 动态计数）
+#   2. 单源 IP 并发 SSH 连接 > 10 → drop（连接耗尽抑制）
+# 幂等：destroy 对不存在对象为 no-op，可重复 nft -f 应用。
+table inet nova-ssh-guard
+destroy table inet nova-ssh-guard
+table inet nova-ssh-guard {
+    chain input {
+        type filter hook input priority -190; policy accept;
+        tcp dport 22 ct state new meter ssh_meter { ip saddr limit rate over 6/minute } counter drop comment "cve-2026-123158-bruteforce"
+        tcp dport 22 ct count over 10 counter drop comment "cve-2026-123158-connlimit"
+    }
+}

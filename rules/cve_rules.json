@@ -944,5 +944,23 @@
     "year": 2026,
     "desc": "XChangeServlet 接口存在 SQL 注入，未认证攻击者可注入恶意 SQL 窃取/篡改数据，2026年7月公开",
     "ref": "https://net.xmu.edu.cn/info/1041/9522.htm"
+  },
+  {
+    "id": 5008,
+    "name": "OpenSSH sshhole 密码认证绕过(Web-SSH终端面)",
+    "pattern": "guacamole/tunnel",
+    "category": "AuthBypass",
+    "action": "block",
+    "enabled": true,
+    "group": "2026应急",
+    "cve": "CVE-2026-123158",
+    "vulnName": "OpenSSH 密码认证绕过(sshole)",
+    "severity": "high",
+    "component": "OpenSSH",
+    "cvss": 8.1,
+    "year": 2026,
+    "scope": ["uri"],
+    "desc": "OpenSSH<10.6p2 在 musl libc 且无 PAM 环境下，对 /etc/shadow 密码字段为 '*' 的账户输入 256-1024 字符任意密码即可绕过认证。本规则拦截经 HTTP 暴露的 Web-SSH 终端(如 Apache Guacamole /tunnel 隧道端点)作为 SSH 协议层漏洞的上层暴露面；SSH 端口本体的网络层防护由 deploy/nft/nova-ssh-guard.nft 提供，主机加固见 sshd 加固配置。",
+    "ref": "https://nvd.nist.gov/vuln/detail/CVE-2026-123158"
   }
 ]
