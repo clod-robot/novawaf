@@ -20,7 +20,7 @@
 #include "novawaf/detect/ips_engine.h"
 
 // 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
-#define NOVAWAF_VERSION "1.2.0-rc.3"
+#define NOVAWAF_VERSION "1.2.0-rc.4"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
