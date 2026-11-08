@@ -17,9 +17,10 @@
 #include "novawaf/detect/custom_rules.h"
 #include "novawaf/detect/cve_patch.h"
 #include "novawaf/detect/regex_patch.h"
+#include "novawaf/detect/ips_engine.h"
 
 // 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
-#define NOVAWAF_VERSION "1.2.0-rc.1"
+#define NOVAWAF_VERSION "1.2.0-rc.2"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -2218,6 +2219,49 @@ int main(int argc, char** argv) {
             if (!g_running) break;
             loadCvePatch(false);
             loadRegexPatch(false);
+        }
+    }).detach();
+
+    // ---- 自研 IPS：深度检测（协议异常/HTTP 走私、编码绕过、参数污染、无文件执行/C2、
+    //      敏感端点探测）→ 加权评分实时阻断 + 高危联动防火墙封禁 + 告警入 Redis。
+    //      策略经 novawaf:ips:policy 热加载（copy-on-write，热路径无锁）----
+    auto ipsVersion = std::make_shared<std::string>("-");
+    auto loadIpsPolicy = [ipsVersion](bool initial) -> size_t {
+        const char* rh = getenv("NOVA_REDIS_HOST");
+        if (!rh || !*rh) {
+            if (initial) {
+                auto p = IpsEngine::instance().policy();
+                std::printf("  IPS: builtin policy modules=%zu block=%d log=%d fwBan=%d mode=%s\n",
+                            IpsEngine::instance().moduleCount(), p->blockScore, p->logScore,
+                            p->fwBanScore, p->blockMode ? "block" : "observe");
+            }
+            return IpsEngine::instance().moduleCount();
+        }
+        int port = getenv("NOVA_REDIS_PORT") ? atoi(getenv("NOVA_REDIS_PORT")) : 6379;
+        const char* pass = getenv("NOVA_REDIS_PASS");
+        int db = getenv("NOVA_REDIS_DB") ? atoi(getenv("NOVA_REDIS_DB")) : 0;
+        RedisClient r;
+        if (!r.connect(rh, port, pass ? pass : "", db)) return IpsEngine::instance().moduleCount();
+        auto ver = r.get("novawaf:ips:policy:version");
+        std::string cur = ver.value_or("");
+        if (cur == *ipsVersion && !initial) return (size_t)-1;  // 版本未变，跳过重解析
+        auto blob = r.get("novawaf:ips:policy");
+        *ipsVersion = cur;
+        size_t n = IpsEngine::instance().loadPolicy(blob.value_or(""));
+        auto p = IpsEngine::instance().policy();
+        std::printf("  IPS: %s policy modules=%zu block=%d log=%d fwBan=%d mode=%s (ver=%s)\n",
+                    initial ? "loaded" : "hot-reloaded", n, p->blockScore, p->logScore,
+                    p->fwBanScore, p->blockMode ? "block" : "observe", cur.c_str());
+        return n;
+    };
+    loadIpsPolicy(true);
+    pipeline.addDetector(std::make_unique<IpsDetector>());
+    int ipsInterval = getenv("NOVA_IPS_INTERVAL") ? atoi(getenv("NOVA_IPS_INTERVAL")) : 60;
+    std::thread([loadIpsPolicy, ipsInterval]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(ipsInterval));
+            if (!g_running) break;
+            loadIpsPolicy(false);
         }
     }).detach();
 
