@@ -60,6 +60,10 @@ public:
         if (acceptThread_.joinable()) acceptThread_.join();
     }
 
+    // 兜底：main 若未显式 stop（如异常退出路径），静态析构时仍要 join 监听线程，
+    // 否则 joinable 的 std::thread 被销毁会直接 std::terminate()。
+    ~RmiGuard() { stop(); }
+
     int64_t blockedCount() const { return blocked_.load(); }
     int64_t connCount() const { return accepted_.load(); }
 

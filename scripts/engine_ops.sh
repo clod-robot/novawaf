@@ -50,7 +50,10 @@ master_pid() {  # → master pid（存活 supervise master），失败返回 1
     local p exe
     p=$(head -c 16 "$PIDFILE" | tr -dc '0-9')
     [ -n "$p" ] && [ -d "/proc/$p" ] || return 1
-    exe=$(readlink -f "/proc/$p/exe" 2>/dev/null) || return 1
+    # 不能用 readlink -f：master 可能仍持有被 gc 清理的旧版本 inode（二进制已删），
+    # 此时 readlink -f 返回空导致误判 master 不在。改用 readlink 并剥除 " (deleted)"。
+    exe=$(readlink "/proc/$p/exe" 2>/dev/null) || return 1
+    exe="${exe% (deleted)}"
     case "$exe" in "$ROOT"/versions/*) ;; *) return 1 ;; esac
     tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- '--supervise' || return 1
     printf '%s' "$p"

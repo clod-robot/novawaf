@@ -20,7 +20,7 @@
 #include "novawaf/detect/ips_engine.h"
 
 // 引擎版本号：与仓库根 VERSION 文件一致，发版时同步更新
-#define NOVAWAF_VERSION "1.2.0-rc.2"
+#define NOVAWAF_VERSION "1.2.0-rc.3"
 #include "novawaf/detect/threat_intel.h"
 #include "novawaf/detect/ransomware_detector.h"
 #include "novawaf/av/clamav_client.h"
@@ -2893,6 +2893,7 @@ int main(int argc, char** argv) {
         }
     }
     for (auto& t : reactors) t.join();
+    RmiGuard::instance().stop();         // 停 RMI 反代监听线程（必须 join，否则静态析构 terminate）
     if (g_upstream) g_upstream->stop();  // 排空异步转发任务（ddos 此时仍存活）
     shield.stop();
     TamperCache::instance().stop();      // 停机前把脏基线落盘
