@@ -204,6 +204,10 @@ class FwBackend:
             return
         run("nft", "flush", "chain", "inet", "novawaf", "flood")
         if not kind:
+            # 解除时同时清空各 meter 动态集合：集合在规则删除后仍残留旧元素，
+            # 下次再启用会把历史源（含本机/内网正常主机）继续限速。
+            for k in self.FLOOD_LIMITS:
+                run("nft", "flush", "set", "inet", "novawaf", f"flood_{k.lower()}")
             return
         spec = self.FLOOD_LIMITS.get(kind)
         if not spec:

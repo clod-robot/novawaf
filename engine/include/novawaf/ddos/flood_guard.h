@@ -133,10 +133,12 @@ public:
         // 封顶：爆发期 z 可达数百，若不封顶，攻击停止后需数百秒才能衰减回门限以下，
         // 形成"报警卡死"（误杀 IP 后长时间不放行）。封顶到门限即满足"持续抬升"的语义。
         if (cusum_ > p_.cusumH) cusum_ = p_.cusumH;
-        // CUSUM 只在"样本仍高于基线"时才成立：攻击刚结束时 cusum 还停在门限上，
-        // 若不加 x > mean 的约束，回落的首秒会误判为另一类洪泛（例如 HTTP 攻击
-        // 刚停就冒出 ACK 攻击）。漂移判定本质是"持续高于基线"，不是"曾经高过"。
-        const bool suspect = inst || (cusum_ >= p_.cusumH && x > mean_);
+        // CUSUM 只在"样本仍高于基线"且"达到绝对地板"时才成立：攻击刚结束时 cusum
+        // 还停在门限上，若不加 x > mean 的约束，回落的首秒会误判为另一类洪泛；
+        // 若不加 x >= floor 的约束，生产环境的正常低速背景流量（如常驻 50pps 的 ACK）
+        // 相对"近似零"的学习基线会被 CUSUM 缓慢累积成"持续抬升"，误报低速洪泛。
+        // 低于地板速率的抬升不是洪泛（地板可用 NOVA_FLOOD_FLOOR 调整）。
+        const bool suspect = inst || (cusum_ >= p_.cusumH && x > mean_ && x >= p_.floor);
         streak_ = suspect ? streak_ + 1 : 0;
         if (!suspect) cusum_ *= 0.5;          // 恢复期自然衰减
         alarm_ = streak_ >= p_.confirm;
