@@ -176,6 +176,12 @@ class FwBackend:
         for name, match in self.FLOOD_COUNTER_RULES:
             run("nft", "add", "rule", "inet", "novawaf", "floodcnt",
                 f"{match} counter comment \"flood_{name}\"")
+        # 服务重启后本进程 active_kind 复位为 None，主循环只在"变化"时下发/解除，
+        # 上次运行残留的限速规则与 meter 集合将永久生效。启动即清空，限速状态
+        # 每秒由引擎判定重新推导（存在有效攻击时下一拍即恢复，无损防护连续性）。
+        run("nft", "flush", "chain", "inet", "novawaf", "flood")
+        for k in self.FLOOD_LIMITS:
+            run("nft", "flush", "set", "inet", "novawaf", f"flood_{k.lower()}")
 
     def read_flood_counters(self):
         """返回 {icmp: packets, syn:..., ack:..., udp:..., dns:...}；失败返回 {}。"""
