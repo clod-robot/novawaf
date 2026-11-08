@@ -53,6 +53,8 @@
 #include "novawaf/net/tls_conn.h"
 #include "novawaf/net/h3_server.h"
 #include "novawaf/ddos/ddos_guard.h"
+#include "novawaf/ddos/flood_guard.h"
+#include "novawaf/ddos/kernel_flood.h"
 #include "novawaf/ai/llm_client.h"
 #include "novawaf/ai/ai_detector.h"
 #include "novawaf/ai/http_transport.h"
@@ -739,6 +741,7 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
         bool closeAfterFlush = false;
         int64_t lastActiveMs = 0;
         int64_t firstByteMs = 0;  // 当前不完整请求的首字节时间（慢速请求检测）
+        bool hadReq = false;      // 本连接是否产出过完整请求（false=半开，ACK/SYN 洪泛特征）
     };
     std::unordered_map<int, ConnState> conns;
     std::mutex busyMtx;
@@ -787,10 +790,14 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
 
     // 关闭并清理一条客户端连接（reactor 线程与异步完成回调共用，幂等）
     auto closeConn = [&](int cfd) {
+        bool hadReq = false;
         {
             std::lock_guard<std::mutex> lk(busyMtx);
             if (busy.count(cfd)) return;   // 异步转发进行中，由完成回调收尾
-            if (conns.erase(cfd) == 0) return;  // 已被异步回调关闭，避免重复 close
+            auto it = conns.find(cfd);
+            if (it == conns.end()) return;  // 已被异步回调关闭，避免重复 close
+            hadReq = it->second.hadReq;
+            conns.erase(it);
         }
         epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
         sockaddr_in peer{}; socklen_t plen = sizeof(peer);
@@ -798,7 +805,10 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
             char ipstr[32] = {0};
             inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
             // 与 accept 侧对称：可信反代连接未计入 onConnect，此处不释放
-            if (!isTrustedProxy(ipstr)) ddos.onDisconnect(ipstr);
+            if (!isTrustedProxy(ipstr)) {
+                ddos.onDisconnect(ipstr);
+                FloodGuard::instance().noteConnectClosed(ipstr, nowMs(), hadReq);
+            }
         }
         ::close(cfd);
     };
@@ -866,6 +876,12 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
                     // 真实客户端的速率/封禁在请求层按 XFF 解析后的 clientIp 键控（不受影响）。
                     char ipstr[32] = {0};
                     inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
+                    // 洪泛防护（自适应+令牌桶）：已确认的洪泛源连接级硬拒；
+                    // 其余只记违规不改放行结果，避免与 DdosGuard 双重限流误杀正常突发。
+                    if (!isTrustedProxy(ipstr) && !FloodGuard::instance().allowConnect(ipstr, nowMs())) {
+                        close(cfd);
+                        continue;
+                    }
                     if (!isTrustedProxy(ipstr) && !ddos.onConnect(ipstr)) {
                         // 复测 P1：封禁期黑洞（accept 后静默关闭，客户端只能等 8s
                         // 超时）。已封禁 IP 连接级即回 429 + 真实 Retry-After
@@ -910,6 +926,10 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
                     char ipstr[32] = {0};
                     inet_ntop(AF_INET, &caddr.sin_addr, ipstr, sizeof(ipstr));
                     // 与 h1 accept 对称：受信反代豁免连接级计数（前置代理见 h1 分支注释）
+                    if (!isTrustedProxy(ipstr) && !FloodGuard::instance().allowConnect(ipstr, nowMs())) {
+                        close(cfd);
+                        continue;
+                    }
                     if (!isTrustedProxy(ipstr) && !ddos.onConnect(ipstr)) {
                         close(cfd);
                         continue;
@@ -1056,6 +1076,7 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
                     if (it == conns.end()) { keepOpen = false; break; }
                     nr = nextRequest(it->second.inbuf, rawReq, reqLen, kMaxBody, kMaxHead, kMaxHeaders);
                     if (nr == 0) break;        // 数据不完整，等更多字节
+                    if (nr > 0) it->second.hadReq = true;  // 该连接已产出完整请求（非半开）
                 }
                 // 请求体/头部超限：立即统一错误页拒绝并断连，不再缓冲
                 if (nr == -2 || nr == -3) {
@@ -1321,6 +1342,16 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
                         // 维护模式：所有请求返回维护页，不检测、不转发
                         outResp = kMaint;
                         injectServerLine(outResp);
+                    } else if (bool floodOver = false;
+                               !FloodGuard::instance().allowRequest(req.clientIp, nowMs(), &floodOver) || floodOver) {
+                        // 洪泛防护请求层放在 DdosGuard 之前：DdosGuard 是整秒固定阈值，
+                        // 一旦先拦截，洪泛检测器就看不到真实请求速率（分母被截断），
+                        // 自适应基线无法学习、熵分布失真。此处只对"请求速率形态"的
+                        // 持续超量回 429（令牌桶平滑，不整秒硬截断）。
+                        outResp = errResp(429, "Too Many Requests", "Retry-After: 1\r\n");
+                        shield.recordBlock();
+                        emitEvt(req.clientIp, "Flood", "block", "", "flood request rate", req.path, hdrCi(req, "Host"));
+                        tBlocked = true;
                     } else if (!ddos.onRequest(req.clientIp)) {
                         // 请求速率超限 → 429 + 真实 Retry-After。
                         // 复测 P0 根因：此处曾联动 fw L3 封禁——限流本为秒级自愈，
@@ -1724,6 +1755,8 @@ static void reactorLoop(int listenFd, int tlsPort, int h3Port, SSL_CTX* tlsCtx, 
                         tr.policyId = policyId;
                         TrafficSink::instance().emit(std::move(tr));
                     }
+                    // 4xx 放大是扫描/CC/HTTP 洪泛的强特征：把状态码喂给洪泛检测器
+                    FloodGuard::instance().noteStatus(respStatus(outResp));
                     _mark();  // [6] 后置处理(封禁/事件/统计/注入Cookie)结束，进入回写
                     // 归一化 Connection 头，保证客户端能据 keep-alive 正确定界与复用
                     setRespConnection(outResp, keepAlive);
@@ -2872,6 +2905,14 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // 洪泛防护评估线程：每秒采样 /proc 内核计数器与 root 侧 nft 中继（Redis），
+    // 用自适应基线 + CUSUM + 源分布熵判定 ICMP/SYN/ACK/DNS/UDP/HTTP 洪泛，
+    // 已确认攻击源投递 FwBanPoster 由 fw_enforcer 下发协议级限速/封禁。
+    // 独立线程只做每秒一次的低频计算，不占用 reactor 热路径。
+    FloodMonitor::instance().start();
+    std::printf("  FloodGuard: %s (adaptive k-sigma + CUSUM + entropy)\n",
+                FloodGuard::instance().enabled() ? "enabled" : "disabled");
+
     std::vector<std::thread> reactors;
     for (int i = 0; i < threads; ++i) {
         int lfd = createListenFd(port, backlog);
@@ -2893,6 +2934,7 @@ int main(int argc, char** argv) {
         }
     }
     for (auto& t : reactors) t.join();
+    FloodMonitor::instance().stop();     // 停洪泛评估线程（Reactor 已退出）
     RmiGuard::instance().stop();         // 停 RMI 反代监听线程（必须 join，否则静态析构 terminate）
     if (g_upstream) g_upstream->stop();  // 排空异步转发任务（ddos 此时仍存活）
     shield.stop();
